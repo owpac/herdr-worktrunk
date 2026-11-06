@@ -1,0 +1,24 @@
+# Dependabot opens a pull request each month for a new version of the GitHub actions (pinned by
+# SHA) and of the cargo dependencies. The cooldown keeps a new version out for 14 days: a version
+# with a problem has the time to be withdrawn. mise.toml (Rust, shellcheck) and the version of
+# mise in the workflows stay manual.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 14
+    groups:
+      cargo:
+        patterns: ["*"]
