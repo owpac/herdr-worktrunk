@@ -220,6 +220,19 @@ pub fn workspace_has_agent(workspace_id: &str) -> Result<bool, Error> {
     Ok(has_agent)
 }
 
+/// Return the workspace that herdr opened for the checkout `checkout`.
+pub fn workspace_of_checkout(checkout: &Path) -> Result<Option<String>, Error> {
+    let checkout_text = checkout.to_string_lossy();
+    let result = run(&["worktree", "list", "--cwd", &checkout_text])?;
+    let worktrees = result["worktrees"].as_array().cloned().unwrap_or_default();
+    let workspace_id = worktrees
+        .iter()
+        .find(|worktree| worktree["path"].as_str() == Some(checkout_text.as_ref()))
+        .and_then(|worktree| worktree["open_workspace_id"].as_str())
+        .map(str::to_owned);
+    Ok(workspace_id)
+}
+
 /// Open (or find) the herdr workspace of `checkout`.
 ///
 /// herdr refuses to start from a linked worktree: `main_checkout` is the

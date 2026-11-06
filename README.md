@@ -9,8 +9,8 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 | Action | Result |
 |--------|--------|
 | `trunk.pick` | Opens the worktree picker (fzf) in a popup, with the worktrees and the branches of `wt list`. Type to filter. The worktree opens in its herdr workspace. |
-| `trunk.remove` | Removes the worktree of the focused workspace with `wt remove`, after a question. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
-| `trunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then removes it, after a question. |
+| `trunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question in a small popup. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
+| `trunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then deletes it, after a question in a small popup. A large popup shows the output of wt. |
 
 `trunk.remove` and `trunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent. If an action cannot work (for example the picker outside a git repository), a small popup gives the reason, with an OK button.
 
@@ -19,10 +19,12 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 | Key | Result |
 |-----|--------|
 | `Enter` | Opens the selected worktree, or the worktree of the selected branch (wt creates it). If the typed name matches no branch, the first row is `+ Create worktree <name>`: `Enter` on this row creates the worktree. |
-| `⌫` | With an empty filter: removes the selected worktree with `wt remove`, after a question (Cancel is the default button). wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. With text in the filter: erases a character. |
+| `⌫` | With an empty filter: asks to delete the selected worktree. The picker closes, a small popup asks the question, then the picker comes back. wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. With text in the filter: erases a character. |
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff` (all the changes since the branch left the default branch, `wt step diff`), `log` (the commits), `changes` (the changes that are not committed). |
 | `shift-↑`, `shift-↓` | Scroll the preview. |
 | `Esc` | Cancels. |
+
+The question has 2 buttons: `[ Cancel ]`, the default button, and `[ Delete ]` in red (or `[ Merge ]`). `←` `→` and `Tab` change the button, `Enter` presses it, `y` confirms, `Esc` cancels. herdr shows one popup at a time: a detached process of the plugin opens the next popup when the previous popup is closed.
 
 The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a terminal program never sees the `cmd` key. Thus this plugin uses fzf, with keys that do not need `alt` or `cmd`.
 

@@ -20,7 +20,17 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 const BOLD: &str = "\x1b[1m";
 const REVERSE: &str = "\x1b[7m";
 const DIM: &str = "\x1b[2m";
+const RED: &str = "\x1b[31m";
+const RED_BACKGROUND: &str = "\x1b[1;37;41m";
 const RESET: &str = "\x1b[0m";
+
+/// A button of a box.
+#[derive(Clone, Copy)]
+struct Button<'label> {
+    label: &'label str,
+    /// A button that deletes or changes work: red.
+    is_danger: bool,
+}
 
 /// Run `stty` on the terminal of the popup, and return its output.
 fn stty(arguments: &[&str]) -> Option<String> {
@@ -129,26 +139,32 @@ fn key_of(bytes: &[u8]) -> Key {
     }
 }
 
-/// The line of the buttons, and its visible length. The button
-/// `selected` is in reverse video, the others are dim.
-fn button_line(buttons: &[&str], selected: usize) -> (String, usize) {
+/// The line of the buttons, and its visible length. The selected button
+/// is in reverse video (red for a danger button). The other buttons are
+/// in brackets (red text for a danger button).
+fn button_line(buttons: &[Button], selected: usize) -> (String, usize) {
     let mut line = String::new();
     let mut length = 0;
-    for (index, label) in buttons.iter().enumerate() {
+    for (index, button) in buttons.iter().enumerate() {
         if index > 0 {
             line.push_str(BUTTON_GAP);
             length += BUTTON_GAP.len();
         }
-        let padded = format!("  {label}  ");
-        length += padded.chars().count();
-        let style = if index == selected { REVERSE } else { DIM };
-        line.push_str(&format!("{style}{padded}{RESET}"));
+        let text = format!("[ {} ]", button.label);
+        length += text.chars().count();
+        let style = match (index == selected, button.is_danger) {
+            (true, true) => RED_BACKGROUND,
+            (true, false) => REVERSE,
+            (false, true) => RED,
+            (false, false) => "",
+        };
+        line.push_str(&format!("{style}{text}{RESET}"));
     }
     (line, length)
 }
 
 /// Draw a box: the title, the message, the buttons and a key hint.
-fn draw(title: &str, message: &str, buttons: &[&str], selected: usize, hint: &str) {
+fn draw(title: &str, message: &str, buttons: &[Button], selected: usize, hint: &str) {
     let (rows, columns) = terminal_size();
     let text_width = columns.saturating_sub(2 * SIDE_MARGIN).max(1);
     let message_lines = wrap(message, text_width);
@@ -192,24 +208,51 @@ pub fn show_message(title: &str, message: &str) {
         return;
     }
     let _raw = RawMode::start();
-    draw(title, message, &["OK"], 0, "any key closes");
+    let ok = Button {
+        label: "OK",
+        is_danger: false,
+    };
+    draw(title, message, &[ok], 0, "any key closes");
+    read_key();
+}
+
+/// Print `message` under the output of a command, and wait for a key. The
+/// output stays on the screen: the user can read it.
+pub fn wait_after_output(message: &str) {
+    if !is_interactive() {
+        return;
+    }
+    print!("\r\n{BOLD}{message}{RESET} {DIM}· any key closes{RESET}");
+    let _ = io::stdout().flush();
+    let _raw = RawMode::start();
     read_key();
 }
 
 /// Ask a question with 2 buttons: Cancel (selected first) and `action`.
+/// With `is_danger`, the action button is red.
 ///
 /// ← → and Tab change the button, Enter presses it. `y` presses the
 /// action button. `n`, `q` and Esc press Cancel. Outside a terminal, the
 /// answer is no.
-pub fn confirm(title: &str, message: &str, action: &str) -> bool {
+pub fn confirm(title: &str, message: &str, action: &str, is_danger: bool) -> bool {
     if !is_interactive() {
         return false;
     }
+    let buttons = [
+        Button {
+            label: "Cancel",
+            is_danger: false,
+        },
+        Button {
+            label: action,
+            is_danger,
+        },
+    ];
     let _raw = RawMode::start();
     let mut selected = 0;
     loop {
         let hint = "← → choose · Enter confirms · Esc cancels";
-        draw(title, message, &["Cancel", action], selected, hint);
+        draw(title, message, &buttons, selected, hint);
         match read_key() {
             Key::Enter => return selected == 1,
             Key::Escape | Key::Character('n' | 'N' | 'q') => return false,
@@ -254,11 +297,23 @@ mod tests {
 
     #[test]
     fn the_button_line_counts_only_the_visible_characters() {
-        let (_, length) = button_line(&["Cancel", "Remove"], 0);
+        let buttons = [
+            Button {
+                label: "Cancel",
+                is_danger: false,
+            },
+            Button {
+                label: "Delete",
+                is_danger: true,
+            },
+        ];
+
+        let (line, length) = button_line(&buttons, 1);
 
         assert_eq!(
             length,
-            "  Cancel  ".len() + BUTTON_GAP.len() + "  Remove  ".len()
+            "[ Cancel ]".len() + BUTTON_GAP.len() + "[ Delete ]".len()
         );
+        assert!(line.contains(&format!("{RED_BACKGROUND}[ Delete ]")));
     }
 }

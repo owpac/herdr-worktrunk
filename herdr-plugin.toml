@@ -56,21 +56,24 @@ width = "90%"
 height = "80%"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" pick"]
 
+# The question before a deletion or a merge. herdr shows one popup at a time: the picker closes,
+# this popup asks, then the picker comes back.
 [[panes]]
-id = "remover"
-title = "Worktrunk: remove"
+id = "confirm"
+title = "Worktrunk"
 placement = "popup"
-width = "70%"
-height = "50%"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" remove"]
+width = 64
+height = 12
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" confirm"]
 
+# The output of wt merge.
 [[panes]]
 id = "merger"
 title = "Worktrunk: merge"
 placement = "popup"
 width = "90%"
 height = "80%"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" merge"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" merger"]
 
 # A small popup with a message and an OK button: an action opens it when its popup cannot work,
 # for example the picker outside a git repository.

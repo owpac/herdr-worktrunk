@@ -6,9 +6,10 @@
 //! - `Enter` opens the selected worktree or branch. When the typed name
 //!   matches no branch, the first row is `+ Create worktree <name>`:
 //!   `Enter` on this row creates the worktree.
-//! - `⌫` removes the selected worktree with `wt remove`, after a question,
-//!   when the filter is empty. When the filter has text, `⌫` erases a
-//!   character, as usual.
+//! - `⌫` asks to delete the selected worktree, when the filter is empty:
+//!   the picker closes, the popup confirm asks the question, then the
+//!   picker comes back. When the filter has text, `⌫` erases a character,
+//!   as usual.
 //! - `Tab` and `shift-Tab` change the tab of the preview: the diff since
 //!   the branch left the default branch, the log, and the changes that
 //!   are not committed. `shift-↑` and `shift-↓` scroll the preview.
@@ -16,8 +17,8 @@
 //!
 //! fzf runs this binary for its events: `picker-rows` gives the rows for
 //! the typed name, `picker-preview` gives the preview, `picker-tab`
-//! changes the tab of the preview, `picker-backspace` decides what `⌫`
-//! does, and `picker-remove` removes a worktree.
+//! changes the tab of the preview, and `picker-backspace` decides what
+//! `⌫` does.
 
 use std::env;
 use std::fs;
@@ -29,17 +30,27 @@ use serde_json::Value;
 
 use crate::git;
 use crate::herdr::Error;
-use crate::ui;
 
 /// fzf exits with 130 when the user cancels.
 const FZF_CANCEL_EXIT_CODE: i32 = 130;
 /// fzf exits with 1 when no row matches.
 const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
 const HEADER: &str =
-    "Enter: open or create · ⌫ (empty filter): remove · Tab: preview · Esc: cancel";
+    "Enter: open or create · ⌫ on an empty filter: delete · Tab: preview · Esc: cancel";
+/// The first line that fzf prints when `⌫` asks for a deletion.
+const DELETE_REQUEST: &str = "delete";
 const PREVIEW_COMMIT_COUNT: &str = "20";
 /// The tabs of the preview, in the order of `Tab`.
 const PREVIEW_TABS: [&str; 3] = ["diff", "log", "changes"];
+
+/// The choice of the user in the picker.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Picked {
+    /// Open this row (or create it).
+    Open(Row),
+    /// Delete the worktree of this row, after a question.
+    Delete(Row),
+}
 
 /// A row of the picker. Its fields, separated by tabs: the kind, the
 /// branch, the path of the worktree (empty for a branch), then the text
@@ -289,80 +300,28 @@ pub fn print_preview(repository: &Path, cache: &Path, kind: &str, branch: &str, 
     }
 }
 
-/// The fzf action that removes the selected worktree, then reloads the rows.
-fn remove_action(binary: &str, repository: &str, cache: &str) -> String {
-    let rows_command = format!("{binary} picker-rows {cache} {{q}}");
-    format!(
-        "execute({binary} picker-remove {repository} {cache} {{1}} {{2}})+reload({rows_command})"
-    )
-}
-
-/// fzf event `picker-backspace`: with an empty filter, `⌫` removes the
-/// selected worktree. Else it erases a character.
-pub fn backspace_action(repository: &Path, cache: &Path, query: &str) {
-    if !query.is_empty() {
-        println!("backward-delete-char");
-        return;
-    }
-    let Ok(executable) = env::current_exe() else {
-        println!("backward-delete-char");
-        return;
+/// fzf event `picker-backspace`: print the fzf actions of `⌫`.
+///
+/// With text in the filter, `⌫` erases a character. With an empty filter,
+/// on a worktree, it ends the picker with a deletion request. On another
+/// row, the header tells why nothing happens.
+pub fn backspace_action(query: &str, kind: &str, branch: &str) {
+    let actions = if !query.is_empty() {
+        "backward-delete-char".to_owned()
+    } else {
+        match kind {
+            "worktree" => format!("print({DELETE_REQUEST})+accept"),
+            "main" => format!("change-header:The main checkout cannot be deleted. · {HEADER}"),
+            _ => format!("change-header:{branch} has no worktree to delete. · {HEADER}"),
+        }
     };
-    println!(
-        "{}",
-        remove_action(
-            &shell_quote(&executable.to_string_lossy()),
-            &shell_quote(&repository.to_string_lossy()),
-            &shell_quote(&cache.to_string_lossy()),
-        )
-    );
+    println!("{actions}");
 }
 
-/// fzf event `picker-remove`: remove the selected worktree with wt, after
-/// a question, then refresh the cache.
-pub fn remove(repository: &Path, cache: &Path, kind: &str, branch: &str) {
-    let title = "Worktrunk: remove";
-    match kind {
-        "worktree" => {}
-        "main" => {
-            ui::show_message(title, "The main checkout cannot be removed.");
-            return;
-        }
-        _ => {
-            ui::show_message(title, &format!("{branch} has no worktree to remove."));
-            return;
-        }
-    }
-    let question =
-        format!("Remove the worktree of {branch}?\nwt keeps the branch if it is not merged.");
-    if !ui::confirm(title, &question, "Remove") {
-        return;
-    }
-    let output = Command::new("wt")
-        .arg("-C")
-        .arg(repository)
-        .args(["remove", "--foreground", branch])
-        .stdin(Stdio::inherit())
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let details = String::from_utf8_lossy(&output.stderr);
-            ui::show_message(
-                title,
-                &format!("wt did not remove the worktree.\n{}", details.trim()),
-            );
-        }
-        Err(error) => ui::show_message(title, &format!("cannot run wt: {error}")),
-    }
-    // The observer closes the workspace of the removed worktree.
-    let _ = write_cache(cache, repository);
-}
-
-/// Show the picker for `repository`, and return the selected row.
+/// Show the picker for `repository`, and return the choice of the user.
 ///
 /// Returns None if the user cancels.
-pub fn pick(repository: &Path) -> Result<Option<Row>, Error> {
+pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
     let main_checkout = git::checkout_of(repository)
         .map(|checkout| checkout.main_checkout())
         .unwrap_or_else(|| repository.to_path_buf());
@@ -399,10 +358,12 @@ pub fn pick(repository: &Path) -> Result<Option<Row>, Error> {
             "{binary} picker-preview {repository_text} {cache_text} {{1}} {{2}} {{3}}"
         ))
         .arg("--bind")
-        .arg(format!("change:reload({rows_command})"))
+        .arg(format!(
+            "change:reload({rows_command})+change-header:{HEADER}"
+        ))
         .arg("--bind")
         .arg(format!(
-            "bspace:transform({binary} picker-backspace {repository_text} {cache_text} {{q}})"
+            "bspace:transform({binary} picker-backspace {{q}} {{1}} {{2}})"
         ))
         .arg("--bind")
         .arg(format!(
@@ -430,8 +391,13 @@ pub fn pick(repository: &Path) -> Result<Option<Row>, Error> {
         Some(FZF_CANCEL_EXIT_CODE) | Some(FZF_NO_MATCH_EXIT_CODE) => return Ok(None),
         _ => return Err(Error::Command("fzf failed.".to_owned())),
     }
-    let selected = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_row(selected.trim_end_matches('\n')))
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    if first == DELETE_REQUEST {
+        return Ok(lines.next().and_then(parse_row).map(Picked::Delete));
+    }
+    Ok(parse_row(first).map(Picked::Open))
 }
 
 /// Read the row that fzf prints.

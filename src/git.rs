@@ -49,6 +49,20 @@ pub fn checkout_of(folder: &Path) -> Option<Checkout> {
     Some(Checkout { root, common_dir })
 }
 
+/// Return the branch of the checkout `root`, or None for a detached HEAD.
+pub fn branch_of(root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

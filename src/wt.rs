@@ -64,6 +64,27 @@ pub fn remove(main_checkout: &Path, checkout: &Path) -> Result<(), Error> {
     )
 }
 
+/// Remove the worktree `checkout` without output on the terminal. On a
+/// failure, the error has the message of wt.
+pub fn remove_quietly(main_checkout: &Path, checkout: &Path) -> Result<(), Error> {
+    let output = Command::new("wt")
+        .arg("-C")
+        .arg(main_checkout)
+        .args(["remove", "--foreground"])
+        .arg(checkout)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Error::Command(format!("cannot run wt: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = String::from_utf8_lossy(&output.stderr);
+    Err(Error::Command(format!(
+        "wt did not delete the worktree.\n{}",
+        details.trim()
+    )))
+}
+
 /// Merge the branch of `checkout` into the default branch, without the
 /// removal of the worktree. wt squashes, rebases, runs the pre-merge
 /// hooks and fast-forwards the default branch.

@@ -5,7 +5,7 @@
 //!   herdr-worktrunk observe                    start the observer in the background
 //!   herdr-worktrunk observe --run              the observer itself
 //!   herdr-worktrunk open picker|remover|merger an action: open a popup
-//!   herdr-worktrunk pick|remove|merge|message  the command of a popup
+//!   herdr-worktrunk pick|confirm|merger|message  the command of a popup
 
 mod actions;
 mod config;
@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use herdr::Error;
 
 const USAGE: &str =
-    "usage: herdr-worktrunk observe | open picker|remover|merger | pick | remove | merge | message";
+    "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message";
 
 /// A folder that herdr gives in an environment variable, else a default.
 fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
@@ -77,13 +77,13 @@ fn main() -> ExitCode {
             picker::change_tab(Path::new(cache), *direction == "next");
             return ExitCode::SUCCESS;
         }
-        ["picker-backspace", repository, cache, query @ ..] => {
-            let query = query.first().copied().unwrap_or_default();
-            picker::backspace_action(Path::new(repository), Path::new(cache), query);
+        ["picker-backspace", query, kind, branch] => {
+            picker::backspace_action(query, kind, branch);
             return ExitCode::SUCCESS;
         }
-        ["picker-remove", repository, cache, kind, branch] => {
-            picker::remove(Path::new(repository), Path::new(cache), kind, branch);
+        // The detached process that opens the next popup.
+        ["open-later", entrypoint, folder, assignments @ ..] => {
+            actions::open_later(entrypoint, Path::new(folder), assignments);
             return ExitCode::SUCCESS;
         }
         ["observe"] => (observe(false), None),
@@ -92,8 +92,8 @@ fn main() -> ExitCode {
             (actions::open(entrypoint), None)
         }
         ["pick"] => (actions::pick(), Some("pick")),
-        ["remove"] => (actions::remove(), Some("remove")),
-        ["merge"] => (actions::merge(), Some("merge")),
+        ["confirm"] => (actions::confirm(), Some("confirm")),
+        ["merger"] => (actions::merger(), Some("merger")),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
