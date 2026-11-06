@@ -14,7 +14,7 @@
 #   HERDR_WORKTRUNK_BUILD=source   skip the download, and build with cargo
 set -u
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
 cd "$ROOT" || exit 1
 REPOSITORY_URL="https://github.com/owpac/herdr-worktrunk"
 TARGET="$ROOT/bin/herdr-worktrunk"

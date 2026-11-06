@@ -1,2 +1,6 @@
+# The tools of the project: mise installs them on your machine and in the CI. This file is the
+# only place of the Rust version. rust-version in Cargo.toml is a different value: the oldest
+# Rust that the cargo fallback of scripts/install.sh supports.
 [tools]
-rust = "1.99.1"
+rust = { version = "1.99.1", components = ["clippy", "rustfmt"] }
+shellcheck = "0.11.0"

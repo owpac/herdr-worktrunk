@@ -97,10 +97,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      # mise installs the Rust toolchain of mise.toml. A release does not use the cache of
+      # the CI: each build installs a new toolchain.
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
-          toolchain: 1.99.1
-          targets: ${{ matrix.target }}
+          version: 2026.10.17
+          install_args: rust
+          cache: false
+      - name: Add the target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: rustup target add "$TARGET"
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
@@ -166,11 +173,11 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          assets="herdr-worktrunk-linux-x86_64 herdr-worktrunk-linux-aarch64 herdr-worktrunk-macos-x86_64 herdr-worktrunk-macos-aarch64"
-          for asset in $assets; do
+          set -- herdr-worktrunk-linux-x86_64 herdr-worktrunk-linux-aarch64 herdr-worktrunk-macos-x86_64 herdr-worktrunk-macos-aarch64
+          for asset in "$@"; do
             test -f "$asset" || { echo "missing $asset" >&2; exit 1; }
           done
-          sha256sum $assets > SHA256SUMS
+          sha256sum "$@" > SHA256SUMS
           cat SHA256SUMS
       # Create a draft, upload all the assets, then publish: nobody downloads a partial release.
       # A published release keeps its assets. If a run fails after the creation of the draft,

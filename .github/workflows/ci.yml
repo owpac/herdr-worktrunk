@@ -1,4 +1,7 @@
 # Format, lint and test each push and each pull request, on Linux and macOS.
+#
+# mise installs the tools of mise.toml: Rust with clippy and rustfmt, and shellcheck. The version
+# of mise is a fixed version, at least 2 weeks old.
 name: ci
 
 on:
@@ -21,10 +24,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
-          toolchain: 1.99.1
-          components: clippy, rustfmt
+          version: 2026.10.17
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -41,8 +43,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
         with:
-          toolchain: "1.89"
+          version: 2026.10.17
+          install: false
       - name: Build
-        run: cargo build --locked
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$msrv" || { echo "Cargo.toml has no rust-version" >&2; exit 1; }
+          mise exec "rust@$msrv" -- cargo build --locked
+
+  shell:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.17
+          install_args: shellcheck
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh
