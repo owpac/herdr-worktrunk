@@ -112,6 +112,7 @@ description = "merge the worktree of the workspace (wt)"
 ```sh
 git clone https://github.com/owpac/herdr-worktrunk
 cd herdr-worktrunk
+mise install                                         # Rust and shellcheck of mise.toml
 HERDR_WORKTRUNK_BUILD=source sh scripts/install.sh   # build bin/herdr-worktrunk with cargo
 herdr plugin link "$PWD"
 bin/herdr-worktrunk observe                          # start the observer once after the link
@@ -123,6 +124,7 @@ bin/herdr-worktrunk observe                          # start the observer once a
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+shellcheck scripts/*.sh
 ```
 
 ## Release
