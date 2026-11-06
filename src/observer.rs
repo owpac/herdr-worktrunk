@@ -1,0 +1,568 @@
+//! The observer keeps the rule "1 git worktree = 1 herdr workspace".
+//!
+//! herdr starts the observer with the plugin (`[[startup]]`). Every 2
+//! seconds, the observer reads the snapshot of herdr and does 2 things:
+//!
+//! 1. If an agent works in another checkout of the same repository than
+//!    its workspace (for example, Claude Code entered a worktree), the
+//!    observer moves the pane of the agent to the workspace of this
+//!    checkout. herdr opens the workspace if necessary.
+//! 2. If the worktree of a workspace is removed (`wt remove`, `wt merge`)
+//!    and no agent works in the workspace, the observer closes it.
+//!
+//! The observer watches only the agents. A shell that changes its folder
+//! does not move. A change to another repository does not move.
+
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::git::{self, Checkout};
+use crate::herdr::{self, Error, Snapshot};
+
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The folder of a pane rarely changes: ask git again after this time.
+const CHECKOUT_CACHE_TIME: Duration = Duration::from_secs(30);
+/// After this number of failed snapshots in a row, herdr is stopped.
+const MAX_SNAPSHOT_FAILURES: u32 = 5;
+const MAX_LOG_SIZE_BYTES: u64 = 1_000_000;
+
+/// An agent pane, as the rules of the observer see it.
+#[derive(Clone, Debug)]
+pub struct AgentPane {
+    pub pane_id: String,
+    pub workspace_id: String,
+    /// The checkout of the folder of the agent, if the folder is in git.
+    pub checkout: Option<Checkout>,
+    pub is_focused: bool,
+}
+
+/// A workspace, with the checkout that it showed when the observer first
+/// saw it. herdr can change the checkout of a workspace later, when the
+/// folder of its pane changes: the first checkout is the true one.
+#[derive(Clone, Debug)]
+pub struct KnownWorkspace {
+    pub workspace_id: String,
+    pub checkout_root: Option<PathBuf>,
+    pub common_dir: Option<PathBuf>,
+    pub is_linked_worktree: bool,
+    pub has_agent: bool,
+    pub checkout_exists: bool,
+}
+
+/// One change that the observer makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Step {
+    MovePane {
+        pane_id: String,
+        checkout: Checkout,
+        focus: bool,
+    },
+    CloseWorkspace {
+        workspace_id: String,
+    },
+}
+
+/// Decide the changes for one snapshot.
+///
+/// A pane moves only if the observer saw the same difference in the
+/// previous snapshot too: a short change of folder does not move a pane.
+///
+/// Returns the changes, and the panes with a difference in this
+/// snapshot (give them to the next call).
+pub fn plan(
+    agent_panes: &[AgentPane],
+    workspaces: &[KnownWorkspace],
+    previous_differences: &HashSet<String>,
+) -> (Vec<Step>, HashSet<String>) {
+    let mut steps = Vec::new();
+    let mut differences = HashSet::new();
+    for pane in agent_panes {
+        let Some(checkout) = &pane.checkout else {
+            continue;
+        };
+        let Some(workspace) = workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == pane.workspace_id)
+        else {
+            continue;
+        };
+        let is_other_checkout = workspace.checkout_root.as_ref() != Some(&checkout.root);
+        let is_same_repository = workspace.common_dir.as_ref() == Some(&checkout.common_dir);
+        if !is_other_checkout || !is_same_repository {
+            continue;
+        }
+        differences.insert(pane.pane_id.clone());
+        if previous_differences.contains(&pane.pane_id) {
+            steps.push(Step::MovePane {
+                pane_id: pane.pane_id.clone(),
+                checkout: checkout.clone(),
+                focus: pane.is_focused,
+            });
+        }
+    }
+    for workspace in workspaces {
+        let is_removed_worktree = workspace.is_linked_worktree && !workspace.checkout_exists;
+        if is_removed_worktree && !workspace.has_agent {
+            steps.push(Step::CloseWorkspace {
+                workspace_id: workspace.workspace_id.clone(),
+            });
+        }
+    }
+    (steps, differences)
+}
+
+/// The checkout of a workspace when the observer first saw it.
+#[derive(Clone, Debug)]
+struct FirstCheckout {
+    root: Option<PathBuf>,
+    common_dir: Option<PathBuf>,
+    is_linked_worktree: bool,
+}
+
+/// The state that the observer keeps between 2 snapshots.
+struct Observer {
+    log: Log,
+    workspaces: HashMap<String, FirstCheckout>,
+    folders: HashMap<PathBuf, (Instant, Option<Checkout>)>,
+    differences: HashSet<String>,
+}
+
+impl Observer {
+    /// Return the checkout of a folder, from the cache when it is recent.
+    fn checkout_of_folder(&mut self, folder: &Path) -> Option<Checkout> {
+        if let Some((time, checkout)) = self.folders.get(folder) {
+            if time.elapsed() < CHECKOUT_CACHE_TIME {
+                return checkout.clone();
+            }
+        }
+        let checkout = git::checkout_of(folder);
+        self.folders
+            .insert(folder.to_path_buf(), (Instant::now(), checkout.clone()));
+        checkout
+    }
+
+    /// Remember the checkout of each new workspace, and forget the
+    /// closed workspaces.
+    fn update_workspaces(&mut self, snapshot: &Snapshot) {
+        let live: HashSet<&str> = snapshot
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.workspace_id.as_str())
+            .collect();
+        self.workspaces.retain(|id, _| live.contains(id.as_str()));
+        for workspace in &snapshot.workspaces {
+            if self.workspaces.contains_key(&workspace.workspace_id) {
+                continue;
+            }
+            let first = match herdr::workspace_checkout(&workspace.workspace_id) {
+                Ok(Some(checkout)) => FirstCheckout {
+                    common_dir: git::checkout_of(&checkout.checkout_path)
+                        .map(|checkout| checkout.common_dir),
+                    root: Some(checkout.checkout_path),
+                    is_linked_worktree: checkout.is_linked_worktree,
+                },
+                Ok(None) => FirstCheckout {
+                    root: None,
+                    common_dir: None,
+                    is_linked_worktree: false,
+                },
+                Err(error) => {
+                    self.log.write(&format!(
+                        "workspace get {}: {error}",
+                        workspace.workspace_id
+                    ));
+                    continue;
+                }
+            };
+            self.workspaces
+                .insert(workspace.workspace_id.clone(), first);
+        }
+    }
+
+    /// Read one snapshot, then make its changes.
+    fn tick(&mut self, snapshot: &Snapshot) {
+        self.update_workspaces(snapshot);
+        let mut agent_panes = Vec::new();
+        for pane in snapshot.panes.iter().filter(|pane| pane.agent.is_some()) {
+            let checkout = pane
+                .folder()
+                .and_then(|folder| self.checkout_of_folder(folder));
+            agent_panes.push(AgentPane {
+                pane_id: pane.pane_id.clone(),
+                workspace_id: pane.workspace_id.clone(),
+                checkout,
+                is_focused: pane.focused,
+            });
+        }
+        let known: Vec<KnownWorkspace> = self
+            .workspaces
+            .iter()
+            .map(|(workspace_id, first)| KnownWorkspace {
+                workspace_id: workspace_id.clone(),
+                checkout_root: first.root.clone(),
+                common_dir: first.common_dir.clone(),
+                is_linked_worktree: first.is_linked_worktree,
+                has_agent: agent_panes
+                    .iter()
+                    .any(|pane| &pane.workspace_id == workspace_id),
+                checkout_exists: first.root.as_deref().is_some_and(Path::exists),
+            })
+            .collect();
+        let (steps, differences) = plan(&agent_panes, &known, &self.differences);
+        self.differences = differences;
+        for step in steps {
+            if let Err(error) = self.apply(&step, &agent_panes) {
+                self.log.write(&format!("{step:?}: {error}"));
+            }
+        }
+    }
+
+    /// Make one change in herdr.
+    fn apply(&mut self, step: &Step, agent_panes: &[AgentPane]) -> Result<(), Error> {
+        match step {
+            Step::CloseWorkspace { workspace_id } => {
+                herdr::close_workspace(workspace_id)?;
+                self.workspaces.remove(workspace_id);
+                self.log
+                    .write(&format!("closed the workspace {workspace_id}"));
+                Ok(())
+            }
+            Step::MovePane {
+                pane_id,
+                checkout,
+                focus,
+            } => {
+                let source_workspace = agent_panes
+                    .iter()
+                    .find(|pane| &pane.pane_id == pane_id)
+                    .map(|pane| pane.workspace_id.clone())
+                    .unwrap_or_default();
+                self.move_pane(pane_id, &source_workspace, checkout, *focus)?;
+                self.differences.remove(pane_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Move a pane to the workspace of `checkout`.
+    ///
+    /// If a workspace shows this checkout, the pane goes to a new tab of
+    /// it. Else, herdr opens the workspace, and the pane replaces its
+    /// first shell. herdr closes the old workspace if the pane was its
+    /// last pane.
+    fn move_pane(
+        &mut self,
+        pane_id: &str,
+        source_workspace: &str,
+        checkout: &Checkout,
+        focus: bool,
+    ) -> Result<(), Error> {
+        let existing = self
+            .workspaces
+            .iter()
+            .find(|(id, first)| {
+                id.as_str() != source_workspace && first.root.as_ref() == Some(&checkout.root)
+            })
+            .map(|(id, _)| id.clone());
+        if let Some(workspace_id) = existing {
+            herdr::move_pane_to_new_tab(pane_id, &workspace_id, focus)?;
+            self.log
+                .write(&format!("moved {pane_id} to the workspace {workspace_id}"));
+            return Ok(());
+        }
+        let opened = herdr::open_checkout(&checkout.root, &checkout.main_checkout(), false)?;
+        if opened.workspace_id == source_workspace {
+            // herdr already gives this checkout to the workspace of the pane.
+            self.remember(&opened.workspace_id, checkout);
+            return Ok(());
+        }
+        let is_new_workspace = !self.workspaces.contains_key(&opened.workspace_id);
+        if is_new_workspace {
+            herdr::move_pane_next_to(pane_id, &opened.tab_id, &opened.root_pane_id, focus)?;
+            herdr::close_pane(&opened.root_pane_id)?;
+        } else {
+            herdr::move_pane_to_new_tab(pane_id, &opened.workspace_id, focus)?;
+        }
+        self.remember(&opened.workspace_id, checkout);
+        self.log.write(&format!(
+            "moved {pane_id} to the workspace {} of {}",
+            opened.workspace_id,
+            checkout.root.display()
+        ));
+        Ok(())
+    }
+
+    fn remember(&mut self, workspace_id: &str, checkout: &Checkout) {
+        self.workspaces.insert(
+            workspace_id.to_owned(),
+            FirstCheckout {
+                root: Some(checkout.root.clone()),
+                common_dir: Some(checkout.common_dir.clone()),
+                is_linked_worktree: checkout.root != checkout.main_checkout(),
+            },
+        );
+    }
+}
+
+/// A small log file in the state folder of the plugin.
+struct Log {
+    file: Option<File>,
+}
+
+impl Log {
+    fn open(path: &Path) -> Self {
+        let is_too_big =
+            fs::metadata(path).is_ok_and(|metadata| metadata.len() > MAX_LOG_SIZE_BYTES);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(!is_too_big)
+            .write(true)
+            .truncate(is_too_big)
+            .open(path)
+            .ok();
+        Log { file }
+    }
+
+    fn write(&mut self, message: &str) {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        if let Some(file) = &mut self.file {
+            // The log is only for a diagnosis: a failed write must not stop
+            // the observer.
+            let _ = writeln!(file, "{seconds} {message}");
+        }
+    }
+}
+
+/// The lock file: only one observer runs for each herdr server.
+fn lock_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("observer.lock")
+}
+
+fn open_lock(state_dir: &Path) -> Result<File, Error> {
+    fs::create_dir_all(state_dir).map_err(|error| {
+        Error::Command(format!("cannot create {}: {error}", state_dir.display()))
+    })?;
+    let path = lock_path(state_dir);
+    File::create(&path)
+        .map_err(|error| Error::Command(format!("cannot create {}: {error}", path.display())))
+}
+
+/// Start the observer in the background, if it does not run, and return.
+///
+/// herdr runs `[[startup]]` and `[[events]]` commands as short commands:
+/// they must end. Thus this function starts a detached process
+/// (`observe --run`) in a new process group, then returns at once. The
+/// detached process takes the lock, so a second start does nothing.
+pub fn start(state_dir: &Path) -> Result<(), Error> {
+    let lock = open_lock(state_dir)?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    // The detached process takes the lock itself.
+    drop(lock);
+    let executable = env::current_exe()
+        .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
+    Command::new(executable)
+        .args(["observe", "--run"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| Error::Command(format!("cannot start the observer: {error}")))?;
+    Ok(())
+}
+
+/// The modification time of the binary of the observer.
+fn binary_time() -> Option<SystemTime> {
+    let executable = env::current_exe().ok()?;
+    fs::metadata(executable).ok()?.modified().ok()
+}
+
+/// Run the observer until herdr stops.
+///
+/// If another observer has the lock, return at once. If an update of the
+/// plugin replaces the binary, the observer runs the new binary.
+pub fn run(state_dir: &Path) -> Result<(), Error> {
+    let lock = open_lock(state_dir)?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    let mut observer = Observer {
+        log: Log::open(&state_dir.join("observer.log")),
+        workspaces: HashMap::new(),
+        folders: HashMap::new(),
+        differences: HashSet::new(),
+    };
+    observer.log.write("observer started");
+    let started_binary = binary_time();
+    let mut failures = 0;
+    loop {
+        match herdr::snapshot() {
+            Ok(snapshot) => {
+                failures = 0;
+                observer.tick(&snapshot);
+            }
+            Err(error) => {
+                failures += 1;
+                if failures >= MAX_SNAPSHOT_FAILURES {
+                    observer.log.write(&format!("observer stopped: {error}"));
+                    return Ok(());
+                }
+            }
+        }
+        if binary_time() != started_binary {
+            observer.log.write("new binary: the observer starts it");
+            // The new process takes the lock again: release it first.
+            drop(lock);
+            let error = Command::new(env::current_exe().unwrap_or_default())
+                .args(["observe", "--run"])
+                .exec();
+            return Err(Error::Command(format!(
+                "cannot run the new binary: {error}"
+            )));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checkout(root: &str) -> Checkout {
+        Checkout {
+            root: PathBuf::from(root),
+            common_dir: PathBuf::from("/work/repo/.git"),
+        }
+    }
+
+    fn agent_in(workspace_id: &str, folder_checkout: Option<Checkout>) -> AgentPane {
+        AgentPane {
+            pane_id: "w1:p1".to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            checkout: folder_checkout,
+            is_focused: true,
+        }
+    }
+
+    fn workspace(workspace_id: &str, root: &str) -> KnownWorkspace {
+        KnownWorkspace {
+            workspace_id: workspace_id.to_owned(),
+            checkout_root: Some(PathBuf::from(root)),
+            common_dir: Some(PathBuf::from("/work/repo/.git")),
+            is_linked_worktree: root != "/work/repo",
+            has_agent: false,
+            checkout_exists: true,
+        }
+    }
+
+    fn previous(pane_id: &str) -> HashSet<String> {
+        HashSet::from([pane_id.to_owned()])
+    }
+
+    #[test]
+    fn an_agent_in_its_checkout_does_not_move() {
+        let panes = [agent_in("w1", Some(checkout("/work/repo")))];
+
+        let (steps, differences) =
+            plan(&panes, &[workspace("w1", "/work/repo")], &previous("w1:p1"));
+
+        assert!(steps.is_empty());
+        assert!(differences.is_empty());
+    }
+
+    #[test]
+    fn a_first_difference_waits_for_the_next_snapshot() {
+        let panes = [agent_in("w1", Some(checkout("/work/repo.feature")))];
+
+        let (steps, differences) = plan(&panes, &[workspace("w1", "/work/repo")], &HashSet::new());
+
+        assert!(steps.is_empty());
+        assert!(differences.contains("w1:p1"));
+    }
+
+    #[test]
+    fn an_agent_in_a_worktree_moves_after_two_snapshots() {
+        let panes = [agent_in("w1", Some(checkout("/work/repo.feature")))];
+
+        let (steps, _) = plan(&panes, &[workspace("w1", "/work/repo")], &previous("w1:p1"));
+
+        assert_eq!(
+            steps,
+            [Step::MovePane {
+                pane_id: "w1:p1".to_owned(),
+                checkout: checkout("/work/repo.feature"),
+                focus: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_agent_in_another_repository_does_not_move() {
+        let other_repository = Checkout {
+            root: PathBuf::from("/work/other"),
+            common_dir: PathBuf::from("/work/other/.git"),
+        };
+        let panes = [agent_in("w1", Some(other_repository))];
+
+        let (steps, _) = plan(&panes, &[workspace("w1", "/work/repo")], &previous("w1:p1"));
+
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn an_agent_outside_git_does_not_move() {
+        let panes = [agent_in("w1", None)];
+
+        let (steps, _) = plan(&panes, &[workspace("w1", "/work/repo")], &previous("w1:p1"));
+
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn a_removed_worktree_without_agent_closes_its_workspace() {
+        let mut removed = workspace("w2", "/work/repo.feature");
+        removed.checkout_exists = false;
+
+        let (steps, _) = plan(&[], &[removed], &HashSet::new());
+
+        assert_eq!(
+            steps,
+            [Step::CloseWorkspace {
+                workspace_id: "w2".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_with_an_agent_stays_open() {
+        let mut removed = workspace("w2", "/work/repo.feature");
+        removed.checkout_exists = false;
+        removed.has_agent = true;
+
+        let (steps, _) = plan(&[], &[removed], &HashSet::new());
+
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn the_main_checkout_never_closes() {
+        let mut main = workspace("w1", "/work/repo");
+        main.checkout_exists = false;
+
+        let (steps, _) = plan(&[], &[main], &HashSet::new());
+
+        assert!(steps.is_empty());
+    }
+}

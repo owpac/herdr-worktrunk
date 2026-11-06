@@ -1,0 +1,22 @@
+[package]
+name = "herdr-worktrunk"
+# The release workflow writes the version (YYYY.M.N) in the commit of the tag.
+version = "0.0.0"
+edition = "2021"
+# The oldest toolchain that the cargo fallback of scripts/install.sh supports.
+# File::try_lock (the single observer) needs 1.89.
+rust-version = "1.89"
+description = "herdr plugin: manage the git worktrees with worktrunk, and keep 1 worktree = 1 herdr workspace"
+license = "MIT"
+repository = "https://github.com/owpac/herdr-worktrunk"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

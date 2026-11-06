@@ -1,0 +1,73 @@
+id = "trunk"
+name = "Worktrunk"
+# The version of a release: YYYY.M.N. On main, the version stays 0.0.0. The release workflow
+# writes the version in the commit of the tag of each release.
+version = "0.0.0"
+min_herdr_version = "0.9.0"
+description = "Manage the git worktrees with worktrunk (wt), and keep 1 worktree = 1 herdr workspace"
+platforms = ["linux", "macos"]
+
+# scripts/install.sh puts the binary at bin/herdr-worktrunk: the release binary of this version,
+# or a cargo build.
+[[build]]
+command = ["sh", "scripts/install.sh"]
+
+# The observer: it moves the pane of an agent to the workspace of its worktree, and closes the
+# workspace of a removed worktree. `observe = false` in config.toml stops it. config.toml is also
+# read by the agents (agent_mode): see the README.
+# `observe` starts the observer in the background and returns. herdr runs [[startup]] when the
+# server starts, but not when the plugin is installed or linked: the event pane.agent_detected
+# also starts the observer. A lock keeps one observer for each herdr server.
+[[startup]]
+command = ["bin/herdr-worktrunk", "observe"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bin/herdr-worktrunk", "observe"]
+
+[[actions]]
+id = "pick"
+title = "Worktree: pick or create"
+description = "Open the wt picker: Enter opens a worktree or a branch, alt-c creates a worktree, alt-x removes one"
+contexts = ["global"]
+command = ["bin/herdr-worktrunk", "open", "picker"]
+
+[[actions]]
+id = "remove"
+title = "Worktree: remove this worktree"
+description = "Remove the worktree of the focused workspace with wt remove, after a question"
+contexts = ["global"]
+command = ["bin/herdr-worktrunk", "open", "remover"]
+
+[[actions]]
+id = "merge"
+title = "Worktree: merge this worktree"
+description = "Merge the worktree of the focused workspace into the default branch with wt merge, then remove it"
+contexts = ["global"]
+command = ["bin/herdr-worktrunk", "open", "merger"]
+
+# herdr starts a plugin pane in the folder of the workspace, not in the plugin root: the commands
+# use HERDR_PLUGIN_ROOT.
+[[panes]]
+id = "picker"
+title = "Worktrunk"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" pick"]
+
+[[panes]]
+id = "remover"
+title = "Worktrunk: remove"
+placement = "popup"
+width = "70%"
+height = "50%"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" remove"]
+
+[[panes]]
+id = "merger"
+title = "Worktrunk: merge"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" merge"]

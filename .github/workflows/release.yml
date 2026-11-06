@@ -1,0 +1,193 @@
+# Release each push on main, like the tools pac, kompose and craft of owpac: the version is
+# YYYY.M.N, the month of the push in UTC and the number of the release in this month.
+#
+# herdr reads the version in herdr-plugin.toml, and scripts/install.sh downloads the release of
+# this version. On main, the version stays 0.0.0. For each release, the job publish writes the
+# version in herdr-plugin.toml, Cargo.toml and Cargo.lock, in a release commit on top of the
+# main commit. The tag points to this release commit, and main does not change. The dotfiles
+# install a tag: `herdr plugin install owpac/herdr-worktrunk --ref <tag>`.
+#
+# The month has no leading zero (2027.3.1, not 2027.03.1): Cargo and herdr read the version as
+# SemVer, and SemVer refuses a leading zero.
+#
+# The binary does not read its version, so the build jobs build the main commit. The job publish
+# pushes the tag only after all the builds succeed.
+#
+# A tag that GITHUB_TOKEN pushes does not start other workflows. Thus this workflow also builds
+# and publishes the binaries. Do not change the names of the assets: scripts/install.sh
+# downloads them.
+#   herdr-worktrunk-<os>-<arch>   os: linux or macos, arch: x86_64 or aarch64
+#   SHA256SUMS               "<sha256>  <asset name>" for each binary
+name: release
+
+on:
+  push:
+    branches: [main]
+  # A pull request builds each asset, but publishes nothing.
+  pull_request:
+
+permissions:
+  contents: read
+
+# One release at a time: two runs must not read the same last tag. The pull requests have their
+# own group, so that they never cancel a release that waits.
+concurrency:
+  group: release-${{ github.event_name == 'push' && 'main' || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.released }}
+    steps:
+      # fetch-depth 0 also fetches the tags.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Find the version of this push
+        id: version
+        run: |
+          main_commit=$(git rev-parse HEAD)
+          # A re-run of the same push: reuse the tag of its release commit.
+          for existing in $(git tag --list '[0-9][0-9][0-9][0-9].*.*'); do
+            if [ "$(git rev-parse "$existing^{commit}^")" = "$main_commit" ]; then
+              echo "The commit $main_commit already has the release $existing."
+              echo "version=$existing" >> "$GITHUB_OUTPUT"
+              echo "released=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          month=$(date -u +%Y.%-m)
+          last=$(git tag --list "$month.*" | sed "s/^$month\.//" | sort -n | tail -1)
+          version="$month.$((${last:-0} + 1))"
+          echo "Next version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "released=false" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    # Run when the job version passed, or when it did not run (pull request).
+    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
+    name: build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The musl targets link statically, so the binary runs on each Linux distribution.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            asset: herdr-worktrunk-linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            asset: herdr-worktrunk-linux-aarch64
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            asset: herdr-worktrunk-macos-x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            asset: herdr-worktrunk-macos-aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+          targets: ${{ matrix.target }}
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Stage the asset
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          cp "target/$TARGET/release/herdr-worktrunk" "dist/$ASSET"
+      - name: Check the static link
+        if: contains(matrix.target, 'linux-musl')
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: file "dist/$ASSET" | grep -Eq 'statically linked|static-pie linked'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Push the release commit and its tag
+        if: needs.version.outputs.released != 'true'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Change only the first version line of each file: the version of the plugin in
+          # herdr-plugin.toml, and the version of [package] in Cargo.toml.
+          for file in herdr-plugin.toml Cargo.toml; do
+            awk -v version="$VERSION" '
+              !done && /^version = "/ { $0 = "version = \"" version "\""; done = 1 }
+              { print }
+            ' "$file" > "$file.new"
+            mv "$file.new" "$file"
+          done
+          awk -v version="$VERSION" '
+            previous == "name = \"herdr-worktrunk\"" && /^version = / { $0 = "version = \"" version "\"" }
+            { print; previous = $0 }
+          ' Cargo.lock > Cargo.lock.new
+          mv Cargo.lock.new Cargo.lock
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -am "chore: release $VERSION"
+          git tag "$VERSION"
+          git push origin "refs/tags/$VERSION"
+          echo "Tagged $VERSION"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          assets="herdr-worktrunk-linux-x86_64 herdr-worktrunk-linux-aarch64 herdr-worktrunk-macos-x86_64 herdr-worktrunk-macos-aarch64"
+          for asset in $assets; do
+            test -f "$asset" || { echo "missing $asset" >&2; exit 1; }
+          done
+          sha256sum $assets > SHA256SUMS
+          cat SHA256SUMS
+      # Create a draft, upload all the assets, then publish: nobody downloads a partial release.
+      # A published release keeps its assets. If a run fails after the creation of the draft,
+      # a re-run of the same push fills this draft.
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.version.outputs.version }}
+        run: |
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then
+              echo "The release $TAG is already published: its assets stay." >&2
+              exit 0
+            fi
+          else
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false
