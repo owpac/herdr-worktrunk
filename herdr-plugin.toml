@@ -71,3 +71,13 @@ placement = "popup"
 width = "90%"
 height = "80%"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" merge"]
+
+# A small popup with a message and an OK button: an action opens it when its popup cannot work,
+# for example the picker outside a git repository.
+[[panes]]
+id = "message"
+title = "Worktrunk"
+placement = "popup"
+width = 64
+height = 10
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" message"]

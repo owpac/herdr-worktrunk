@@ -5,24 +5,24 @@
 //!   herdr-worktrunk observe                    start the observer in the background
 //!   herdr-worktrunk observe --run              the observer itself
 //!   herdr-worktrunk open picker|remover|merger an action: open a popup
-//!   herdr-worktrunk pick|remove|merge          the command of a popup
+//!   herdr-worktrunk pick|remove|merge|message  the command of a popup
 
 mod actions;
 mod config;
 mod git;
 mod herdr;
 mod observer;
+mod ui;
 mod wt;
 
 use std::env;
-use std::io::{self, BufRead, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use herdr::Error;
 
 const USAGE: &str =
-    "usage: herdr-worktrunk observe | open picker|remover|merger | pick | remove | merge";
+    "usage: herdr-worktrunk observe | open picker|remover|merger | pick | remove | merge | message";
 
 /// A folder that herdr gives in an environment variable, else a default.
 fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
@@ -54,28 +54,23 @@ fn observe(is_observer: bool) -> Result<(), Error> {
     }
 }
 
-/// In a popup, wait for Enter: the message then stays on the screen.
-fn wait_for_enter() {
-    if io::stdin().is_terminal() {
-        println!("Press Enter to close.");
-        let mut line = String::new();
-        // The pane closes after this read: its result does not matter.
-        let _ = io::stdin().lock().read_line(&mut line);
-    }
-}
-
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    let (result, is_popup) = match arguments.as_slice() {
-        ["observe"] => (observe(false), false),
-        ["observe", "--run"] => (observe(true), false),
-        ["open", entrypoint @ ("picker" | "remover" | "merger")] => {
-            (actions::open(entrypoint), false)
+    // `popup` is the command of a popup: its errors show in a message box.
+    let (result, popup) = match arguments.as_slice() {
+        ["message"] => {
+            actions::message();
+            return ExitCode::SUCCESS;
         }
-        ["pick"] => (actions::pick(), true),
-        ["remove"] => (actions::remove(), true),
-        ["merge"] => (actions::merge(), true),
+        ["observe"] => (observe(false), None),
+        ["observe", "--run"] => (observe(true), None),
+        ["open", entrypoint @ ("picker" | "remover" | "merger")] => {
+            (actions::open(entrypoint), None)
+        }
+        ["pick"] => (actions::pick(), Some("pick")),
+        ["remove"] => (actions::remove(), Some("remove")),
+        ["merge"] => (actions::merge(), Some("merge")),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -84,11 +79,14 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("herdr-worktrunk: {error}");
-            if is_popup {
-                wait_for_enter();
-            } else {
-                herdr::notify(&error.to_string());
+            match popup {
+                Some(command) => {
+                    ui::show_message(actions::popup_title(command), &error.to_string());
+                }
+                None => {
+                    eprintln!("herdr-worktrunk: {error}");
+                    herdr::notify(&error.to_string());
+                }
             }
             ExitCode::FAILURE
         }
