@@ -8,7 +8,6 @@
 //! context in environment variables.
 
 use std::env;
-use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::git::{self, Checkout};
@@ -145,20 +144,6 @@ fn target_worktree(workspace_id: &str) -> Result<Checkout, Error> {
     Ok(checkout)
 }
 
-/// Ask a yes or no question on the terminal. The default is no.
-fn confirm(question: &str) -> Result<bool, Error> {
-    print!("{question} [y/N] ");
-    io::stdout()
-        .flush()
-        .map_err(|error| Error::Command(error.to_string()))?;
-    let mut answer = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut answer)
-        .map_err(|error| Error::Command(error.to_string()))?;
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
-}
-
 /// After a removal: give the focus to the main checkout, then close the
 /// workspace of the removed worktree.
 fn close_after_removal(workspace_id: &str, checkout: &Checkout) -> Result<(), Error> {
@@ -175,9 +160,11 @@ fn close_after_removal(workspace_id: &str, checkout: &Checkout) -> Result<(), Er
 pub fn remove() -> Result<(), Error> {
     let workspace_id = popup_workspace()?;
     let checkout = target_worktree(&workspace_id)?;
-    println!("{}", checkout.root.display());
-    let question = "Remove this worktree? wt keeps a branch that is not merged.";
-    if !confirm(question)? {
+    let question = format!(
+        "Remove the worktree {}?\nwt keeps the branch if it is not merged.",
+        checkout.root.display()
+    );
+    if !ui::confirm(popup_title("remove"), &question, "Remove") {
         return Ok(());
     }
     wt::remove(&checkout.main_checkout(), &checkout.root)?;
@@ -189,9 +176,11 @@ pub fn remove() -> Result<(), Error> {
 pub fn merge() -> Result<(), Error> {
     let workspace_id = popup_workspace()?;
     let checkout = target_worktree(&workspace_id)?;
-    println!("{}", checkout.root.display());
-    let question = "Merge this worktree into the default branch (wt merge), then remove it?";
-    if !confirm(question)? {
+    let question = format!(
+        "Merge the worktree {} into the default branch (wt merge), then remove it?",
+        checkout.root.display()
+    );
+    if !ui::confirm(popup_title("merge"), &question, "Merge") {
         return Ok(());
     }
     wt::merge(&checkout.root)?;
