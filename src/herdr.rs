@@ -65,6 +65,8 @@ pub struct Workspace {
     pub pane_count: u32,
     #[serde(default)]
     pub tab_count: u32,
+    #[serde(default)]
+    pub focused: bool,
 }
 
 /// The live state of herdr, in one call.
@@ -208,6 +210,16 @@ pub fn workspace_checkout(workspace_id: &str) -> Result<Option<WorkspaceCheckout
         checkout_path: PathBuf::from(source),
         is_linked_worktree: false,
     }))
+}
+
+/// Tell if a workspace has the focus in the herdr UI.
+pub fn workspace_is_focused(workspace_id: &str) -> Result<bool, Error> {
+    let snapshot = snapshot()?;
+    let is_focused = snapshot
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.workspace_id == workspace_id && workspace.focused);
+    Ok(is_focused)
 }
 
 /// Tell if an agent works in a workspace.

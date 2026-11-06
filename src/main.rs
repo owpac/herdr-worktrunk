@@ -65,8 +65,9 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         // The events of the fzf picker.
-        ["picker-rows", cache, query @ ..] => {
-            picker::print_rows(Path::new(cache), query.first().copied().unwrap_or_default());
+        ["picker-rows", repository, cache, query @ ..] => {
+            let query = query.first().copied().unwrap_or_default();
+            picker::print_rows(Path::new(repository), Path::new(cache), query);
             return ExitCode::SUCCESS;
         }
         ["picker-preview", repository, cache, kind, branch, path] => {

@@ -216,6 +216,13 @@ pub fn show_message(title: &str, message: &str) {
     read_key();
 }
 
+/// Show `title` and `message` without a button, while a command works.
+pub fn show_progress(title: &str, message: &str) {
+    if is_interactive() {
+        draw(title, message, &[], 0, "please wait");
+    }
+}
+
 /// Print `message` under the output of a command, and wait for a key. The
 /// output stays on the screen: the user can read it.
 pub fn wait_after_output(message: &str) {

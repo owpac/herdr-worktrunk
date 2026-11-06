@@ -35,6 +35,7 @@ const FOLDER_VARIABLE: &str = "TRUNK_FOLDER";
 const CHECKOUT_VARIABLE: &str = "TRUNK_CHECKOUT";
 const OPERATION_VARIABLE: &str = "TRUNK_OPERATION";
 const RETURN_VARIABLE: &str = "TRUNK_RETURN";
+const REPOSITORY_VARIABLE: &str = "TRUNK_REPOSITORY";
 const TITLE_VARIABLE: &str = "TRUNK_MESSAGE_TITLE";
 const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 
@@ -205,6 +206,7 @@ pub fn pick() -> Result<(), Error> {
                 return Ok(());
             };
             let folder_text = folder.to_string_lossy();
+            let repository_text = main_checkout.to_string_lossy();
             return open_after_this_popup(
                 "confirm",
                 &folder,
@@ -213,6 +215,7 @@ pub fn pick() -> Result<(), Error> {
                     (CHECKOUT_VARIABLE, &path.to_string_lossy()),
                     (RETURN_VARIABLE, RETURN_TO_PICKER),
                     (FOLDER_VARIABLE, &folder_text),
+                    (REPOSITORY_VARIABLE, &repository_text),
                 ],
             );
         }
@@ -270,7 +273,14 @@ pub fn confirm() -> Result<(), Error> {
     if let Err(error) = &result {
         ui::show_message(TITLE, &error.to_string());
     }
-    let folder = popup_folder()?;
+    // The folder of the picker can be the deleted worktree: then the
+    // picker comes back in the main checkout.
+    let mut folder = popup_folder()?;
+    if git::checkout_of(&folder).is_none() {
+        if let Some(repository) = env::var_os(REPOSITORY_VARIABLE) {
+            folder = PathBuf::from(repository);
+        }
+    }
     let folder_text = folder.to_string_lossy();
     open_after_this_popup("picker", &folder, &[(FOLDER_VARIABLE, &folder_text)])
 }
@@ -327,20 +337,25 @@ fn ask_and_run() -> Result<(), Error> {
     if !ui::confirm("Delete the worktree", &question, "Delete", true) {
         return Ok(());
     }
+    ui::show_progress(
+        "Delete the worktree",
+        &format!("Deleting the worktree of {branch}…"),
+    );
     wt::remove_quietly(&checkout.main_checkout(), &checkout.root)?;
-    // From an action, the focus goes to the main checkout. From the
-    // picker, the observer closes the workspace of the worktree.
-    if let Some(workspace_id) = &workspace_from_action {
+    if let Some(workspace_id) = &workspace_id {
         close_after_removal(workspace_id, &checkout)?;
     }
     Ok(())
 }
 
-/// After a removal: give the focus to the main checkout, then close the
-/// workspace of the removed worktree.
+/// After a removal: close the workspace of the removed worktree at once.
+/// If this workspace has the focus, the focus goes first to the main
+/// checkout (else herdr gives it to another workspace).
 fn close_after_removal(workspace_id: &str, checkout: &Checkout) -> Result<(), Error> {
-    let main_checkout = checkout.main_checkout();
-    herdr::open_checkout(&main_checkout, &main_checkout, true)?;
+    if herdr::workspace_is_focused(workspace_id)? {
+        let main_checkout = checkout.main_checkout();
+        herdr::open_checkout(&main_checkout, &main_checkout, true)?;
+    }
     match herdr::close_workspace(workspace_id) {
         // The observer can close the workspace first.
         Err(Error::Herdr { code, .. }) if code == "workspace_not_found" => Ok(()),

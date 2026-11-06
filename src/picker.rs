@@ -188,7 +188,16 @@ fn read_cache(cache: &Path) -> Vec<String> {
 }
 
 /// fzf event `picker-rows`: print the rows for the typed name.
-pub fn print_rows(cache: &Path, query: &str) {
+///
+/// The first call reads `wt list` and writes the cache: fzf shows the
+/// picker at once, with a spinner until the rows arrive. A key during the
+/// load cancels this call, so each call loads the rows if the cache is
+/// missing.
+pub fn print_rows(repository: &Path, cache: &Path, query: &str) {
+    if !cache.exists() {
+        // Without rows, the picker still offers the create row.
+        let _ = write_cache(cache, repository);
+    }
     let mut stdout = io::stdout().lock();
     for row in rows_for_query(&read_cache(cache), query) {
         // fzf closes the pipe when the user types again: stop without error.
@@ -326,15 +335,15 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
         .map(|checkout| checkout.main_checkout())
         .unwrap_or_else(|| repository.to_path_buf());
     let cache = cache_path();
-    let lines = write_cache(&cache, &main_checkout)?;
+    let _ = fs::remove_file(&cache);
     let executable = env::current_exe()
         .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
     let binary = shell_quote(&executable.to_string_lossy());
     let repository_text = shell_quote(&main_checkout.to_string_lossy());
     let cache_text = shell_quote(&cache.to_string_lossy());
-    let rows_command = format!("{binary} picker-rows {cache_text} {{q}}");
+    let rows_command = format!("{binary} picker-rows {repository_text} {cache_text} {{q}}");
     let _ = fs::remove_file(tab_path(&cache));
-    let mut fzf = Command::new("fzf")
+    let fzf = Command::new("fzf")
         .args([
             "--ansi",
             "--layout",
@@ -358,6 +367,8 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
             "{binary} picker-preview {repository_text} {cache_text} {{1}} {{2}} {{3}}"
         ))
         .arg("--bind")
+        .arg(format!("start:reload({rows_command})"))
+        .arg("--bind")
         .arg(format!(
             "change:reload({rows_command})+change-header:{HEADER}"
         ))
@@ -373,14 +384,11 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
         .arg(format!(
             "btab:transform({binary} picker-tab {cache_text} previous)"
         ))
-        .stdin(Stdio::piped())
+        // The event start loads the rows.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|error| Error::Command(format!("cannot run fzf: {error}")))?;
-    if let Some(mut input) = fzf.stdin.take() {
-        // fzf can stop before it reads all the rows: ignore a broken pipe.
-        let _ = input.write_all(lines.join("\n").as_bytes());
-    }
     let output = fzf
         .wait_with_output()
         .map_err(|error| Error::Command(format!("fzf failed: {error}")))?;
