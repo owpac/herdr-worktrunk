@@ -1,4 +1,4 @@
-id = "trunk"
+id = "herdr-worktrunk"
 name = "Worktrunk"
 # The version of a release: YYYY.M.N. On main, the version stays 0.0.0. The release workflow
 # writes the version in the commit of the tag of each release.

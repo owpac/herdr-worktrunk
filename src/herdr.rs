@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// The ID of this plugin in herdr-plugin.toml.
-pub const PLUGIN_ID: &str = "trunk";
+pub const PLUGIN_ID: &str = "herdr-worktrunk";
 
 /// A failure of a herdr command, or of another command of this plugin.
 #[derive(Debug)]

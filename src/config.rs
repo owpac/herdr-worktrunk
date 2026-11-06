@@ -1,5 +1,5 @@
 //! The config file of the plugin: `config.toml` in the config folder that
-//! herdr gives to the plugin (`herdr plugin config-dir trunk`).
+//! herdr gives to the plugin (`herdr plugin config-dir herdr-worktrunk`).
 //!
 //! The agents also read this file (the skill worktrees of the agent
 //! plugin herdr): `agent_mode` and the `[repositories."<path>"]` tables

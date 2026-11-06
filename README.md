@@ -8,11 +8,11 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 
 | Action | Result |
 |--------|--------|
-| `trunk.pick` | Opens the worktree picker (fzf) in a popup, with the worktrees and the branches of `wt list`. Type to filter. The worktree opens in its herdr workspace. |
-| `trunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question in a small popup. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
-| `trunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then deletes it, after a question in a small popup. A large popup shows the output of wt. |
+| `herdr-worktrunk.pick` | Opens the worktree picker (fzf) in a popup, with the worktrees and the branches of `wt list`. Type to filter. The worktree opens in its herdr workspace. |
+| `herdr-worktrunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question in a small popup. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
+| `herdr-worktrunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then deletes it, after a question in a small popup. A large popup shows the output of wt. |
 
-`trunk.remove` and `trunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent. If an action cannot work (for example the picker outside a git repository), a small popup gives the reason, with an OK button.
+`herdr-worktrunk.remove` and `herdr-worktrunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent. If an action cannot work (for example the picker outside a git repository), a small popup gives the reason, with an OK button.
 
 ### Keys of the picker
 
@@ -42,11 +42,11 @@ Limits:
 - A workspace where an agent works stays open after the removal of its worktree, for example after `wt merge` in the agent. Close it with the herdr key `close_workspace`.
 - A pane that moves gets a new pane ID: address an agent with its herdr name. A running `herdr agent prompt --wait` on this agent stops with `agent_not_running`: run `herdr agent wait <name>`.
 
-herdr runs `[[startup]]` when the server starts, but not when the plugin is installed. Thus the event `pane.agent_detected` also starts the observer. A lock keeps one observer for each herdr server. If an update replaces the binary, the observer runs the new binary. Its log is `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/trunk/`).
+herdr runs `[[startup]]` when the server starts, but not when the plugin is installed. Thus the event `pane.agent_detected` also starts the observer. A lock keeps one observer for each herdr server. If an update replaces the binary, the observer runs the new binary. Its log is `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
 
 ## Configuration
 
-`config.toml` in the config folder of the plugin (`herdr plugin config-dir trunk`):
+`config.toml` in the config folder of the plugin (`herdr plugin config-dir herdr-worktrunk`):
 
 ```toml
 # Start the observer (default: true).
@@ -91,19 +91,19 @@ remove_worktree = ""
 [[keys.command]]
 key = "prefix+shift+g"
 type = "plugin_action"
-command = "trunk.pick"
+command = "herdr-worktrunk.pick"
 description = "pick or create a worktree (wt)"
 
 [[keys.command]]
 key = "prefix+shift+x"
 type = "plugin_action"
-command = "trunk.remove"
+command = "herdr-worktrunk.remove"
 description = "remove the worktree of the workspace (wt)"
 
 [[keys.command]]
 key = "prefix+shift+m"
 type = "plugin_action"
-command = "trunk.merge"
+command = "herdr-worktrunk.merge"
 description = "merge the worktree of the workspace (wt)"
 ```
 
