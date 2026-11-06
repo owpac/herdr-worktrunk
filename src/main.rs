@@ -12,11 +12,12 @@ mod config;
 mod git;
 mod herdr;
 mod observer;
+mod picker;
 mod ui;
 mod wt;
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use herdr::Error;
@@ -61,6 +62,19 @@ fn main() -> ExitCode {
     let (result, popup) = match arguments.as_slice() {
         ["message"] => {
             actions::message();
+            return ExitCode::SUCCESS;
+        }
+        // The events of the fzf picker.
+        ["picker-rows", cache, query @ ..] => {
+            picker::print_rows(Path::new(cache), query.first().copied().unwrap_or_default());
+            return ExitCode::SUCCESS;
+        }
+        ["picker-preview", repository, kind, branch] => {
+            picker::print_preview(Path::new(repository), kind, branch);
+            return ExitCode::SUCCESS;
+        }
+        ["picker-remove", repository, cache, kind, branch] => {
+            picker::remove(Path::new(repository), Path::new(cache), kind, branch);
             return ExitCode::SUCCESS;
         }
         ["observe"] => (observe(false), None),

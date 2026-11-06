@@ -8,11 +8,21 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 
 | Action | Result |
 |--------|--------|
-| `trunk.pick` | Opens the picker of `wt` in a popup. Type to filter. `Enter` opens a worktree or a branch (wt creates its worktree), `alt-c` creates a worktree with the typed name, `alt-x` removes a worktree, `Esc` cancels. The worktree opens in its herdr workspace. |
+| `trunk.pick` | Opens the worktree picker (fzf) in a popup, with the worktrees and the branches of `wt list`. Type to filter. The worktree opens in its herdr workspace. |
 | `trunk.remove` | Removes the worktree of the focused workspace with `wt remove`, after a question. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
 | `trunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then removes it, after a question. |
 
-`trunk.remove` and `trunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent.
+`trunk.remove` and `trunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent. If an action cannot work (for example the picker outside a git repository), a small popup gives the reason, with an OK button.
+
+### Keys of the picker
+
+| Key | Result |
+|-----|--------|
+| `Enter` | Opens the selected worktree, or the worktree of the selected branch (wt creates it). If the typed name matches no branch, the first row is `+ Create worktree <name>`: `Enter` on this row creates the worktree. |
+| `cmd+⌫` (`ctrl-u`) | Removes the selected worktree with `wt remove`, after a question. wt keeps a branch that is not merged. |
+| `Esc` | Cancels. |
+
+The terminal sends no `cmd` key to a program. iTerm2 sends `ctrl-u` for `cmd+⌫`, so the picker binds `ctrl-u`. The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`): this plugin uses fzf, so that its keys match the other keys of macOS.
 
 ## The observer
 
@@ -53,7 +63,7 @@ The plugin reads only the top-level key `observe`, and ignores the other keys.
 
 - herdr 0.9.0 or later, on macOS or Linux.
 - worktrunk (`wt`) and git on the `PATH` of the herdr server.
-- For `alt-c` and `alt-x` in the picker, the terminal sends the Option key as Meta (alt). For example, in iTerm2: Settings › Profiles › Keys › Right Option key › Esc+.
+- [fzf](https://github.com/junegunn/fzf) for the picker. The plugin uses its events `change`, `reload` and `execute` (tested with fzf 0.74).
 
 ## Installation
 

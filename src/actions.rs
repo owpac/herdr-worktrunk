@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use crate::git::{self, Checkout};
 use crate::herdr::{self, Error};
+use crate::picker::{self, Row};
 use crate::ui;
 use crate::wt;
 
@@ -90,15 +91,21 @@ fn repository_of(folder: &Path) -> Result<Checkout, Error> {
     })
 }
 
-/// Popup picker: pick or create a worktree with wt, then open its workspace.
+/// Popup picker: pick or create a worktree, then open its workspace.
 pub fn pick() -> Result<(), Error> {
     let folder = match env::var_os(FOLDER_VARIABLE) {
         Some(folder) => PathBuf::from(folder),
         None => env::current_dir().map_err(|error| Error::Command(error.to_string()))?,
     };
     let repository = repository_of(&folder)?;
-    let Some(picked) = wt::pick(&repository.root)? else {
+    let main_checkout = repository.main_checkout();
+    let Some(row) = picker::pick(&repository.root)? else {
         return Ok(());
+    };
+    let picked = match row {
+        Row::Worktree { path, .. } => path,
+        Row::Branch { branch } => wt::switch(&main_checkout, &branch, false)?,
+        Row::Create { name } => wt::switch(&main_checkout, &name, true)?,
     };
     let checkout = git::checkout_of(&picked)
         .ok_or_else(|| Error::Command(format!("{} is not a git checkout.", picked.display())))?;

@@ -8,36 +8,33 @@ use serde_json::Value;
 
 use crate::herdr::Error;
 
-/// Show the picker of wt, and return the checkout that the user picks.
-///
-/// The picker lists the worktrees and the local branches. Enter opens a
-/// row (wt creates the worktree of a branch), alt-c creates a worktree
-/// with the typed name, alt-x removes a row, and Esc cancels. The picker
-/// draws on the terminal, and prints its JSON result on stdout.
-///
-/// Returns None if the user cancels.
-pub fn pick(repository: &Path) -> Result<Option<PathBuf>, Error> {
-    let output = Command::new("wt")
-        .arg("-C")
-        .arg(repository)
-        .args(["switch", "--branches", "--no-cd", "--format", "json"])
+/// Open the worktree of `branch` with wt (wt creates it if necessary),
+/// and return its path. With `is_new_branch`, wt also creates the branch
+/// from the default branch. The wt hooks run, and their questions use the
+/// terminal of the user.
+pub fn switch(repository: &Path, branch: &str, is_new_branch: bool) -> Result<PathBuf, Error> {
+    let mut command = Command::new("wt");
+    command.arg("-C").arg(repository).arg("switch");
+    if is_new_branch {
+        command.arg("--create");
+    }
+    let output = command
+        .args([branch, "--no-cd", "--format", "json"])
         .stdin(Stdio::inherit())
         .stderr(Stdio::inherit())
         .output()
         .map_err(|error| Error::Command(format!("cannot run wt: {error}")))?;
     if !output.status.success() {
-        return Err(Error::Command("The wt picker failed.".to_owned()));
+        return Err(Error::Command(format!(
+            "wt did not open the worktree of {branch}."
+        )));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-    let result: Value = serde_json::from_str(text.trim())
+    let result: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| Error::Command(format!("wt switch: invalid JSON: {error}")))?;
     let path = result["path"]
         .as_str()
         .ok_or_else(|| Error::Command("wt switch gave no path.".to_owned()))?;
-    Ok(Some(PathBuf::from(path)))
+    Ok(PathBuf::from(path))
 }
 
 /// Run a wt command on the terminal of the user, and fail if it fails.

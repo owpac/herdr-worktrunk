@@ -28,7 +28,7 @@ command = ["bin/herdr-worktrunk", "observe"]
 [[actions]]
 id = "pick"
 title = "Worktree: pick or create"
-description = "Open the wt picker: Enter opens a worktree or a branch, alt-c creates a worktree, alt-x removes one"
+description = "Open the worktree picker: Enter opens or creates a worktree, cmd+⌫ (ctrl-u) removes one, Esc cancels"
 contexts = ["global"]
 command = ["bin/herdr-worktrunk", "open", "picker"]
 
