@@ -69,8 +69,17 @@ fn main() -> ExitCode {
             picker::print_rows(Path::new(cache), query.first().copied().unwrap_or_default());
             return ExitCode::SUCCESS;
         }
-        ["picker-preview", repository, kind, branch] => {
-            picker::print_preview(Path::new(repository), kind, branch);
+        ["picker-preview", repository, cache, kind, branch, path] => {
+            picker::print_preview(Path::new(repository), Path::new(cache), kind, branch, path);
+            return ExitCode::SUCCESS;
+        }
+        ["picker-tab", cache, direction] => {
+            picker::change_tab(Path::new(cache), *direction == "next");
+            return ExitCode::SUCCESS;
+        }
+        ["picker-backspace", repository, cache, query @ ..] => {
+            let query = query.first().copied().unwrap_or_default();
+            picker::backspace_action(Path::new(repository), Path::new(cache), query);
             return ExitCode::SUCCESS;
         }
         ["picker-remove", repository, cache, kind, branch] => {

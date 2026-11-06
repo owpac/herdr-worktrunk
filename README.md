@@ -19,10 +19,12 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 | Key | Result |
 |-----|--------|
 | `Enter` | Opens the selected worktree, or the worktree of the selected branch (wt creates it). If the typed name matches no branch, the first row is `+ Create worktree <name>`: `Enter` on this row creates the worktree. |
-| `cmd+⌫` (`ctrl-u`) | Removes the selected worktree with `wt remove`, after a question. wt keeps a branch that is not merged. |
+| `⌫` | With an empty filter: removes the selected worktree with `wt remove`, after a question (Cancel is the default button). wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. With text in the filter: erases a character. |
+| `Tab`, `shift-Tab` | Change the tab of the preview: `diff` (all the changes since the branch left the default branch, `wt step diff`), `log` (the commits), `changes` (the changes that are not committed). |
+| `shift-↑`, `shift-↓` | Scroll the preview. |
 | `Esc` | Cancels. |
 
-The terminal sends no `cmd` key to a program. iTerm2 sends `ctrl-u` for `cmd+⌫`, so the picker binds `ctrl-u`. The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`): this plugin uses fzf, so that its keys match the other keys of macOS.
+The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a terminal program never sees the `cmd` key. Thus this plugin uses fzf, with keys that do not need `alt` or `cmd`.
 
 ## The observer
 

@@ -6,17 +6,22 @@
 //! - `Enter` opens the selected worktree or branch. When the typed name
 //!   matches no branch, the first row is `+ Create worktree <name>`:
 //!   `Enter` on this row creates the worktree.
-//! - `cmd+⌫` removes the selected worktree with `wt remove`. iTerm2 sends
-//!   `ctrl-u` for `cmd+⌫`, so the picker binds `ctrl-u`.
+//! - `⌫` removes the selected worktree with `wt remove`, after a question,
+//!   when the filter is empty. When the filter has text, `⌫` erases a
+//!   character, as usual.
+//! - `Tab` and `shift-Tab` change the tab of the preview: the diff since
+//!   the branch left the default branch, the log, and the changes that
+//!   are not committed. `shift-↑` and `shift-↓` scroll the preview.
 //! - `Esc` cancels.
 //!
 //! fzf runs this binary for its events: `picker-rows` gives the rows for
-//! the typed name, `picker-preview` gives the preview, and
-//! `picker-remove` removes a worktree.
+//! the typed name, `picker-preview` gives the preview, `picker-tab`
+//! changes the tab of the preview, `picker-backspace` decides what `⌫`
+//! does, and `picker-remove` removes a worktree.
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -24,13 +29,17 @@ use serde_json::Value;
 
 use crate::git;
 use crate::herdr::Error;
+use crate::ui;
 
 /// fzf exits with 130 when the user cancels.
 const FZF_CANCEL_EXIT_CODE: i32 = 130;
 /// fzf exits with 1 when no row matches.
 const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
-const HEADER: &str = "Enter: open or create · cmd+⌫: remove · Esc: cancel";
-const PREVIEW_COMMIT_COUNT: &str = "15";
+const HEADER: &str =
+    "Enter: open or create · ⌫ (empty filter): remove · Tab: preview · Esc: cancel";
+const PREVIEW_COMMIT_COUNT: &str = "20";
+/// The tabs of the preview, in the order of `Tab`.
+const PREVIEW_TABS: [&str; 3] = ["diff", "log", "changes"];
 
 /// A row of the picker. Its fields, separated by tabs: the kind, the
 /// branch, the path of the worktree (empty for a branch), then the text
@@ -73,10 +82,14 @@ impl Row {
                 String::new(),
                 format!("\x1b[32m+ Create worktree\x1b[0m {name}"),
             ),
-            Row::Worktree { path, .. } => (
-                path.display().to_string(),
-                format!("{status}  \x1b[2m{}\x1b[0m", path.display()),
-            ),
+            Row::Worktree { path, .. } => {
+                // The folder name is sufficient: the full path is long.
+                let folder = path.file_name().unwrap_or(path.as_os_str());
+                (
+                    path.display().to_string(),
+                    format!("{status}  \x1b[2m{}\x1b[0m", folder.to_string_lossy()),
+                )
+            }
             Row::Branch { .. } => (
                 String::new(),
                 format!("{status}  \x1b[2mbranch, no worktree\x1b[0m"),
@@ -174,62 +187,173 @@ pub fn print_rows(cache: &Path, query: &str) {
     }
 }
 
-/// fzf event `picker-preview`: print the last commits and the changes.
-pub fn print_preview(repository: &Path, kind: &str, branch: &str) {
+/// The file that keeps the tab of the preview, next to the cache.
+fn tab_path(cache: &Path) -> PathBuf {
+    cache.with_extension("tab")
+}
+
+fn read_tab(cache: &Path) -> usize {
+    fs::read_to_string(tab_path(cache))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .filter(|tab| *tab < PREVIEW_TABS.len())
+        .unwrap_or(0)
+}
+
+/// The label of the preview: the tabs, with the current tab in brackets.
+fn preview_label(current: usize) -> String {
+    let tabs: Vec<String> = PREVIEW_TABS
+        .iter()
+        .enumerate()
+        .map(|(index, tab)| {
+            if index == current {
+                format!("[{tab}]")
+            } else {
+                format!(" {tab} ")
+            }
+        })
+        .collect();
+    format!(" {} ", tabs.join(" "))
+}
+
+/// fzf event `picker-tab`: go to the next (or the previous) tab of the
+/// preview, and print the fzf actions that show it.
+pub fn change_tab(cache: &Path, is_next: bool) {
+    let count = PREVIEW_TABS.len();
+    let current = read_tab(cache);
+    let tab = if is_next {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    };
+    // Without the file, the preview stays on its first tab.
+    let _ = fs::write(tab_path(cache), tab.to_string());
+    println!(
+        "refresh-preview+change-preview-label:{}",
+        preview_label(tab)
+    );
+}
+
+/// Run a command for the preview, and print its output and its errors.
+fn print_command(command: &mut Command) {
+    let output = command.env("GIT_PAGER", "cat").env("PAGER", "cat").output();
+    match output {
+        Ok(output) => {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            print!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Err(error) => println!("cannot run the preview: {error}"),
+    }
+}
+
+/// fzf event `picker-preview`: print the current tab of the preview.
+pub fn print_preview(repository: &Path, cache: &Path, kind: &str, branch: &str, path: &str) {
     if kind == "create" {
         println!("Enter creates the worktree {branch} from the default branch.");
         return;
     }
-    let log = Command::new("git")
-        .arg("-C")
-        .arg(repository)
-        .args(["log", "--oneline", "--decorate", "--color=always", "-n"])
-        .arg(PREVIEW_COMMIT_COUNT)
-        .arg(branch)
-        .arg("--")
-        .output();
-    if let Ok(output) = log {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
+    match PREVIEW_TABS[read_tab(cache)] {
+        "diff" => print_command(Command::new("wt").arg("-C").arg(repository).args([
+            "step",
+            "diff",
+            "--branch",
+            branch,
+            "--",
+            "--color=always",
+        ])),
+        "log" => print_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["log", "--oneline", "--decorate", "--color=always", "-n"])
+                .arg(PREVIEW_COMMIT_COUNT)
+                .arg(branch)
+                .arg("--"),
+        ),
+        _ if path.is_empty() => println!("{branch} has no worktree: no changes to show."),
+        _ => {
+            print_command(Command::new("git").arg("-C").arg(path).args([
+                "-c",
+                "color.status=always",
+                "status",
+                "--short",
+                "--branch",
+            ]));
+            println!();
+            print_command(Command::new("git").arg("-C").arg(path).args([
+                "diff",
+                "--color=always",
+                "HEAD",
+            ]));
+        }
     }
 }
 
-/// Ask a yes or no question on the terminal. The default is no.
-fn confirm(question: &str) -> bool {
-    print!("{question} [y/N] ");
-    let _ = io::stdout().flush();
-    let mut answer = String::new();
-    let _ = io::stdin().lock().read_line(&mut answer);
-    matches!(answer.trim(), "y" | "Y" | "yes")
+/// The fzf action that removes the selected worktree, then reloads the rows.
+fn remove_action(binary: &str, repository: &str, cache: &str) -> String {
+    let rows_command = format!("{binary} picker-rows {cache} {{q}}");
+    format!(
+        "execute({binary} picker-remove {repository} {cache} {{1}} {{2}})+reload({rows_command})"
+    )
+}
+
+/// fzf event `picker-backspace`: with an empty filter, `⌫` removes the
+/// selected worktree. Else it erases a character.
+pub fn backspace_action(repository: &Path, cache: &Path, query: &str) {
+    if !query.is_empty() {
+        println!("backward-delete-char");
+        return;
+    }
+    let Ok(executable) = env::current_exe() else {
+        println!("backward-delete-char");
+        return;
+    };
+    println!(
+        "{}",
+        remove_action(
+            &shell_quote(&executable.to_string_lossy()),
+            &shell_quote(&repository.to_string_lossy()),
+            &shell_quote(&cache.to_string_lossy()),
+        )
+    );
 }
 
 /// fzf event `picker-remove`: remove the selected worktree with wt, after
 /// a question, then refresh the cache.
 pub fn remove(repository: &Path, cache: &Path, kind: &str, branch: &str) {
+    let title = "Worktrunk: remove";
     match kind {
         "worktree" => {}
         "main" => {
-            println!("The main checkout cannot be removed. Press Enter.");
-            let _ = io::stdin().lock().read_line(&mut String::new());
+            ui::show_message(title, "The main checkout cannot be removed.");
             return;
         }
         _ => {
-            println!("{branch} has no worktree to remove. Press Enter.");
-            let _ = io::stdin().lock().read_line(&mut String::new());
+            ui::show_message(title, &format!("{branch} has no worktree to remove."));
             return;
         }
     }
     let question =
-        format!("Remove the worktree of {branch}? wt keeps a branch that is not merged.");
-    if confirm(&question) {
-        let status = Command::new("wt")
-            .arg("-C")
-            .arg(repository)
-            .args(["remove", "--foreground", branch])
-            .status();
-        if !matches!(status, Ok(status) if status.success()) {
-            println!("wt did not remove the worktree (see above). Press Enter.");
-            let _ = io::stdin().lock().read_line(&mut String::new());
+        format!("Remove the worktree of {branch}?\nwt keeps the branch if it is not merged.");
+    if !ui::confirm(title, &question, "Remove") {
+        return;
+    }
+    let output = Command::new("wt")
+        .arg("-C")
+        .arg(repository)
+        .args(["remove", "--foreground", branch])
+        .stdin(Stdio::inherit())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let details = String::from_utf8_lossy(&output.stderr);
+            ui::show_message(
+                title,
+                &format!("wt did not remove the worktree.\n{}", details.trim()),
+            );
         }
+        Err(error) => ui::show_message(title, &format!("cannot run wt: {error}")),
     }
     // The observer closes the workspace of the removed worktree.
     let _ = write_cache(cache, repository);
@@ -250,6 +374,7 @@ pub fn pick(repository: &Path) -> Result<Option<Row>, Error> {
     let repository_text = shell_quote(&main_checkout.to_string_lossy());
     let cache_text = shell_quote(&cache.to_string_lossy());
     let rows_command = format!("{binary} picker-rows {cache_text} {{q}}");
+    let _ = fs::remove_file(tab_path(&cache));
     let mut fzf = Command::new("fzf")
         .args([
             "--ansi",
@@ -265,15 +390,27 @@ pub fn pick(repository: &Path) -> Result<Option<Row>, Error> {
             "--header",
             HEADER,
             "--preview-window",
-            "right,45%",
+            "right,50%",
         ])
+        .arg("--preview-label")
+        .arg(preview_label(0))
         .arg("--preview")
-        .arg(format!("{binary} picker-preview {repository_text} {{1}} {{2}}"))
+        .arg(format!(
+            "{binary} picker-preview {repository_text} {cache_text} {{1}} {{2}} {{3}}"
+        ))
         .arg("--bind")
         .arg(format!("change:reload({rows_command})"))
         .arg("--bind")
         .arg(format!(
-            "ctrl-u:execute({binary} picker-remove {repository_text} {cache_text} {{1}} {{2}})+reload({rows_command})"
+            "bspace:transform({binary} picker-backspace {repository_text} {cache_text} {{q}})"
+        ))
+        .arg("--bind")
+        .arg(format!(
+            "tab:transform({binary} picker-tab {cache_text} next)"
+        ))
+        .arg("--bind")
+        .arg(format!(
+            "btab:transform({binary} picker-tab {cache_text} previous)"
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -287,6 +424,7 @@ pub fn pick(repository: &Path) -> Result<Option<Row>, Error> {
         .wait_with_output()
         .map_err(|error| Error::Command(format!("fzf failed: {error}")))?;
     let _ = fs::remove_file(&cache);
+    let _ = fs::remove_file(tab_path(&cache));
     match output.status.code() {
         Some(0) => {}
         Some(FZF_CANCEL_EXIT_CODE) | Some(FZF_NO_MATCH_EXIT_CODE) => return Ok(None),
