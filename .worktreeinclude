@@ -1,0 +1,5 @@
+# The gitignored files that `wt step copy-ignored` copies to each new worktree.
+# The build cache of Cargo. On APFS, the copy uses no more disk space.
+target/
+# The local permissions of Claude Code.
+.claude/settings.local.json
