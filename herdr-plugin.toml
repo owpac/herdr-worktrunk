@@ -46,15 +46,15 @@ description = "Merge the worktree of the focused workspace into the default bran
 contexts = ["global"]
 command = ["bin/herdr-worktrunk", "open", "merger"]
 
-# herdr starts a plugin pane in the folder of the workspace, not in the plugin root: the commands
-# use HERDR_PLUGIN_ROOT.
+# herdr starts a plugin pane in the folder of the workspace (--cwd). As for an action, herdr finds
+# bin/herdr-worktrunk in the plugin root.
 [[panes]]
 id = "picker"
 title = "Worktrunk"
 placement = "popup"
 width = "90%"
 height = "80%"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" pick"]
+command = ["bin/herdr-worktrunk", "pick"]
 
 # The question before a deletion or a merge. herdr shows one popup at a time: the picker closes,
 # this popup asks, then the picker comes back.
@@ -64,7 +64,7 @@ title = "Worktrunk"
 placement = "popup"
 width = 64
 height = 12
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" confirm"]
+command = ["bin/herdr-worktrunk", "confirm"]
 
 # The output of wt merge.
 [[panes]]
@@ -73,7 +73,7 @@ title = "Worktrunk: merge"
 placement = "popup"
 width = "90%"
 height = "80%"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" merger"]
+command = ["bin/herdr-worktrunk", "merger"]
 
 # A small popup with a message and an OK button: an action opens it when its popup cannot work,
 # for example the picker outside a git repository.
@@ -83,4 +83,4 @@ title = "Worktrunk"
 placement = "popup"
 width = 64
 height = 10
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-worktrunk\" message"]
+command = ["bin/herdr-worktrunk", "message"]
