@@ -78,6 +78,7 @@ Limits:
 - The thread works only when herdr runs. It does not check a repository without a herdr workspace: the `post-start` hook of wt can run `wt step prune` for it.
 - The thread sees only the agents. If a shell or an editor is open in the worktree, the thread removes the worktree, and the observer closes the workspace. Save your files before the merge.
 - The thread stops a `gh` command after 1 minute, and a `git` command after 30 seconds.
+- The thread never approves the hooks of a project (`--yes`). If a `pre-remove` or `post-remove` hook of the project has no approval, `wt remove` fails, and the log shows the error. Run `wt config approvals add` in the repository.
 - The observer writes each removal and each new error in `observer.log`. An error that stays gives one line.
 
 ## Configuration
