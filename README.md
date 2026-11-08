@@ -44,6 +44,44 @@ Limits:
 
 herdr runs `[[startup]]` when the server starts, but not when the plugin is installed. Thus the event `pane.agent_detected` also starts the observer. A lock keeps one observer for each herdr server. If an update replaces the binary, the observer runs the new binary. Its log is `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
 
+The observer reads `config.toml` when it starts. After a change, stop the observer: `pkill -f 'herdr-worktrunk observe --run'`. The next agent that herdr detects starts it again.
+
+### The worktrees of the merged pull requests
+
+With `prune_merged = true` (see [Configuration](#configuration)), the observer also removes the worktree of each merged pull request. A second thread checks the repositories every 5 minutes. It checks a repository if a herdr workspace shows one of its checkouts.
+
+The thread removes the worktree of a branch only if GitHub merged a pull request of this branch, if the default branch does not contain the local commit, and if one of these conditions is true:
+
+- The last commit of the pull request is the local commit of the branch.
+- The pull request contains the local commit. This case covers the button "Update branch" of GitHub: it adds a commit that the local branch does not have.
+
+The thread keeps:
+
+- a worktree where an agent works: the folder of the agent is in the worktree, or the workspace of the agent shows the worktree,
+- a worktree whose local commit is in the default branch. A new worktree starts there, also on the name of an old branch. `wt step prune` removes this worktree, for example after a merge with a merge commit.
+- the main worktree, a detached worktree and a locked worktree,
+- a worktree with changes that are not committed: `wt remove` refuses it,
+- a branch that got a new commit after the check. Just before the removal, the thread reads the commit of the branch again.
+
+The thread removes the worktree and its branch with `wt remove --force-delete`. GitHub merged the local commit, so the default branch has the work, also after a squash merge. Without `--force-delete`, wt keeps a branch if it does not find its content in the default branch, for example if the default branch later changed the same files. `--force-delete` acts only on the branch: the thread never uses `--force`, which removes the changes that are not committed. GitHub keeps the commits of the pull request (`refs/pull/<number>/head`). Then the observer closes the workspace of the worktree (rule 2).
+
+The thread does not run `git fetch`. A fetch every 5 minutes can ask the ssh agent (for example 1Password) for a key while nobody is at the computer. gh uses the API of GitHub, with its own token.
+
+To see the worktrees that the thread removes, run `list-merged` with the binary of the plugin. This command removes no worktree, and does not know the agents of herdr.
+
+```sh
+bin/herdr-worktrunk list-merged <folder of the repository>
+```
+
+Limits:
+
+- The thread checks only a remote `origin` on the host `github.com`. An ssh alias of the host (`Host` in `~/.ssh/config`) does not work.
+- The thread works only when herdr runs. It does not check a repository without a herdr workspace: the `post-start` hook of wt can run `wt step prune` for it.
+- The thread sees only the agents. If a shell or an editor is open in the worktree, the thread removes the worktree, and the observer closes the workspace. Save your files before the merge.
+- The thread stops a `gh` command after 1 minute, and a `git` command after 30 seconds.
+- The thread never approves the hooks of a project (`--yes`). If a `pre-remove` or `post-remove` hook of the project has no approval, `wt remove` fails, and the log shows the error. Run `wt config approvals add` in the repository.
+- The observer writes each removal and each new error in `observer.log`. An error that stays gives one line. When the thread starts, the log shows `prune_merged: on`.
+
 ## Configuration
 
 `config.toml` in the config folder of the plugin (`herdr plugin config-dir herdr-worktrunk`):
@@ -51,6 +89,9 @@ herdr runs `[[startup]]` when the server starts, but not when the plugin is inst
 ```toml
 # Start the observer (default: true).
 observe = true
+
+# The observer removes the worktree of each merged pull request (default: false). Needs gh.
+prune_merged = false
 
 # What an agent can do without a question at the end of a task in a worktree: "ask" or "auto".
 # The plugin does not read this key: the agents read it (for example the skill worktrees of
@@ -61,13 +102,14 @@ agent_mode = "ask"
 agent_mode = "auto"
 ```
 
-The plugin reads only the top-level key `observe`, and ignores the other keys.
+The plugin reads only the top-level keys `observe` and `prune_merged`, and ignores the other keys.
 
 ## Requirements
 
 - herdr 0.9.0 or later, on macOS or Linux.
 - worktrunk (`wt`) and git on the `PATH` of the herdr server.
 - [fzf](https://github.com/junegunn/fzf) for the picker. The plugin uses its events `change`, `reload` and `execute` (tested with fzf 0.74).
+- With `prune_merged = true` only: [gh](https://cli.github.com) on the `PATH` of the herdr server, with a login (`gh auth login`).
 
 ## Installation
 
