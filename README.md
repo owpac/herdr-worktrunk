@@ -164,7 +164,7 @@ herdr plugin link "$PWD"
 bin/herdr-worktrunk observe                          # give the binary of the link to the observer
 ```
 
-`herdr plugin link` does not run the build step: run `scripts/install.sh` again after each change. The observer runs the new binary by itself. After `herdr plugin unlink` and an install, run `bin/herdr-worktrunk observe` of the installed folder, or wait for the next agent: the observer then runs the installed binary. The checks of the CI:
+`herdr plugin link` does not run the build step: run `scripts/install.sh` again after each change. A rebuild keeps the path of the binary: the observer sees its new modification time, and runs it by itself. A binary at another path needs an `observe` command: after `herdr plugin unlink` and an install, run `bin/herdr-worktrunk observe` of the installed folder, or wait for the next agent. The checks of the CI:
 
 ```sh
 cargo fmt --check
