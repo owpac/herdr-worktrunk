@@ -24,9 +24,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use crate::cleaner;
 use crate::git::{self, Checkout};
 use crate::herdr::{self, Error};
 use crate::picker::{self, Picked, Row};
+use crate::stale;
 use crate::ui;
 use crate::wt;
 
@@ -40,6 +42,15 @@ const TITLE_VARIABLE: &str = "TRUNK_MESSAGE_TITLE";
 const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 /// The reason of a question that the observer asks (an old worktree).
 const REASON_VARIABLE: &str = "TRUNK_REASON";
+/// The file of the list of the popup cleaner.
+const LIST_VARIABLE: &str = "TRUNK_CLEANER_LIST";
+/// The repository of the popup cleaner, else all the repositories of the
+/// herdr workspaces.
+const SCOPE_VARIABLE: &str = "TRUNK_CLEANER_SCOPE";
+/// `TRUNK_RETURN=cleaner`: after the question, the cleaner comes back.
+const RETURN_TO_CLEANER: &str = "cleaner";
+/// The popup confirm asks before the deletion of all the old worktrees.
+const DELETE_ALL: &str = "delete-all";
 
 /// The observer waits this number of times for a free popup, 2 seconds
 /// each time: 10 minutes at most.
@@ -86,6 +97,9 @@ pub fn open(entrypoint: &str) -> Result<(), Error> {
         .or_else(|| context["workspace_cwd"].as_str())
         .ok_or_else(|| Error::Command("The herdr action context has no folder.".to_owned()))?;
     let folder_path = Path::new(folder);
+    if entrypoint == "cleaner" {
+        return herdr::open_plugin_pane("cleaner", folder_path, &[(FOLDER_VARIABLE, folder)]);
+    }
     if entrypoint == "picker" {
         if let Err(error) = repository_of(folder_path) {
             return open_message(&error.to_string(), folder_path);
@@ -177,31 +191,6 @@ pub fn open_later(entrypoint: &str, folder: &Path, assignments: &[&str]) {
             _ => return,
         }
     }
-}
-
-/// Open the popup confirm about the deletion of the worktree `checkout`,
-/// with `reason` before the question. The observer calls this function:
-/// the popup removes the worktree if the user says yes.
-///
-/// herdr shows one popup at a time. Thus the function waits while another
-/// popup is open, for 10 minutes at most. It returns when the popup
-/// opens, not when the user answers.
-pub fn ask_to_delete(main_checkout: &Path, checkout: &Path, reason: &str) -> Result<(), Error> {
-    let checkout_text = checkout.to_string_lossy();
-    let environment = [
-        (CHECKOUT_VARIABLE, checkout_text.as_ref()),
-        (OPERATION_VARIABLE, DELETE),
-        (REASON_VARIABLE, reason),
-    ];
-    for _ in 0..ASK_ATTEMPTS {
-        match herdr::open_plugin_pane("confirm", main_checkout, &environment) {
-            Err(Error::Herdr { code, .. }) if code == "ui_busy" => thread::sleep(ASK_INTERVAL),
-            other => return other,
-        }
-    }
-    Err(Error::Command(
-        "another popup stayed open for 10 minutes".to_owned(),
-    ))
 }
 
 /// The checkout that holds `folder`, or an error for the user.
@@ -298,12 +287,33 @@ fn refuse_if_agent(workspace_id: &str) -> Result<(), Error> {
 /// picker opened this popup, the picker comes back after.
 pub fn confirm() -> Result<(), Error> {
     let result = ask_and_run();
-    let is_return_to_picker = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_PICKER);
-    if !is_return_to_picker {
+    let return_to = env::var(RETURN_VARIABLE).unwrap_or_default();
+    if return_to != RETURN_TO_PICKER && return_to != RETURN_TO_CLEANER {
         return result;
     }
     if let Err(error) = &result {
         ui::show_message(TITLE, &error.to_string());
+    }
+    if return_to == RETURN_TO_CLEANER {
+        // The cleaner comes back with the same list, without the deleted
+        // worktrees.
+        let folder = popup_folder()?;
+        let folder = if folder.exists() {
+            folder
+        } else {
+            env::temp_dir()
+        };
+        let list = env::var(LIST_VARIABLE).unwrap_or_default();
+        let folder_text = folder.to_string_lossy();
+        return open_after_this_popup(
+            "cleaner",
+            &folder,
+            &[
+                (LIST_VARIABLE, &list),
+                (FOLDER_VARIABLE, &folder_text),
+                (RETURN_VARIABLE, RETURN_TO_CLEANER),
+            ],
+        );
     }
     // The folder of the picker can be the deleted worktree: then the
     // picker comes back in the main checkout.
@@ -331,6 +341,9 @@ fn describe(checkout: &Checkout) -> (String, String) {
 /// The question of the popup confirm, and its operation.
 fn ask_and_run() -> Result<(), Error> {
     let operation = env::var(OPERATION_VARIABLE).unwrap_or_default();
+    if operation == DELETE_ALL {
+        return delete_all();
+    }
     let checkout_path = env::var_os(CHECKOUT_VARIABLE)
         .map(PathBuf::from)
         .ok_or_else(|| Error::Command("No worktree: run this popup from its action.".to_owned()))?;
@@ -381,6 +394,180 @@ fn ask_and_run() -> Result<(), Error> {
         close_after_removal(workspace_id, &checkout)?;
     }
     Ok(())
+}
+
+/// The question before the deletion of all the old worktrees of the list
+/// of the cleaner, then the deletions and a summary.
+fn delete_all() -> Result<(), Error> {
+    let list_path = PathBuf::from(env::var_os(LIST_VARIABLE).unwrap_or_default());
+    let old = stale::read_list(&list_path);
+    if old.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<String> = old
+        .iter()
+        .take(5)
+        .map(|worktree| format!("- {} ({} days)", worktree.branch, worktree.days))
+        .collect();
+    let more = if old.len() > shown.len() {
+        format!("\n… and {} more", old.len() - shown.len())
+    } else {
+        String::new()
+    };
+    let question = format!(
+        "Delete the {} old worktrees?\n{}{more}\nwt keeps a branch that is not merged.",
+        old.len(),
+        shown.join("\n")
+    );
+    if !ui::confirm("Clean the worktrees", &question, "Delete all", true) {
+        return Ok(());
+    }
+    let mut deleted = 0;
+    let mut kept = Vec::new();
+    for worktree in &old {
+        ui::show_progress(
+            "Clean the worktrees",
+            &format!("Deleting the worktree of {}…", worktree.branch),
+        );
+        let workspace_id = herdr::workspace_of_checkout(&worktree.path)?;
+        if let Some(workspace_id) = &workspace_id {
+            if herdr::workspace_has_agent(workspace_id)? {
+                kept.push(format!("{}: an agent works in it", worktree.branch));
+                continue;
+            }
+        }
+        match wt::remove_quietly(&worktree.main_checkout, &worktree.path) {
+            Ok(()) => {
+                deleted += 1;
+                if let (Some(workspace_id), Some(checkout)) =
+                    (&workspace_id, git::checkout_of(&worktree.main_checkout))
+                {
+                    let _ = close_after_removal(workspace_id, &checkout);
+                }
+            }
+            Err(_) => kept.push(format!("{}: wt refused it", worktree.branch)),
+        }
+    }
+    let mut summary = format!("Deleted {deleted} worktrees.");
+    if !kept.is_empty() {
+        summary.push_str(&format!("\nKept:\n{}", kept.join("\n")));
+    }
+    ui::show_message("Clean the worktrees", &summary);
+    Ok(())
+}
+
+/// Popup cleaner: the list of the old worktrees. `Enter` deletes one,
+/// `ctrl-a` deletes all of them, through the popup confirm. Then the list
+/// comes back, without the deleted worktrees.
+///
+/// The list comes from `TRUNK_CLEANER_LIST` (the observer, or the return
+/// after a question). Else the popup looks for the old worktrees of
+/// `TRUNK_CLEANER_SCOPE`, or of all the repositories of the herdr
+/// workspaces.
+pub fn cleaner(stale_days: u32) -> Result<(), Error> {
+    let folder = popup_folder()?;
+    let given_list = env::var_os(LIST_VARIABLE)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
+    let (list_path, old) = match given_list {
+        Some(path) => {
+            let old = stale::read_list(&path);
+            (path, old)
+        }
+        None => {
+            ui::show_progress("Clean the worktrees", "Looking for old worktrees…");
+            let scope = env::var_os(SCOPE_VARIABLE).map(PathBuf::from);
+            let old = cleaner::find_old_worktrees(scope.as_deref(), stale_days)?;
+            let path = env::temp_dir().join(format!(
+                "herdr-worktrunk-cleaner-{}.tsv",
+                std::process::id()
+            ));
+            stale::write_list(&path, &old)
+                .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
+            (path, old)
+        }
+    };
+    if old.is_empty() {
+        let _ = std::fs::remove_file(&list_path);
+        if !is_return {
+            ui::show_message(
+                "Clean the worktrees",
+                &format!(
+                    "No old worktree to clean: no worktree without pull request and without change for {stale_days} days."
+                ),
+            );
+        }
+        return Ok(());
+    }
+    let list_text = list_path.to_string_lossy();
+    let folder_text = folder.to_string_lossy();
+    match cleaner::choose(&old, &list_path)? {
+        None => {
+            let _ = std::fs::remove_file(&list_path);
+            Ok(())
+        }
+        Some(cleaner::Choice::DeleteAll) => open_after_this_popup(
+            "confirm",
+            &folder,
+            &[
+                (OPERATION_VARIABLE, DELETE_ALL),
+                (LIST_VARIABLE, &list_text),
+                (RETURN_VARIABLE, RETURN_TO_CLEANER),
+                (FOLDER_VARIABLE, &folder_text),
+            ],
+        ),
+        Some(cleaner::Choice::Delete(worktree)) => {
+            let reason = format!("No pull request, and no change for {} days.", worktree.days);
+            open_after_this_popup(
+                "confirm",
+                &folder,
+                &[
+                    (OPERATION_VARIABLE, DELETE),
+                    (CHECKOUT_VARIABLE, &worktree.path.to_string_lossy()),
+                    (REASON_VARIABLE, &reason),
+                    (LIST_VARIABLE, &list_text),
+                    (RETURN_VARIABLE, RETURN_TO_CLEANER),
+                    (FOLDER_VARIABLE, &folder_text),
+                ],
+            )
+        }
+    }
+}
+
+/// Open the popup cleaner with a list of old worktrees (the daily pass of
+/// the observer). herdr shows one popup at a time: wait while another
+/// popup is open, for 10 minutes at most.
+pub fn open_cleaner(folder: &Path, list_path: &Path) -> Result<(), Error> {
+    let list_text = list_path.to_string_lossy();
+    let folder_text = folder.to_string_lossy();
+    let environment = [
+        (LIST_VARIABLE, list_text.as_ref()),
+        (FOLDER_VARIABLE, folder_text.as_ref()),
+    ];
+    for _ in 0..ASK_ATTEMPTS {
+        match herdr::open_plugin_pane("cleaner", folder, &environment) {
+            Err(Error::Herdr { code, .. }) if code == "ui_busy" => thread::sleep(ASK_INTERVAL),
+            other => return other,
+        }
+    }
+    Err(Error::Command(
+        "another popup stayed open for 10 minutes".to_owned(),
+    ))
+}
+
+/// Open the popup cleaner from a shell (command clean): for the
+/// repository of `scope`, or for all the repositories of the herdr
+/// workspaces.
+pub fn open_cleaner_from_shell(scope: Option<&Path>) -> Result<(), Error> {
+    let folder = env::current_dir().map_err(|error| Error::Command(error.to_string()))?;
+    let folder_text = folder.to_string_lossy();
+    let scope_text = scope.map(|scope| scope.to_string_lossy().into_owned());
+    let mut environment = vec![(FOLDER_VARIABLE, folder_text.as_ref())];
+    if let Some(scope_text) = &scope_text {
+        environment.push((SCOPE_VARIABLE, scope_text.as_str()));
+    }
+    herdr::open_plugin_pane("cleaner", &folder, &environment)
 }
 
 /// After a removal: close the workspace of the removed worktree at once.

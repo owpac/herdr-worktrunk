@@ -11,6 +11,7 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 | `herdr-worktrunk.pick` | Opens the worktree picker (fzf) in a popup, with the worktrees and the branches of `wt list`. Type to filter. The worktree opens in its herdr workspace. |
 | `herdr-worktrunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question in a small popup. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
 | `herdr-worktrunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then deletes it, after a question in a small popup. A large popup shows the output of wt. |
+| `herdr-worktrunk.clean` | Opens the list of the old worktrees without pull request, in all the repositories of the herdr workspaces (see [The popup cleaner](#the-popup-cleaner)). |
 
 `herdr-worktrunk.remove` and `herdr-worktrunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent. If an action cannot work (for example the picker outside a git repository), a small popup gives the reason, with an OK button.
 
@@ -106,22 +107,34 @@ With `prune_merged = true` and `stale_days = <days>`, the thread also asks about
 - no change that is not committed,
 - no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the git folder of the worktree (a commit, a checkout, an add). Thus a new worktree on an old commit is not old.
 
-For each old worktree, the thread opens the popup of the plugin: `No pull request, and no change for <n> days. Delete the worktree of <branch>?`. `Delete` removes the worktree with `wt remove`: wt keeps the branch if it is not merged. `Cancel` keeps it. The popups come one after the other.
+If old worktrees exist, the thread opens the popup cleaner with them (see below). The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
 
-The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree).
+### The popup cleaner
 
-To see the old worktrees without a wait, run `list-stale` with the binary of the plugin. This command uses `stale_days`, or 7 days if `stale_days` is 0. It does not know the agents of herdr, and ignores the last questions.
+The action `herdr-worktrunk.clean` opens the list of the old worktrees of **all the repositories of the herdr workspaces**, in fzf. It uses the criteria above, with `stale_days` (or 7 days if `stale_days` is 0), and ignores the last questions.
+
+| Key | Result |
+|-----|--------|
+| `Enter` | Asks to delete the selected worktree, then the list comes back. |
+| `ctrl-a` | Asks to delete all the worktrees of the list. A progress popup, then a summary, shows the result. |
+| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker). |
+| `Esc` | Quits. |
+
+Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner keeps a worktree where an agent works, and closes the workspace of each deleted worktree.
+
+From a shell, `clean` opens the same popup, for one repository or for all of them. `list-stale` prints the old worktrees of one repository without a popup.
 
 ```sh
+bin/herdr-worktrunk clean [<folder of a repository>]
 bin/herdr-worktrunk list-stale <folder of the repository>
 ```
 
-To ask again at once, delete `stale-last` in the state folder: the next pass of the thread asks. The thread checks only the repositories of the herdr workspaces, with a remote `origin` on GitHub.
+The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh.
 
 Limits:
 
 - A shell prompt that runs `git status` in the worktree changes the git folder. Thus a worktree with such a shell open never gets old.
-- The thread waits 10 minutes at most for the answer to a popup. Then it stops, and asks about the other worktrees the next day.
+- The daily pass waits 10 minutes at most for a free popup. Then it stops, and tries again the next day.
 
 ## Configuration
 
@@ -192,6 +205,12 @@ key = "prefix+shift+m"
 type = "plugin_action"
 command = "herdr-worktrunk.merge"
 description = "merge the worktree of the workspace (wt)"
+
+[[keys.command]]
+key = "prefix+shift+c"
+type = "plugin_action"
+command = "herdr-worktrunk.clean"
+description = "clean the old worktrees (wt)"
 ```
 
 ## Development

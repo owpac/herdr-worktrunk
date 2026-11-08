@@ -2,10 +2,10 @@
 //!
 //! Once a day, the thread of the merged pull requests looks for the
 //! linked worktrees with no pull request, no agent, no change that is not
-//! committed, and no activity for `stale_days` days. For each one, it
-//! opens the popup confirm of the plugin: the user deletes the worktree,
-//! or cancels. The thread does not ask again about a worktree for
-//! `stale_days` days.
+//! committed, and no activity for `stale_days` days. It opens the popup
+//! cleaner of the plugin with these worktrees: the user deletes some or
+//! all of them, or quits. The thread does not ask again about a worktree
+//! for `stale_days` days. The action clean opens the same popup at once.
 //!
 //! 2 files in the state folder keep the dates, so a restart of the
 //! observer does not ask again:
@@ -107,9 +107,120 @@ fn format_asked(asked: &HashMap<PathBuf, u64>) -> String {
     lines.concat()
 }
 
+/// An old worktree without pull request: a candidate of the cleaning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OldWorktree {
+    pub main_checkout: PathBuf,
+    pub path: PathBuf,
+    pub branch: String,
+    /// The days without activity.
+    pub days: u64,
+}
+
+/// The canonical path of a folder, or the path itself.
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Select the old worktrees among the worktrees without pull request of
+/// the repository of `main_checkout`: no agent (`is_busy`), no activity
+/// for `stale_days` days, and no change that is not committed.
+///
+/// `asked` gives the last questions of the daily pass: a worktree gets a
+/// new question only after `stale_days` days. A manual cleaning gives
+/// None: it shows all the old worktrees.
+pub fn select_old(
+    main_checkout: &Path,
+    worktrees: Vec<crate::git::LinkedWorktree>,
+    is_busy: impl Fn(&Path) -> bool,
+    asked: Option<&HashMap<PathBuf, u64>>,
+    stale_days: u32,
+) -> Vec<OldWorktree> {
+    let now = now();
+    worktrees
+        .into_iter()
+        .filter_map(|worktree| {
+            if is_busy(&worktree.path) {
+                return None;
+            }
+            let path = canonical(&worktree.path);
+            if asked.is_some_and(|asked| !may_ask(asked, &path, now, stale_days)) {
+                return None;
+            }
+            let activity = crate::git::last_activity(&path)?;
+            if !is_stale(activity, now, stale_days) || !crate::git::is_clean(&path) {
+                return None;
+            }
+            Some(OldWorktree {
+                main_checkout: main_checkout.to_path_buf(),
+                path,
+                branch: worktree.branch,
+                days: now.saturating_sub(activity) / DAY,
+            })
+        })
+        .collect()
+}
+
+/// Write a list of old worktrees: one line for each worktree,
+/// `<path>\t<branch>\t<main checkout>\t<days>`. The popup cleaner reads
+/// this file.
+pub fn write_list(path: &Path, old: &[OldWorktree]) -> Result<(), std::io::Error> {
+    let text: String = old
+        .iter()
+        .map(|worktree| {
+            format!(
+                "{}\t{}\t{}\t{}\n",
+                worktree.path.display(),
+                worktree.branch,
+                worktree.main_checkout.display(),
+                worktree.days
+            )
+        })
+        .collect();
+    fs::write(path, text)
+}
+
+/// Read a list of old worktrees, without the worktrees that do not exist
+/// anymore (a deletion since the list was written).
+pub fn read_list(path: &Path) -> Vec<OldWorktree> {
+    fs::read_to_string(path)
+        .map(|text| parse_list(&text))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|worktree| worktree.path.exists())
+        .collect()
+}
+
+fn parse_list(text: &str) -> Vec<OldWorktree> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some(OldWorktree {
+                path: PathBuf::from(fields.next()?),
+                branch: fields.next()?.to_owned(),
+                main_checkout: PathBuf::from(fields.next()?),
+                days: fields.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_list_of_old_worktrees_is_read_back() {
+        let old = vec![OldWorktree {
+            main_checkout: PathBuf::from("/work/repo"),
+            path: PathBuf::from("/work/repo.old"),
+            branch: "feature/old".to_owned(),
+            days: 12,
+        }];
+        let text = "/work/repo.old\tfeature/old\t/work/repo\t12\nbad line\n";
+
+        assert_eq!(parse_list(text), old);
+    }
 
     const NOW: u64 = 1_800_000_000;
 

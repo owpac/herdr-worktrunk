@@ -35,7 +35,7 @@ use crate::git::{self, Checkout, LinkedWorktree};
 use crate::github::PullRequestState;
 use crate::herdr::{self, Error, Pane, Snapshot};
 use crate::prune::{self, FinishedWorktree};
-use crate::stale;
+use crate::stale::{self, OldWorktree};
 use crate::wt;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -620,15 +620,6 @@ struct PruneSettings {
     stale_days: u32,
 }
 
-/// An old worktree without pull request, for the daily question.
-#[derive(Clone, Debug)]
-struct OldWorktree {
-    main_checkout: PathBuf,
-    path: PathBuf,
-    branch: String,
-    days: u64,
-}
-
 /// Select the old worktrees among the worktrees without pull request: no
 /// agent, a question allowed again, no activity for `stale_days` days, and
 /// no change that is not committed.
@@ -639,35 +630,22 @@ fn old_worktrees(
     asked: &HashMap<PathBuf, u64>,
     stale_days: u32,
 ) -> Vec<OldWorktree> {
-    let now = stale::now();
-    worktrees
-        .into_iter()
-        .filter_map(|worktree| {
-            if !lock(view).agents_in(&worktree.path).is_empty() {
-                return None;
-            }
-            let path = canonical(&worktree.path);
-            if !stale::may_ask(asked, &path, now, stale_days) {
-                return None;
-            }
-            let activity = git::last_activity(&path)?;
-            if !stale::is_stale(activity, now, stale_days) || !git::is_clean(&path) {
-                return None;
-            }
-            Some(OldWorktree {
-                main_checkout: main_checkout.to_path_buf(),
-                path,
-                branch: worktree.branch,
-                days: now.saturating_sub(activity) / stale::DAY,
-            })
-        })
-        .collect()
+    let is_busy = |checkout: &Path| !lock(view).agents_in(checkout).is_empty();
+    stale::select_old(main_checkout, worktrees, is_busy, Some(asked), stale_days)
 }
 
-/// Ask about each old worktree in the popup confirm, one after the other,
-/// in a new thread: an open popup must not stop the removals.
+/// Open the popup cleaner with all the old worktrees, in a new thread: an
+/// open popup must not stop the removals. The thread records a question
+/// for each worktree of the list: `Esc` keeps them for `stale_days` days.
 fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: Arc<Log>) {
-    if old.is_empty() {
+    let Some(folder) = old.first().map(|worktree| worktree.main_checkout.clone()) else {
+        return;
+    };
+    let list_path = settings.state_dir.join("stale-list.tsv");
+    if let Err(error) = stale::write_list(&list_path, &old) {
+        log.write(&format!(
+            "cannot write the list of the old worktrees: {error}"
+        ));
         return;
     }
     let thread_log = Arc::clone(&log);
@@ -675,26 +653,23 @@ fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: 
         .name("stale_days".to_owned())
         .spawn(move || {
             let log = thread_log;
-            let mut asked = stale::read_asked(&settings.state_dir);
-            for worktree in old {
-                let reason = format!("No pull request, and no change for {} days.", worktree.days);
-                if let Err(error) =
-                    actions::ask_to_delete(&worktree.main_checkout, &worktree.path, &reason)
-                {
-                    log.write(&format!(
-                        "cannot ask about the old worktree of {}: {}",
-                        worktree.branch,
-                        one_line(&error)
-                    ));
-                    return;
-                }
-                asked.insert(worktree.path.clone(), stale::now());
-                stale::write_asked(&settings.state_dir, &asked);
+            if let Err(error) = actions::open_cleaner(&folder, &list_path) {
                 log.write(&format!(
-                    "asked about the old worktree of {} ({} days)",
-                    worktree.branch, worktree.days
+                    "cannot open the popup cleaner: {}",
+                    one_line(&error)
                 ));
+                return;
             }
+            let mut asked = stale::read_asked(&settings.state_dir);
+            let now = stale::now();
+            for worktree in &old {
+                asked.insert(worktree.path.clone(), now);
+            }
+            stale::write_asked(&settings.state_dir, &asked);
+            log.write(&format!(
+                "opened the popup cleaner with {} old worktrees",
+                old.len()
+            ));
         });
     if let Err(error) = started {
         log.write(&format!("cannot start the thread stale_days: {error}"));

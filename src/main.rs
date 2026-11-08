@@ -4,12 +4,14 @@
 //! Usage:
 //!   herdr-worktrunk observe                    start the observer in the background
 //!   herdr-worktrunk observe --run              the observer itself
-//!   herdr-worktrunk open picker|remover|merger an action: open a popup
-//!   herdr-worktrunk pick|confirm|merger|message  the command of a popup
+//!   herdr-worktrunk open picker|remover|merger|cleaner  an action: open a popup
+//!   herdr-worktrunk pick|confirm|merger|cleaner|message  the command of a popup
 //!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the merged or closed pull requests
 //!   herdr-worktrunk list-stale [<folder>]      list the old worktrees without pull request
+//!   herdr-worktrunk clean [<folder>]           open the popup cleaner from a shell
 
 mod actions;
+mod cleaner;
 mod config;
 mod git;
 mod github;
@@ -28,7 +30,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message | list-merged [<folder>] | list-stale [<folder>]";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner | pick | confirm | merger | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>]";
 
 /// The days without activity of `list-stale` when `stale_days` is 0.
 const DEFAULT_STALE_DAYS: u32 = 7;
@@ -95,6 +97,15 @@ fn list_merged(folder: &Path) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+/// The days without activity of an old worktree for the cleaning:
+/// `stale_days` of the config, or 7 days if the key is 0.
+fn stale_days_or_default() -> u32 {
+    match load_config().stale_days {
+        0 => DEFAULT_STALE_DAYS,
+        days => days,
+    }
 }
 
 /// Print the old worktrees without pull request in the repository of
@@ -169,14 +180,23 @@ fn main() -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
+        ["clean", folder @ ..] if folder.len() <= 1 => {
+            let scope = folder.first().map(Path::new);
+            if let Err(error) = actions::open_cleaner_from_shell(scope) {
+                eprintln!("herdr-worktrunk: {error}");
+                return ExitCode::FAILURE;
+            }
+            return ExitCode::SUCCESS;
+        }
         ["observe"] => (observe(false), None),
         ["observe", "--run"] => (observe(true), None),
-        ["open", entrypoint @ ("picker" | "remover" | "merger")] => {
+        ["open", entrypoint @ ("picker" | "remover" | "merger" | "cleaner")] => {
             (actions::open(entrypoint), None)
         }
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
+        ["cleaner"] => (actions::cleaner(stale_days_or_default()), Some("cleaner")),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
