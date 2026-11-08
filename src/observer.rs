@@ -25,7 +25,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{self, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -556,13 +556,19 @@ fn wanted_binary_path(state_dir: &Path) -> PathBuf {
 }
 
 /// Write the path of `binary` for the running observer. Write a temporary
-/// file, then rename it: the observer never reads a partial path.
+/// file, then rename it: the observer never reads a partial path. Each
+/// process has its own temporary file: 2 `observe` commands can run at
+/// the same time.
 fn write_wanted_binary(state_dir: &Path, binary: &Path) -> Result<(), Error> {
     let path = wanted_binary_path(state_dir);
-    let temporary = state_dir.join("observer.binary.tmp");
-    fs::write(&temporary, binary.as_os_str().as_bytes())
-        .and_then(|()| fs::rename(&temporary, &path))
-        .map_err(|error| Error::Command(format!("cannot write {}: {error}", path.display())))
+    let temporary = state_dir.join(format!("observer.binary.{}.tmp", process::id()));
+    let result = fs::write(&temporary, binary.as_os_str().as_bytes())
+        .and_then(|()| fs::rename(&temporary, &path));
+    if result.is_err() {
+        // The temporary file can stay after a failed rename.
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| Error::Command(format!("cannot write {}: {error}", path.display())))
 }
 
 /// Read the path that the last `observe` command wrote, or None if the
@@ -606,6 +612,7 @@ pub fn start(state_dir: &Path) -> Result<(), Error> {
         .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
     let written = write_wanted_binary(state_dir, &canonical(&executable));
     if lock.try_lock().is_err() {
+        // An observer runs: only the file can give it this binary.
         return written;
     }
     // The detached process takes the lock itself.
@@ -618,14 +625,60 @@ pub fn start(state_dir: &Path) -> Result<(), Error> {
         .process_group(0)
         .spawn()
         .map_err(|error| Error::Command(format!("cannot start the observer: {error}")))?;
-    written
+    // The new observer runs this binary: it does not need the file.
+    Ok(())
 }
 
-/// The modification time of the binary of the observer, or None if the
-/// binary does not exist.
-fn binary_time() -> Option<SystemTime> {
-    let executable = env::current_exe().ok()?;
-    fs::metadata(executable).ok()?.modified().ok()
+/// The modification time of a file, or None if the file does not exist.
+fn modification_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// What the observer knows about its binary, to run a new binary.
+struct BinaryWatch {
+    /// The canonical path of the binary of the observer, saved at the
+    /// start. On Linux, after a rebuild, `current_exe()` gives
+    /// "<path> (deleted)": the observer reads the saved path.
+    current: PathBuf,
+    /// The modification time of `current` at the start, or after a failed
+    /// `exec` of `current`.
+    time: Option<SystemTime>,
+    /// A wanted binary that `exec` refused: the observer does not try it
+    /// again.
+    refused: Option<PathBuf>,
+}
+
+impl BinaryWatch {
+    fn new(current: PathBuf) -> Self {
+        let time = modification_time(&current);
+        BinaryWatch {
+            current,
+            time,
+            refused: None,
+        }
+    }
+
+    /// Return the binary that the observer runs now, or None to keep its
+    /// process. A path to a binary that does not exist does not stop the
+    /// observer.
+    fn binary_to_run(&self, state_dir: &Path) -> Option<PathBuf> {
+        let wanted = read_wanted_binary(state_dir)
+            .map(|path| canonical(&path))
+            .filter(|path| path.is_file() && self.refused.as_ref() != Some(path));
+        let is_rebuilt =
+            modification_time(&self.current).is_some_and(|time| Some(time) != self.time);
+        binary_to_run(&self.current, wanted.as_deref(), is_rebuilt)
+    }
+
+    /// Remember a binary that `exec` refused.
+    fn refuse(&mut self, binary: PathBuf) {
+        if binary == self.current {
+            // Try again only after the next rebuild.
+            self.time = modification_time(&self.current);
+        } else {
+            self.refused = Some(binary);
+        }
+    }
 }
 
 /// Run the observer until herdr stops.
@@ -653,8 +706,15 @@ pub fn run(state_dir: &Path, prune_merged: bool) -> Result<(), Error> {
         observer.log.write("prune_merged: on");
         start_prune_thread(view, log);
     }
-    let current_binary = canonical(&env::current_exe().unwrap_or_default());
-    let started_time = binary_time();
+    let mut binary_watch = match env::current_exe() {
+        Ok(binary) => Some(BinaryWatch::new(canonical(&binary))),
+        Err(error) => {
+            observer
+                .log
+                .write(&format!("cannot find the binary of the observer: {error}"));
+            None
+        }
+    };
     let mut failures = 0;
     loop {
         match herdr::snapshot() {
@@ -670,24 +730,23 @@ pub fn run(state_dir: &Path, prune_merged: bool) -> Result<(), Error> {
                 }
             }
         }
-        // A path to a binary that does not exist does not stop the observer.
-        let wanted = read_wanted_binary(state_dir)
-            .map(|path| canonical(&path))
-            .filter(|path| path.is_file());
-        let is_rebuilt = binary_time().is_some_and(|time| Some(time) != started_time);
-        if let Some(binary) = binary_to_run(&current_binary, wanted.as_deref(), is_rebuilt) {
-            observer.log.write(&format!(
-                "new binary: {} -> {}",
-                current_binary.display(),
-                binary.display()
-            ));
-            // The new process takes the lock again: release it first.
-            drop(lock);
-            let error = Command::new(&binary).args(["observe", "--run"]).exec();
-            return Err(Error::Command(format!(
-                "cannot run the new binary {}: {error}",
-                binary.display()
-            )));
+        if let Some(watch) = binary_watch.as_mut() {
+            if let Some(binary) = watch.binary_to_run(state_dir) {
+                observer.log.write(&format!(
+                    "new binary: {} -> {}",
+                    watch.current.display(),
+                    binary.display()
+                ));
+                // The lock file closes at the exec (close-on-exec), so the
+                // new process takes the lock. If the exec fails, this
+                // process keeps the lock and continues.
+                let error = Command::new(&binary).args(["observe", "--run"]).exec();
+                observer.log.write(&format!(
+                    "cannot run the new binary {}: {error}",
+                    binary.display()
+                ));
+                watch.refuse(binary);
+            }
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -912,6 +971,48 @@ mod tests {
 
         assert_eq!(read_wanted_binary(&folder), Some(PathBuf::from(NEW_BINARY)));
         assert!(!folder.join("observer.binary.tmp").exists());
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_refused_binary_is_not_tried_again() {
+        let folder = test_folder("refused");
+        let current = canonical(&folder).join("current");
+        let new = canonical(&folder).join("new");
+        let newer = canonical(&folder).join("newer");
+        for binary in [&current, &new, &newer] {
+            fs::write(binary, "").unwrap();
+        }
+        let mut watch = BinaryWatch::new(current.clone());
+        write_wanted_binary(&folder, &new).unwrap();
+        assert_eq!(watch.binary_to_run(&folder), Some(new.clone()));
+
+        watch.refuse(new);
+
+        assert_eq!(watch.binary_to_run(&folder), None);
+        write_wanted_binary(&folder, &newer).unwrap();
+        assert_eq!(watch.binary_to_run(&folder), Some(newer));
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_rebuilt_binary_that_exec_refused_waits_for_the_next_rebuild() {
+        let folder = test_folder("rebuilt");
+        let current = canonical(&folder).join("current");
+        fs::write(&current, "").unwrap();
+        let mut watch = BinaryWatch::new(current.clone());
+        let later = SystemTime::now() + Duration::from_secs(60);
+        File::options()
+            .write(true)
+            .open(&current)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(watch.binary_to_run(&folder), Some(current.clone()));
+
+        watch.refuse(current);
+
+        assert_eq!(watch.binary_to_run(&folder), None);
         fs::remove_dir_all(&folder).unwrap();
     }
 
