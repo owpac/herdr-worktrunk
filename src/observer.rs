@@ -12,6 +12,10 @@
 //!
 //! The observer watches only the agents. A shell that changes its folder
 //! does not move. A change to another repository does not move.
+//!
+//! With `prune_merged = true`, a second thread removes the worktrees of
+//! the merged pull requests every 5 minutes (see `prune`). It skips a
+//! worktree where an agent works. Then the rule 2 closes the workspace.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -20,13 +24,21 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::git::{self, Checkout};
 use crate::herdr::{self, Error, Snapshot};
+use crate::prune;
+use crate::wt;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The thread of the merged pull requests waits this time after the
+/// start: the first snapshots give it the repositories.
+const PRUNE_FIRST_DELAY: Duration = Duration::from_secs(30);
+/// The time between 2 checks of the merged pull requests.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(300);
 /// The folder of a pane rarely changes: ask git again after this time.
 const CHECKOUT_CACHE_TIME: Duration = Duration::from_secs(30);
 /// After this number of failed snapshots in a row, herdr is stopped.
@@ -128,10 +140,72 @@ struct FirstCheckout {
 
 /// The state that the observer keeps between 2 snapshots.
 struct Observer {
-    log: Log,
+    log: Arc<Log>,
     workspaces: HashMap<String, FirstCheckout>,
     folders: HashMap<PathBuf, (Instant, Option<Checkout>)>,
     differences: HashSet<String>,
+    /// The view of the thread of the merged pull requests, if
+    /// `prune_merged` is true.
+    prune_view: Option<Arc<Mutex<PruneView>>>,
+}
+
+/// What the thread of the merged pull requests reads from the observer.
+/// The observer writes it at each snapshot.
+#[derive(Debug, Default)]
+struct PruneView {
+    /// The main checkout of each repository that a workspace shows.
+    repositories: HashSet<PathBuf>,
+    /// The checkouts where an agent works, as canonical paths.
+    busy_checkouts: HashSet<PathBuf>,
+}
+
+impl PruneView {
+    fn is_busy(&self, checkout: &Path) -> bool {
+        self.busy_checkouts.contains(&canonical(checkout))
+    }
+}
+
+/// Lock the view. A panic of the other thread does not stop this thread.
+fn lock(view: &Mutex<PruneView>) -> MutexGuard<'_, PruneView> {
+    view.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The canonical path of a folder, or the path itself if the folder does
+/// not exist. git and herdr can give 2 forms of the same folder, for
+/// example `/tmp` and `/private/tmp` on macOS.
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The checkouts where an agent works: the checkout of the folder of each
+/// agent, and the checkout of the workspace of each agent. The actions
+/// remove and merge refuse the same workspaces.
+fn busy_checkouts(
+    agent_panes: &[AgentPane],
+    workspaces: &HashMap<String, FirstCheckout>,
+) -> HashSet<PathBuf> {
+    let mut busy = HashSet::new();
+    for pane in agent_panes {
+        if let Some(checkout) = &pane.checkout {
+            busy.insert(canonical(&checkout.root));
+        }
+        let workspace_root = workspaces
+            .get(&pane.workspace_id)
+            .and_then(|first| first.root.as_deref());
+        if let Some(root) = workspace_root {
+            busy.insert(canonical(root));
+        }
+    }
+    busy
+}
+
+/// The main checkout of each repository that a workspace shows.
+fn repositories(workspaces: &HashMap<String, FirstCheckout>) -> HashSet<PathBuf> {
+    workspaces
+        .values()
+        .filter_map(|first| first.common_dir.as_deref().and_then(Path::parent))
+        .map(canonical)
+        .collect()
 }
 
 impl Observer {
@@ -215,6 +289,13 @@ impl Observer {
                 checkout_exists: first.root.as_deref().is_some_and(Path::exists),
             })
             .collect();
+        if let Some(view) = &self.prune_view {
+            let new_view = PruneView {
+                repositories: repositories(&self.workspaces),
+                busy_checkouts: busy_checkouts(&agent_panes, &self.workspaces),
+            };
+            *lock(view) = new_view;
+        }
         let (steps, differences) = plan(&agent_panes, &known, &self.differences);
         self.differences = differences;
         for step in steps {
@@ -311,9 +392,78 @@ impl Observer {
     }
 }
 
-/// A small log file in the state folder of the plugin.
+/// Start the thread of the merged pull requests. `git fetch` and gh take
+/// several seconds: this thread keeps them out of the loop of the
+/// snapshots, so the panes do not wait for the network.
+fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>) {
+    let thread_log = Arc::clone(&log);
+    let started = thread::Builder::new()
+        .name("prune-merged".to_owned())
+        .spawn(move || prune_loop(&view, &thread_log));
+    if let Err(error) = started {
+        log.write(&format!("cannot start the thread prune-merged: {error}"));
+    }
+}
+
+/// Check the merged pull requests of each repository, every 5 minutes.
+///
+/// The thread writes a message only if the previous pass did not write
+/// it: a failure that stays gives one line, not one line every 5 minutes.
+fn prune_loop(view: &Mutex<PruneView>, log: &Log) {
+    let mut previous_messages = HashSet::new();
+    thread::sleep(PRUNE_FIRST_DELAY);
+    loop {
+        let repositories: Vec<PathBuf> = lock(view).repositories.iter().cloned().collect();
+        let mut messages = Vec::new();
+        for repository in repositories {
+            if let Err(error) = prune_repository(&repository, view, &mut messages) {
+                messages.push(format!("prune-merged {}: {error}", repository.display()));
+            }
+        }
+        for message in &messages {
+            if !previous_messages.contains(message) {
+                log.write(message);
+            }
+        }
+        previous_messages = messages.into_iter().collect();
+        thread::sleep(PRUNE_INTERVAL);
+    }
+}
+
+/// Remove the merged worktrees of one repository, and add a message for
+/// each removal and each refusal of wt.
+///
+/// Ask the view again before each removal: an agent can enter a worktree
+/// during the calls to GitHub.
+fn prune_repository(
+    main_checkout: &Path,
+    view: &Mutex<PruneView>,
+    messages: &mut Vec<String>,
+) -> Result<(), Error> {
+    let is_busy = |checkout: &Path| lock(view).is_busy(checkout);
+    for worktree in prune::merged_worktrees(main_checkout, is_busy)? {
+        if is_busy(&worktree.path) {
+            continue;
+        }
+        match wt::remove_merged(main_checkout, &worktree.path) {
+            Ok(()) => messages.push(format!(
+                "removed the worktree of {}: its pull request is merged",
+                worktree.branch
+            )),
+            Err(error) => messages.push(format!(
+                "wt remove {}: {}",
+                worktree.branch,
+                error.to_string().replace('\n', " ")
+            )),
+        }
+    }
+    Ok(())
+}
+
+/// A small log file in the state folder of the plugin. The 2 threads of
+/// the observer write in it.
 struct Log {
-    file: Option<File>,
+    file: Mutex<Option<File>>,
 }
 
 impl Log {
@@ -327,15 +477,18 @@ impl Log {
             .truncate(is_too_big)
             .open(path)
             .ok();
-        Log { file }
+        Log {
+            file: Mutex::new(file),
+        }
     }
 
-    fn write(&mut self, message: &str) {
+    fn write(&self, message: &str) {
         let seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        if let Some(file) = &mut self.file {
+        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(file) = file.as_mut() {
             // The log is only for a diagnosis: a failed write must not stop
             // the observer.
             let _ = writeln!(file, "{seconds} {message}");
@@ -392,19 +545,28 @@ fn binary_time() -> Option<SystemTime> {
 /// Run the observer until herdr stops.
 ///
 /// If another observer has the lock, return at once. If an update of the
-/// plugin replaces the binary, the observer runs the new binary.
-pub fn run(state_dir: &Path) -> Result<(), Error> {
+/// plugin replaces the binary, the observer runs the new binary. With
+/// `prune_merged`, the observer also starts the thread of the merged pull
+/// requests.
+pub fn run(state_dir: &Path, prune_merged: bool) -> Result<(), Error> {
     let lock = open_lock(state_dir)?;
     if lock.try_lock().is_err() {
         return Ok(());
     }
+    let log = Arc::new(Log::open(&state_dir.join("observer.log")));
+    let prune_view = prune_merged.then(|| Arc::new(Mutex::new(PruneView::default())));
     let mut observer = Observer {
-        log: Log::open(&state_dir.join("observer.log")),
+        log: Arc::clone(&log),
         workspaces: HashMap::new(),
         folders: HashMap::new(),
         differences: HashSet::new(),
+        prune_view: prune_view.clone(),
     };
     observer.log.write("observer started");
+    if let Some(view) = prune_view {
+        observer.log.write("prune-merged: on");
+        start_prune_thread(view, log);
+    }
     let started_binary = binary_time();
     let mut failures = 0;
     loop {
@@ -554,6 +716,45 @@ mod tests {
         let (steps, _) = plan(&[], &[removed], &HashSet::new());
 
         assert!(steps.is_empty());
+    }
+
+    fn first_checkout(root: Option<&str>) -> FirstCheckout {
+        FirstCheckout {
+            root: root.map(PathBuf::from),
+            common_dir: root.map(|_| PathBuf::from("/work/repo/.git")),
+            is_linked_worktree: root.is_some_and(|root| root != "/work/repo"),
+        }
+    }
+
+    #[test]
+    fn an_agent_makes_busy_its_checkout_and_the_checkout_of_its_workspace() {
+        let workspaces =
+            HashMap::from([("w1".to_owned(), first_checkout(Some("/work/repo.feature")))]);
+        let panes = [agent_in("w1", Some(checkout("/work/repo.other")))];
+
+        let busy = busy_checkouts(&panes, &workspaces);
+
+        assert_eq!(
+            busy,
+            HashSet::from([
+                PathBuf::from("/work/repo.feature"),
+                PathBuf::from("/work/repo.other"),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_repositories_are_the_main_checkouts_of_the_workspaces() {
+        let workspaces = HashMap::from([
+            ("w1".to_owned(), first_checkout(Some("/work/repo"))),
+            ("w2".to_owned(), first_checkout(Some("/work/repo.feature"))),
+            ("w3".to_owned(), first_checkout(None)),
+        ]);
+
+        assert_eq!(
+            repositories(&workspaces),
+            HashSet::from([PathBuf::from("/work/repo")])
+        );
     }
 
     #[test]

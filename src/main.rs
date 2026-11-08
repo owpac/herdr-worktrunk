@@ -6,13 +6,17 @@
 //!   herdr-worktrunk observe --run              the observer itself
 //!   herdr-worktrunk open picker|remover|merger an action: open a popup
 //!   herdr-worktrunk pick|confirm|merger|message  the command of a popup
+//!   herdr-worktrunk prune-merged --dry-run [<folder>]
+//!                                              the worktrees of the merged pull requests
 
 mod actions;
 mod config;
 mod git;
+mod github;
 mod herdr;
 mod observer;
 mod picker;
+mod prune;
 mod ui;
 mod wt;
 
@@ -22,8 +26,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str =
-    "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message | prune-merged --dry-run [<folder>]";
 
 /// A folder that herdr gives in an environment variable, else a default.
 fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
@@ -41,7 +44,8 @@ fn observe(is_observer: bool) -> Result<(), Error> {
         "HERDR_PLUGIN_CONFIG_DIR",
         &[".config", "herdr", "plugins", "config", herdr::PLUGIN_ID],
     );
-    if !config::load(&config_dir).observe {
+    let config = config::load(&config_dir);
+    if !config.observe {
         return Ok(());
     }
     let state_dir = herdr_folder(
@@ -49,10 +53,27 @@ fn observe(is_observer: bool) -> Result<(), Error> {
         &[".local", "state", "herdr", "plugins", herdr::PLUGIN_ID],
     );
     if is_observer {
-        observer::run(&state_dir)
+        observer::run(&state_dir, config.prune_merged)
     } else {
         observer::start(&state_dir)
     }
+}
+
+/// Print the worktrees of the merged pull requests in the repository of
+/// `folder`: the worktrees that the observer removes with `prune_merged`.
+/// Remove nothing. This command does not know the agents of herdr.
+fn prune_dry_run(folder: &Path) -> Result<(), Error> {
+    let checkout = git::checkout_of(folder).ok_or_else(|| {
+        Error::Command(format!("{} is not in a git repository", folder.display()))
+    })?;
+    for worktree in prune::merged_worktrees(&checkout.main_checkout(), |_| false)? {
+        println!(
+            "would remove {} ({})",
+            worktree.path.display(),
+            worktree.branch
+        );
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -85,6 +106,14 @@ fn main() -> ExitCode {
         // The detached process that opens the next popup.
         ["open-later", entrypoint, folder, assignments @ ..] => {
             actions::open_later(entrypoint, Path::new(folder), assignments);
+            return ExitCode::SUCCESS;
+        }
+        ["prune-merged", "--dry-run", folder @ ..] if folder.len() <= 1 => {
+            let folder = Path::new(folder.first().copied().unwrap_or("."));
+            if let Err(error) = prune_dry_run(folder) {
+                eprintln!("herdr-worktrunk: {error}");
+                return ExitCode::FAILURE;
+            }
             return ExitCode::SUCCESS;
         }
         ["observe"] => (observe(false), None),
