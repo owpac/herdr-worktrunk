@@ -175,6 +175,28 @@ struct FreshShell {
     tab_id: String,
 }
 
+/// Return true if the move of `pane_id` out of the workspace
+/// `workspace_id` empties a workspace of a main checkout.
+///
+/// herdr closes a workspace without pane. The workspace of a main checkout
+/// is the first workspace of the group of its project: without it, the
+/// workspaces of the worktrees leave the group. Thus the observer opens a
+/// shell in it first.
+fn empties_main_workspace(
+    first: Option<&FirstCheckout>,
+    workspace_id: &str,
+    pane_id: &str,
+    panes: &[Pane],
+) -> bool {
+    let is_main = first.is_some_and(|first| first.root.is_some() && !first.is_linked_worktree);
+    let mut panes = panes
+        .iter()
+        .filter(|pane| pane.workspace_id == workspace_id);
+    let is_last_pane =
+        panes.next().is_some_and(|only| only.pane_id == pane_id) && panes.next().is_none();
+    is_main && is_last_pane
+}
+
 /// Return the only pane of a new workspace, if this pane is a shell
 /// without agent.
 ///
@@ -511,6 +533,15 @@ impl Observer {
         focus: bool,
         snapshot: &Snapshot,
     ) -> Result<(), Error> {
+        let source_first = self.workspaces.get(source_workspace);
+        if empties_main_workspace(source_first, source_workspace, pane_id, &snapshot.panes) {
+            if let Some(root) = source_first.and_then(|first| first.root.clone()) {
+                herdr::open_shell_tab(source_workspace, &root)?;
+                self.log.write(&format!(
+                    "opened a shell in the workspace {source_workspace}: it keeps the group of its project"
+                ));
+            }
+        }
         let existing = self
             .workspaces
             .iter()
@@ -1355,6 +1386,39 @@ mod tests {
         let panes = [pane("w2:p1", "w2", Some("codex"))];
 
         assert_eq!(fresh_shell(YOUNG, "w2", &panes), None);
+    }
+
+    #[test]
+    fn the_last_pane_of_a_main_workspace_leaves_a_shell() {
+        let main = first_checkout(Some("/work/repo"));
+        let panes = [pane("w1:p1", "w1", Some("claude"))];
+
+        assert!(empties_main_workspace(Some(&main), "w1", "w1:p1", &panes));
+    }
+
+    #[test]
+    fn a_main_workspace_with_another_pane_stays_without_a_new_shell() {
+        let main = first_checkout(Some("/work/repo"));
+        let panes = [
+            pane("w1:p1", "w1", Some("claude")),
+            pane("w1:p2", "w1", None),
+        ];
+
+        assert!(!empties_main_workspace(Some(&main), "w1", "w1:p1", &panes));
+    }
+
+    #[test]
+    fn a_worktree_workspace_can_close_after_its_last_pane() {
+        let worktree = first_checkout(Some("/work/repo.feature"));
+        let panes = [pane("w2:p1", "w2", Some("claude"))];
+
+        assert!(!empties_main_workspace(
+            Some(&worktree),
+            "w2",
+            "w2:p1",
+            &panes
+        ));
+        assert!(!empties_main_workspace(None, "w2", "w2:p1", &panes));
     }
 
     #[test]

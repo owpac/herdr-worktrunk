@@ -285,6 +285,22 @@ pub fn open_checkout(
     })
 }
 
+/// Open a new tab with a shell in `folder`, in an existing workspace,
+/// without the focus.
+pub fn open_shell_tab(workspace_id: &str, folder: &Path) -> Result<(), Error> {
+    let folder_text = folder.to_string_lossy();
+    run(&[
+        "tab",
+        "create",
+        "--workspace",
+        workspace_id,
+        "--cwd",
+        &folder_text,
+        "--no-focus",
+    ])?;
+    Ok(())
+}
+
 /// Move a pane to a new tab of an existing workspace.
 pub fn move_pane_to_new_tab(pane_id: &str, workspace_id: &str, focus: bool) -> Result<(), Error> {
     run(&[
