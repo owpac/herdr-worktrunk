@@ -150,18 +150,23 @@ struct Observer {
 }
 
 /// What the thread of the merged pull requests reads from the observer.
-/// The observer writes it at each snapshot.
+/// The observer writes it at each snapshot. The paths are not canonical:
+/// the thread makes them canonical, so the loop of the snapshots stays
+/// cheap.
 #[derive(Debug, Default)]
 struct PruneView {
     /// The main checkout of each repository that a workspace shows.
     repositories: HashSet<PathBuf>,
-    /// The checkouts where an agent works, as canonical paths.
+    /// The checkouts where an agent works.
     busy_checkouts: HashSet<PathBuf>,
 }
 
 impl PruneView {
     fn is_busy(&self, checkout: &Path) -> bool {
-        self.busy_checkouts.contains(&canonical(checkout))
+        let checkout = canonical(checkout);
+        self.busy_checkouts
+            .iter()
+            .any(|busy| canonical(busy) == checkout)
     }
 }
 
@@ -187,13 +192,13 @@ fn busy_checkouts(
     let mut busy = HashSet::new();
     for pane in agent_panes {
         if let Some(checkout) = &pane.checkout {
-            busy.insert(canonical(&checkout.root));
+            busy.insert(checkout.root.clone());
         }
         let workspace_root = workspaces
             .get(&pane.workspace_id)
-            .and_then(|first| first.root.as_deref());
+            .and_then(|first| first.root.clone());
         if let Some(root) = workspace_root {
-            busy.insert(canonical(root));
+            busy.insert(root);
         }
     }
     busy
@@ -204,7 +209,7 @@ fn repositories(workspaces: &HashMap<String, FirstCheckout>) -> HashSet<PathBuf>
     workspaces
         .values()
         .filter_map(|first| first.common_dir.as_deref().and_then(Path::parent))
-        .map(canonical)
+        .map(Path::to_path_buf)
         .collect()
 }
 
@@ -407,57 +412,78 @@ fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>) {
 
 /// Check the merged pull requests of each repository, every 5 minutes.
 ///
-/// The thread writes a message only if the previous pass did not write
-/// it: a failure that stays gives one line, not one line every 5 minutes.
+/// The thread writes each removal in the log. It writes an error only if
+/// the previous pass did not write it: an error that stays gives one line,
+/// not one line every 5 minutes.
 fn prune_loop(view: &Mutex<PruneView>, log: &Log) {
-    let mut previous_messages = HashSet::new();
+    let mut previous_errors = HashSet::new();
     thread::sleep(PRUNE_FIRST_DELAY);
     loop {
         let repositories: Vec<PathBuf> = lock(view).repositories.iter().cloned().collect();
-        let mut messages = Vec::new();
+        let repositories: HashSet<PathBuf> = repositories
+            .iter()
+            .map(|repository| canonical(repository))
+            .collect();
+        let mut errors = HashSet::new();
         for repository in repositories {
-            if let Err(error) = prune_repository(&repository, view, &mut messages) {
-                messages.push(format!("prune-merged {}: {error}", repository.display()));
+            prune_repository(&repository, view, log, &mut errors);
+        }
+        for error in &errors {
+            if !previous_errors.contains(error) {
+                log.write(error);
             }
         }
-        for message in &messages {
-            if !previous_messages.contains(message) {
-                log.write(message);
-            }
-        }
-        previous_messages = messages.into_iter().collect();
+        previous_errors = errors;
         thread::sleep(PRUNE_INTERVAL);
     }
 }
 
-/// Remove the merged worktrees of one repository, and add a message for
-/// each removal and each refusal of wt.
+/// Remove the merged worktrees of one repository. Write each removal in
+/// the log, and add each error to `errors`.
 ///
 /// Ask the view again before each removal: an agent can enter a worktree
 /// during the calls to GitHub.
 fn prune_repository(
     main_checkout: &Path,
     view: &Mutex<PruneView>,
-    messages: &mut Vec<String>,
-) -> Result<(), Error> {
+    log: &Log,
+    errors: &mut HashSet<String>,
+) {
     let is_busy = |checkout: &Path| lock(view).is_busy(checkout);
-    for worktree in prune::merged_worktrees(main_checkout, is_busy)? {
+    let worktrees = match prune::merged_worktrees(main_checkout, is_busy) {
+        Ok(worktrees) => worktrees,
+        Err(error) => {
+            errors.insert(format!(
+                "prune-merged {}: {}",
+                main_checkout.display(),
+                one_line(&error)
+            ));
+            return;
+        }
+    };
+    for worktree in worktrees {
         if is_busy(&worktree.path) {
             continue;
         }
         match wt::remove_merged(main_checkout, &worktree.path) {
-            Ok(()) => messages.push(format!(
+            Ok(()) => log.write(&format!(
                 "removed the worktree of {}: its pull request is merged",
                 worktree.branch
             )),
-            Err(error) => messages.push(format!(
-                "wt remove {}: {}",
-                worktree.branch,
-                error.to_string().replace('\n', " ")
-            )),
+            Err(error) => {
+                errors.insert(format!(
+                    "wt remove {}: {}",
+                    worktree.branch,
+                    one_line(&error)
+                ));
+            }
         }
     }
-    Ok(())
+}
+
+/// The text of an error on one line of the log.
+fn one_line(error: &Error) -> String {
+    error.to_string().replace('\n', " ")
 }
 
 /// A small log file in the state folder of the plugin. The 2 threads of

@@ -1,9 +1,12 @@
 //! The git facts that the plugin needs about a folder.
 
+use std::env;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::herdr::Error;
+use crate::process;
 
 /// A git checkout: the main checkout or a linked worktree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,17 +75,36 @@ pub struct LinkedWorktree {
     pub branch: String,
 }
 
+/// The time limit of a git command of the thread of the merged pull
+/// requests. `git fetch` can wait for the network.
+const GIT_TIME_LIMIT: Duration = Duration::from_secs(120);
+
 /// Run git in `folder` without a terminal: git cannot ask for a password.
 /// Return its output, or its error message.
 fn run_in(folder: &Path, arguments: &[&str]) -> Result<String, Error> {
-    let output = Command::new("git")
+    run_with_env(folder, arguments, &[])
+}
+
+/// Run git in `folder` without a terminal, with more environment
+/// variables, and with a time limit.
+fn run_with_env(
+    folder: &Path,
+    arguments: &[&str],
+    variables: &[(&str, &str)],
+) -> Result<String, Error> {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(folder)
         .args(arguments)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Error::Command(format!("cannot run git: {error}")))?;
+        .envs(variables.iter().copied());
+    let output = process::output_with_limit(&mut command, GIT_TIME_LIMIT).map_err(|error| {
+        Error::Command(format!(
+            "git {}: {error}",
+            arguments.first().copied().unwrap_or_default()
+        ))
+    })?;
     if !output.status.success() {
         let details = String::from_utf8_lossy(&output.stderr);
         return Err(Error::Command(format!(
@@ -139,8 +161,21 @@ pub fn origin_url(main_checkout: &Path) -> Option<String> {
 }
 
 /// Fetch `origin`, and delete the remote branches that `origin` deleted.
+///
+/// ssh must not ask for a passphrase or for a host key: the observer has
+/// no terminal. Thus, if the user gives no ssh command to git, `fetch`
+/// runs ssh with `BatchMode=yes`. ssh-agent still works.
 pub fn fetch(main_checkout: &Path) -> Result<(), Error> {
-    run_in(main_checkout, &["fetch", "--prune", "--quiet", "origin"]).map(drop)
+    let arguments = ["fetch", "--prune", "--quiet", "origin"];
+    let has_ssh_command = env::var_os("GIT_SSH_COMMAND").is_some()
+        || env::var_os("GIT_SSH").is_some()
+        || run_in(main_checkout, &["config", "--get", "core.sshCommand"]).is_ok();
+    let variables: &[(&str, &str)] = if has_ssh_command {
+        &[]
+    } else {
+        &[("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")]
+    };
+    run_with_env(main_checkout, &arguments, variables).map(drop)
 }
 
 /// Return the default branch of `origin` (for example `origin/main`), or

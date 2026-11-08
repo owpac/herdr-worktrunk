@@ -50,14 +50,15 @@ The observer reads `config.toml` when it starts. After a change, stop the observ
 
 With `prune_merged = true` (see [Configuration](#configuration)), the observer also removes the worktree of each merged pull request. A second thread checks the repositories every 5 minutes. It checks a repository if a herdr workspace shows one of its checkouts.
 
-The thread removes the worktree of a branch only if GitHub merged a pull request of this branch, and if one of these conditions is true:
+The thread removes the worktree of a branch only if GitHub merged a pull request of this branch, if the default branch does not contain the local commit, and if one of these conditions is true:
 
 - The last commit of the pull request is the local commit of the branch.
-- The pull request contains the local commit, and the default branch does not. This case covers the button "Update branch" of GitHub: it adds a commit that the local branch does not have.
+- The pull request contains the local commit. This case covers the button "Update branch" of GitHub: it adds a commit that the local branch does not have.
 
 The thread keeps:
 
 - a worktree where an agent works: the folder of the agent is in the worktree, or the workspace of the agent shows the worktree,
+- a worktree whose local commit is in the default branch. A new worktree starts there, also on the name of an old branch. `wt step prune` removes this worktree, for example after a merge with a merge commit.
 - the main worktree, a detached worktree and a locked worktree,
 - a worktree with changes that are not committed: `wt remove` refuses it.
 
@@ -65,7 +66,7 @@ The thread removes the worktree and its branch with `wt remove --force-delete`. 
 
 Before each check, the thread runs `git fetch --prune` in the repository. Thus `wt step prune` also sees an up-to-date default branch of `origin`.
 
-To see the worktrees that the thread removes, run the binary of the plugin with `--dry-run`. This command removes nothing, and does not know the agents of herdr.
+To see the worktrees that the thread removes, run the binary of the plugin with `--dry-run`. This command removes no worktree, and does not know the agents of herdr. As the thread, it runs `git fetch --prune` first.
 
 ```sh
 bin/herdr-worktrunk prune-merged --dry-run <folder of the repository>
@@ -73,9 +74,10 @@ bin/herdr-worktrunk prune-merged --dry-run <folder of the repository>
 
 Limits:
 
-- The thread checks only a remote `origin` on `github.com`. It ignores the other repositories.
+- The thread checks only a remote `origin` on the host `github.com`. An ssh alias of the host (`Host` in `~/.ssh/config`) does not work.
 - The thread works only when herdr runs. It does not check a repository without a herdr workspace: the `post-start` hook of wt can run `wt step prune` for it.
-- `git fetch` and `gh` have no time limit. If the network stops, the thread waits, but the panes still move.
+- The thread sees only the agents. If a shell or an editor is open in the worktree, the thread removes the worktree, and the observer closes the workspace. Save your files before the merge.
+- The thread stops `git fetch` after 2 minutes, and `gh` after 1 minute. If you give no ssh command to git, `git fetch` runs ssh with `BatchMode=yes`: ssh cannot ask for a passphrase. ssh-agent still works.
 - The observer writes each removal and each new error in `observer.log`. An error that stays gives one line.
 
 ## Configuration

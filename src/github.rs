@@ -1,23 +1,36 @@
 //! The calls to GitHub, with the gh CLI. Only the removal of the merged
 //! worktrees (`prune_merged`) uses them.
 
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use crate::herdr::Error;
+use crate::process;
 
-/// The prefixes of a GitHub remote URL, before `owner/name`.
-const GITHUB_PREFIXES: [&str; 3] = [
-    "git@github.com:",
-    "ssh://git@github.com/",
-    "https://github.com/",
-];
+/// The time limit of a gh command.
+const GH_TIME_LIMIT: Duration = Duration::from_secs(60);
+
+/// The URL schemes of a remote. A remote without scheme has the form
+/// `[user@]host:owner/name`.
+const SCHEMES: [&str; 4] = ["ssh://", "https://", "http://", "git://"];
 
 /// Return the GitHub repository (`owner/name`) of a remote URL, or None if
-/// the remote is not on GitHub.
+/// the host of the remote is not `github.com`. An ssh alias of the host
+/// (`Host` in `~/.ssh/config`) gives None.
 pub fn repository_of(url: &str) -> Option<String> {
-    let path = GITHUB_PREFIXES
-        .iter()
-        .find_map(|prefix| url.strip_prefix(prefix))?;
+    let (host, path) = match SCHEMES.iter().find_map(|scheme| url.strip_prefix(scheme)) {
+        // `[user@]host[:port]/owner/name`
+        Some(rest) => {
+            let (host_and_port, path) = without_user(rest).split_once('/')?;
+            let host = host_and_port.split(':').next().unwrap_or_default();
+            (host, path)
+        }
+        // `[user@]host:owner/name`
+        None => without_user(url).split_once(':')?,
+    };
+    if host != "github.com" {
+        return None;
+    }
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let (owner, name) = path.split_once('/')?;
@@ -27,26 +40,30 @@ pub fn repository_of(url: &str) -> Option<String> {
     Some(path.to_owned())
 }
 
+/// Remove the user (`user@`) at the start of a remote address.
+fn without_user(address: &str) -> &str {
+    let host_end = address.find(['/', ':']).unwrap_or(address.len());
+    match address[..host_end].rfind('@') {
+        Some(at) => &address[at + 1..],
+        None => address,
+    }
+}
+
 /// Run gh without a terminal, and return its output.
 fn run(arguments: &[&str]) -> Result<String, Error> {
-    let output = Command::new("gh")
-        .args(arguments)
-        .env("GH_PROMPT_DISABLED", "1")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| Error::Command(format!("cannot run gh: {error}")))?;
+    let label = arguments
+        .iter()
+        .take(2)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut command = Command::new("gh");
+    command.args(arguments).env("GH_PROMPT_DISABLED", "1");
+    let output = process::output_with_limit(&mut command, GH_TIME_LIMIT)
+        .map_err(|error| Error::Command(format!("gh {label}: {error}")))?;
     if !output.status.success() {
         let details = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Command(format!(
-            "gh {}: {}",
-            arguments
-                .iter()
-                .take(2)
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" "),
-            details.trim()
-        )));
+        return Err(Error::Command(format!("gh {label}: {}", details.trim())));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
@@ -92,12 +109,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_3_forms_of_a_github_url_give_the_repository() {
+    fn the_forms_of_a_github_url_give_the_repository() {
         for url in [
             "git@github.com:owpac/herdr-worktrunk.git",
+            "github.com:owpac/herdr-worktrunk",
             "ssh://git@github.com/owpac/herdr-worktrunk.git",
+            "ssh://git@github.com:22/owpac/herdr-worktrunk.git",
             "https://github.com/owpac/herdr-worktrunk",
-            "https://github.com/owpac/herdr-worktrunk.git/",
+            "https://user@github.com/owpac/herdr-worktrunk.git/",
+            "git://github.com/owpac/herdr-worktrunk.git",
         ] {
             assert_eq!(
                 repository_of(url).as_deref(),
@@ -108,9 +128,24 @@ mod tests {
     }
 
     #[test]
+    fn a_numeric_owner_is_not_a_port() {
+        assert_eq!(
+            repository_of("git@github.com:1234/repo.git").as_deref(),
+            Some("1234/repo")
+        );
+    }
+
+    #[test]
     fn a_remote_outside_github_has_no_repository() {
-        assert_eq!(repository_of("git@gitlab.com:owpac/prompts.git"), None);
-        assert_eq!(repository_of("/work/bare-repo.git"), None);
-        assert_eq!(repository_of("https://github.com/owpac"), None);
+        for url in [
+            "git@gitlab.com:owpac/prompts.git",
+            "git@github-work:owpac/prompts.git",
+            "https://github.example.com/owpac/prompts",
+            "/work/bare-repo.git",
+            "file:///work/bare-repo.git",
+            "https://github.com/owpac",
+        ] {
+            assert_eq!(repository_of(url), None, "{url}");
+        }
     }
 }
