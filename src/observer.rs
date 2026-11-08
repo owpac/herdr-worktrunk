@@ -403,10 +403,10 @@ impl Observer {
 fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>) {
     let thread_log = Arc::clone(&log);
     let started = thread::Builder::new()
-        .name("prune-merged".to_owned())
+        .name("prune_merged".to_owned())
         .spawn(move || prune_loop(&view, &thread_log));
     if let Err(error) = started {
-        log.write(&format!("cannot start the thread prune-merged: {error}"));
+        log.write(&format!("cannot start the thread prune_merged: {error}"));
     }
 }
 
@@ -441,8 +441,10 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Log) {
 /// Remove the merged worktrees of one repository. Write each removal in
 /// the log, and add each error to `errors`.
 ///
-/// Ask the view again before each removal: an agent can enter a worktree
-/// during the calls to GitHub.
+/// Before each removal, ask the view again and read the commit of the
+/// branch again: during the calls to GitHub, an agent can enter the
+/// worktree, or a commit can change the branch. `wt remove` runs at once
+/// after the second check.
 fn prune_repository(
     main_checkout: &Path,
     view: &Mutex<PruneView>,
@@ -454,7 +456,7 @@ fn prune_repository(
         Ok(worktrees) => worktrees,
         Err(error) => {
             errors.insert(format!(
-                "prune-merged {}: {}",
+                "prune_merged {}: {}",
                 main_checkout.display(),
                 one_line(&error)
             ));
@@ -463,6 +465,10 @@ fn prune_repository(
     };
     for worktree in worktrees {
         if is_busy(&worktree.path) {
+            continue;
+        }
+        let current_commit = git::branch_commit(main_checkout, &worktree.branch);
+        if !worktree.is_unchanged(current_commit.as_deref()) {
             continue;
         }
         match wt::remove_merged(main_checkout, &worktree.path) {
@@ -590,7 +596,7 @@ pub fn run(state_dir: &Path, prune_merged: bool) -> Result<(), Error> {
     };
     observer.log.write("observer started");
     if let Some(view) = prune_view {
-        observer.log.write("prune-merged: on");
+        observer.log.write("prune_merged: on");
         start_prune_thread(view, log);
     }
     let started_binary = binary_time();

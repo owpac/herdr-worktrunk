@@ -6,8 +6,7 @@
 //!   herdr-worktrunk observe --run              the observer itself
 //!   herdr-worktrunk open picker|remover|merger an action: open a popup
 //!   herdr-worktrunk pick|confirm|merger|message  the command of a popup
-//!   herdr-worktrunk prune-merged --dry-run [<folder>]
-//!                                              the worktrees of the merged pull requests
+//!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the merged pull requests
 
 mod actions;
 mod config;
@@ -27,7 +26,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message | prune-merged --dry-run [<folder>]";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message | list-merged [<folder>]";
 
 /// A folder that herdr gives in an environment variable, else a default.
 fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
@@ -63,16 +62,12 @@ fn observe(is_observer: bool) -> Result<(), Error> {
 /// Print the worktrees of the merged pull requests in the repository of
 /// `folder`: the worktrees that the observer removes with `prune_merged`.
 /// Remove no worktree. This command does not know the agents of herdr.
-fn prune_dry_run(folder: &Path) -> Result<(), Error> {
+fn list_merged(folder: &Path) -> Result<(), Error> {
     let checkout = git::checkout_of(folder).ok_or_else(|| {
         Error::Command(format!("{} is not in a git repository", folder.display()))
     })?;
     for worktree in prune::merged_worktrees(&checkout.main_checkout(), |_| false)? {
-        println!(
-            "would remove {} ({})",
-            worktree.path.display(),
-            worktree.branch
-        );
+        println!("{} ({})", worktree.path.display(), worktree.branch);
     }
     Ok(())
 }
@@ -109,9 +104,9 @@ fn main() -> ExitCode {
             actions::open_later(entrypoint, Path::new(folder), assignments);
             return ExitCode::SUCCESS;
         }
-        ["prune-merged", "--dry-run", folder @ ..] if folder.len() <= 1 => {
+        ["list-merged", folder @ ..] if folder.len() <= 1 => {
             let folder = Path::new(folder.first().copied().unwrap_or("."));
-            if let Err(error) = prune_dry_run(folder) {
+            if let Err(error) = list_merged(folder) {
                 eprintln!("herdr-worktrunk: {error}");
                 return ExitCode::FAILURE;
             }

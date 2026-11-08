@@ -23,11 +23,31 @@
 //! branch of `origin` can be old. An old copy contains fewer commits, so
 //! the check can only remove a worktree of a merged pull request.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::git::{self, LinkedWorktree};
 use crate::github;
 use crate::herdr::Error;
+
+/// A worktree of a merged pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedWorktree {
+    pub path: PathBuf,
+    pub branch: String,
+    /// The local commit of the branch that GitHub merged. If the branch
+    /// gets a new commit, this new commit is not in the pull request: the
+    /// observer then keeps the branch.
+    pub commit: String,
+}
+
+impl MergedWorktree {
+    /// Return true if the branch still has the merged commit.
+    /// `current_commit` is the commit of the branch now, or None if the
+    /// branch does not exist.
+    pub fn is_unchanged(&self, current_commit: Option<&str>) -> bool {
+        current_commit == Some(self.commit.as_str())
+    }
+}
 
 /// Where the local commit of a branch is, compared with the default branch
 /// of `origin`.
@@ -77,7 +97,7 @@ pub fn is_merged(
 pub fn merged_worktrees(
     main_checkout: &Path,
     is_busy: impl Fn(&Path) -> bool,
-) -> Result<Vec<LinkedWorktree>, Error> {
+) -> Result<Vec<MergedWorktree>, Error> {
     let worktrees: Vec<LinkedWorktree> = git::linked_worktrees(main_checkout)?
         .into_iter()
         .filter(|worktree| !is_busy(&worktree.path))
@@ -110,7 +130,11 @@ pub fn merged_worktrees(
             github::contains(&repository, head, &local_commit)
         });
         if is_merged {
-            merged.push(worktree);
+            merged.push(MergedWorktree {
+                path: worktree.path,
+                branch: worktree.branch,
+                commit: local_commit,
+            });
         }
     }
     Ok(merged)
@@ -191,6 +215,29 @@ mod tests {
             DefaultBranch::Unknown,
             never
         ));
+    }
+
+    fn merged_worktree() -> MergedWorktree {
+        MergedWorktree {
+            path: PathBuf::from("/work/repo.feature"),
+            branch: "feature".to_owned(),
+            commit: "aaa".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_branch_with_the_merged_commit_is_unchanged() {
+        assert!(merged_worktree().is_unchanged(Some("aaa")));
+    }
+
+    #[test]
+    fn a_branch_with_a_new_commit_is_changed() {
+        assert!(!merged_worktree().is_unchanged(Some("bbb")));
+    }
+
+    #[test]
+    fn a_deleted_branch_is_changed() {
+        assert!(!merged_worktree().is_unchanged(None));
     }
 
     #[test]
