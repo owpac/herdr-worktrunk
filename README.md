@@ -42,7 +42,11 @@ Limits:
 - A workspace where an agent works stays open after the removal of its worktree, for example after `wt merge` in the agent. Close it with the herdr key `close_workspace`.
 - A pane that moves gets a new pane ID: address an agent with its herdr name. A running `herdr agent prompt --wait` on this agent stops with `agent_not_running`: run `herdr agent wait <name>`.
 
-herdr runs `[[startup]]` when the server starts, but not when the plugin is installed. Thus the event `pane.agent_detected` also starts the observer. A lock keeps one observer for each herdr server. If an update replaces the binary, the observer runs the new binary. Its log is `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
+herdr runs `[[startup]]` when the server starts, but not when the plugin is installed. Thus the event `pane.agent_detected` also starts the observer. A lock keeps one observer for each herdr server. Its log is `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
+
+The observer runs the binary of the last `observe` command. herdr installs each version of the plugin in a new folder, and keeps the old folders. Thus each `observe` command writes the path of its binary in `observer.binary`, in the state folder. Within 2 seconds, a running observer with another binary runs this binary, and writes `new binary: <old> -> <new>` in its log. After an update, the first agent that herdr detects gives the new binary to the observer. The observer also runs its own binary again if this binary changes, for example after `scripts/install.sh` in a linked folder.
+
+The versions up to 2026.11.7 do not read `observer.binary`. After the update from one of these versions, stop the observer once: `pkill -f 'herdr-worktrunk observe --run'`.
 
 The observer reads `config.toml` when it starts. After a change, stop the observer: `pkill -f 'herdr-worktrunk observe --run'`. The next agent that herdr detects starts it again.
 
@@ -157,10 +161,10 @@ cd herdr-worktrunk
 mise install                                         # Rust and shellcheck of mise.toml
 HERDR_WORKTRUNK_BUILD=source sh scripts/install.sh   # build bin/herdr-worktrunk with cargo
 herdr plugin link "$PWD"
-bin/herdr-worktrunk observe                          # start the observer once after the link
+bin/herdr-worktrunk observe                          # give the binary of the link to the observer
 ```
 
-`herdr plugin link` does not run the build step: run `scripts/install.sh` again after each change. The observer runs the new binary by itself. The checks of the CI:
+`herdr plugin link` does not run the build step: run `scripts/install.sh` again after each change. The observer runs the new binary by itself. After `herdr plugin unlink` and an install, run `bin/herdr-worktrunk observe` of the installed folder, or wait for the next agent: the observer then runs the installed binary. The checks of the CI:
 
 ```sh
 cargo fmt --check

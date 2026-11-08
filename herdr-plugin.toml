@@ -18,7 +18,9 @@ command = ["sh", "scripts/install.sh"]
 # the agents (agent_mode): see the README.
 # `observe` starts the observer in the background and returns. herdr runs [[startup]] when the
 # server starts, but not when the plugin is installed or linked: the event pane.agent_detected
-# also starts the observer. A lock keeps one observer for each herdr server.
+# also starts the observer. A lock keeps one observer for each herdr server. `observe` also gives
+# the path of its binary to a running observer (file observer.binary): herdr installs each version
+# in a new folder, so the observer runs the binary of the last `observe` command.
 [[startup]]
 command = ["bin/herdr-worktrunk", "observe"]
 
