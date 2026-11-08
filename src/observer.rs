@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::actions;
 use crate::git::{self, Checkout, LinkedWorktree};
 use crate::github::PullRequestState;
-use crate::herdr::{self, Error, Snapshot};
+use crate::herdr::{self, Error, Pane, Snapshot};
 use crate::prune::{self, FinishedWorktree};
 use crate::stale;
 use crate::wt;
@@ -158,6 +158,46 @@ struct Observer {
     /// The view of the thread of the merged pull requests, if
     /// `prune_merged` is true.
     prune_view: Option<Arc<Mutex<PruneView>>>,
+    /// The time when the observer first saw each workspace that appeared
+    /// after its start.
+    first_seen: HashMap<String, Instant>,
+    /// The observer read its first snapshot.
+    is_started: bool,
+}
+
+/// The age under which a new workspace can give its shell to an agent.
+const FRESH_WORKSPACE_TIME: Duration = Duration::from_secs(120);
+
+/// A shell pane that the pane of an agent replaces.
+#[derive(Debug, PartialEq, Eq)]
+struct FreshShell {
+    pane_id: String,
+    tab_id: String,
+}
+
+/// Return the only pane of a new workspace, if this pane is a shell
+/// without agent.
+///
+/// The hook post-start of wt opens the workspace of a new worktree, with
+/// a shell. A few seconds later, the agent that entered the worktree
+/// comes: its pane takes the place of this shell. The workspace must be
+/// younger than 2 minutes: the observer does not close a shell that the
+/// user can use.
+fn fresh_shell(age: Option<Duration>, workspace_id: &str, panes: &[Pane]) -> Option<FreshShell> {
+    if !age.is_some_and(|age| age < FRESH_WORKSPACE_TIME) {
+        return None;
+    }
+    let mut panes = panes
+        .iter()
+        .filter(|pane| pane.workspace_id == workspace_id);
+    let only = panes.next()?;
+    if panes.next().is_some() || only.agent.is_some() {
+        return None;
+    }
+    Some(FreshShell {
+        pane_id: only.pane_id.clone(),
+        tab_id: only.tab_id.clone(),
+    })
 }
 
 /// What the thread of the merged pull requests reads from the observer.
@@ -330,9 +370,16 @@ impl Observer {
             .map(|workspace| workspace.workspace_id.as_str())
             .collect();
         self.workspaces.retain(|id, _| live.contains(id.as_str()));
+        self.first_seen.retain(|id, _| live.contains(id.as_str()));
         for workspace in &snapshot.workspaces {
             if self.workspaces.contains_key(&workspace.workspace_id) {
                 continue;
+            }
+            // The workspaces of the first snapshot are not new: the user
+            // can use their shells.
+            if self.is_started {
+                self.first_seen
+                    .insert(workspace.workspace_id.clone(), Instant::now());
             }
             let first = match herdr::workspace_checkout(&workspace.workspace_id) {
                 Ok(Some(checkout)) => FirstCheckout {
@@ -357,6 +404,7 @@ impl Observer {
             self.workspaces
                 .insert(workspace.workspace_id.clone(), first);
         }
+        self.is_started = true;
     }
 
     /// Read one snapshot, then make its changes.
@@ -410,14 +458,19 @@ impl Observer {
         let (steps, differences) = plan(&agent_panes, &known, &self.differences);
         self.differences = differences;
         for step in steps {
-            if let Err(error) = self.apply(&step, &agent_panes) {
+            if let Err(error) = self.apply(&step, &agent_panes, snapshot) {
                 self.log.write(&format!("{step:?}: {error}"));
             }
         }
     }
 
     /// Make one change in herdr.
-    fn apply(&mut self, step: &Step, agent_panes: &[AgentPane]) -> Result<(), Error> {
+    fn apply(
+        &mut self,
+        step: &Step,
+        agent_panes: &[AgentPane],
+        snapshot: &Snapshot,
+    ) -> Result<(), Error> {
         match step {
             Step::CloseWorkspace { workspace_id } => {
                 herdr::close_workspace(workspace_id)?;
@@ -436,7 +489,7 @@ impl Observer {
                     .find(|pane| &pane.pane_id == pane_id)
                     .map(|pane| pane.workspace_id.clone())
                     .unwrap_or_default();
-                self.move_pane(pane_id, &source_workspace, checkout, *focus)?;
+                self.move_pane(pane_id, &source_workspace, checkout, *focus, snapshot)?;
                 self.differences.remove(pane_id);
                 Ok(())
             }
@@ -446,15 +499,17 @@ impl Observer {
     /// Move a pane to the workspace of `checkout`.
     ///
     /// If a workspace shows this checkout, the pane goes to a new tab of
-    /// it. Else, herdr opens the workspace, and the pane replaces its
-    /// first shell. herdr closes the old workspace if the pane was its
-    /// last pane.
+    /// it, or replaces its shell if the workspace is new (see
+    /// `fresh_shell`). Else, herdr opens the workspace, and the pane
+    /// replaces its first shell. herdr closes the old workspace if the
+    /// pane was its last pane.
     fn move_pane(
         &mut self,
         pane_id: &str,
         source_workspace: &str,
         checkout: &Checkout,
         focus: bool,
+        snapshot: &Snapshot,
     ) -> Result<(), Error> {
         let existing = self
             .workspaces
@@ -464,6 +519,15 @@ impl Observer {
             })
             .map(|(id, _)| id.clone());
         if let Some(workspace_id) = existing {
+            let age = self.first_seen.get(&workspace_id).map(Instant::elapsed);
+            if let Some(shell) = fresh_shell(age, &workspace_id, &snapshot.panes) {
+                herdr::move_pane_next_to(pane_id, &shell.tab_id, &shell.pane_id, focus)?;
+                herdr::close_pane(&shell.pane_id)?;
+                self.log.write(&format!(
+                    "moved {pane_id} to the workspace {workspace_id}, in place of its new shell"
+                ));
+                return Ok(());
+            }
             herdr::move_pane_to_new_tab(pane_id, &workspace_id, focus)?;
             self.log
                 .write(&format!("moved {pane_id} to the workspace {workspace_id}"));
@@ -981,6 +1045,8 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
         folders: HashMap::new(),
         differences: HashSet::new(),
         prune_view: prune_view.clone(),
+        first_seen: HashMap::new(),
+        is_started: false,
     };
     observer.log.write("observer started");
     if let Some(view) = prune_view {
@@ -1239,6 +1305,56 @@ mod tests {
     #[test]
     fn an_idle_agent_in_the_focused_workspace_keeps_the_worktree() {
         assert_eq!(decide(&[view_agent("idle", true)]), AgentDecision::Wait);
+    }
+
+    fn pane(pane_id: &str, workspace_id: &str, agent: Option<&str>) -> Pane {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+            "tab_id": format!("{workspace_id}:t1"),
+            "agent": agent,
+        }))
+        .unwrap()
+    }
+
+    const YOUNG: Option<Duration> = Some(Duration::from_secs(5));
+
+    #[test]
+    fn the_only_shell_of_a_new_workspace_is_fresh() {
+        let panes = [
+            pane("w1:p1", "w1", Some("claude")),
+            pane("w2:p1", "w2", None),
+        ];
+
+        assert_eq!(
+            fresh_shell(YOUNG, "w2", &panes),
+            Some(FreshShell {
+                pane_id: "w2:p1".to_owned(),
+                tab_id: "w2:t1".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_old_or_unknown_workspace_keeps_its_shell() {
+        let panes = [pane("w2:p1", "w2", None)];
+
+        assert_eq!(fresh_shell(Some(FRESH_WORKSPACE_TIME), "w2", &panes), None);
+        assert_eq!(fresh_shell(None, "w2", &panes), None);
+    }
+
+    #[test]
+    fn a_workspace_with_2_panes_keeps_its_shells() {
+        let panes = [pane("w2:p1", "w2", None), pane("w2:p2", "w2", None)];
+
+        assert_eq!(fresh_shell(YOUNG, "w2", &panes), None);
+    }
+
+    #[test]
+    fn an_agent_is_not_a_fresh_shell() {
+        let panes = [pane("w2:p1", "w2", Some("codex"))];
+
+        assert_eq!(fresh_shell(YOUNG, "w2", &panes), None);
     }
 
     #[test]

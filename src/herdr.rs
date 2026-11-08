@@ -40,6 +40,8 @@ impl std::error::Error for Error {}
 pub struct Pane {
     pub pane_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub tab_id: String,
     /// The kind of the agent in the pane (claude, codex...), if any.
     pub agent: Option<String>,
     /// The state of the agent: idle, working, blocked, done or unknown.
