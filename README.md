@@ -64,9 +64,9 @@ The thread keeps:
 
 The thread removes the worktree and its branch with `wt remove --force-delete`. GitHub merged the local commit, so the default branch has the work, also after a squash merge. Then the observer closes the workspace of the worktree (rule 2).
 
-Before each check, the thread runs `git fetch --prune` in the repository. Thus `wt step prune` also sees an up-to-date default branch of `origin`.
+The thread does not run `git fetch`. A fetch every 5 minutes can ask the ssh agent (for example 1Password) for a key while nobody is at the computer. gh uses the API of GitHub, with its own token.
 
-To see the worktrees that the thread removes, run the binary of the plugin with `--dry-run`. This command removes no worktree, and does not know the agents of herdr. As the thread, it runs `git fetch --prune` first.
+To see the worktrees that the thread removes, run the binary of the plugin with `--dry-run`. This command removes no worktree, and does not know the agents of herdr.
 
 ```sh
 bin/herdr-worktrunk prune-merged --dry-run <folder of the repository>
@@ -77,7 +77,7 @@ Limits:
 - The thread checks only a remote `origin` on the host `github.com`. An ssh alias of the host (`Host` in `~/.ssh/config`) does not work.
 - The thread works only when herdr runs. It does not check a repository without a herdr workspace: the `post-start` hook of wt can run `wt step prune` for it.
 - The thread sees only the agents. If a shell or an editor is open in the worktree, the thread removes the worktree, and the observer closes the workspace. Save your files before the merge.
-- The thread stops `git fetch` after 2 minutes, and `gh` after 1 minute. If you give no ssh command to git, `git fetch` runs ssh with `BatchMode=yes`: ssh cannot ask for a passphrase. ssh-agent still works.
+- The thread stops a `gh` command after 1 minute, and a `git` command after 30 seconds.
 - The observer writes each removal and each new error in `observer.log`. An error that stays gives one line.
 
 ## Configuration

@@ -62,8 +62,7 @@ fn observe(is_observer: bool) -> Result<(), Error> {
 
 /// Print the worktrees of the merged pull requests in the repository of
 /// `folder`: the worktrees that the observer removes with `prune_merged`.
-/// Remove no worktree. As the observer, run `git fetch --prune` first.
-/// This command does not know the agents of herdr.
+/// Remove no worktree. This command does not know the agents of herdr.
 fn prune_dry_run(folder: &Path) -> Result<(), Error> {
     let checkout = git::checkout_of(folder).ok_or_else(|| {
         Error::Command(format!("{} is not in a git repository", folder.display()))

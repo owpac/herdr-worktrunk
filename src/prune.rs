@@ -18,6 +18,10 @@
 //! worktree starts there. Thus a new worktree stays, also on the name of
 //! an old branch. `wt step prune` removes a worktree whose commit is in the
 //! default branch, for example after a merge commit.
+//!
+//! The observer does not fetch `origin`. Thus the local copy of the default
+//! branch of `origin` can be old. An old copy contains fewer commits, so
+//! the check can only remove a worktree of a merged pull request.
 
 use std::path::Path;
 
@@ -85,7 +89,6 @@ pub fn merged_worktrees(
         .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
     let repository = github::repository_of(&origin_url)
         .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))?;
-    git::fetch(main_checkout)?;
     let default_branch = git::default_branch(main_checkout);
     let mut merged = Vec::new();
     for worktree in worktrees {

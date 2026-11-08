@@ -397,7 +397,7 @@ impl Observer {
     }
 }
 
-/// Start the thread of the merged pull requests. `git fetch` and gh take
+/// Start the thread of the merged pull requests. gh and `wt remove` take
 /// several seconds: this thread keeps them out of the loop of the
 /// snapshots, so the panes do not wait for the network.
 fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>) {
