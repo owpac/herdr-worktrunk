@@ -58,8 +58,18 @@ command = ["bin/herdr-worktrunk", "open", "cleaner"]
 
 # herdr starts a plugin pane in the folder of the workspace (--cwd). As for an action, herdr finds
 # bin/herdr-worktrunk in the plugin root.
+# The large popups (picker, cleaner, merger) have the size of the popup of herdr-bar. With
+# popup_size = "big" in config.toml, the plugin opens their pane <id>-big: 90 % × 80 %.
 [[panes]]
 id = "picker"
+title = "Worktrunk"
+placement = "popup"
+width = "74%"
+height = "62%"
+command = ["bin/herdr-worktrunk", "pick"]
+
+[[panes]]
+id = "picker-big"
 title = "Worktrunk"
 placement = "popup"
 width = "90%"
@@ -70,6 +80,14 @@ command = ["bin/herdr-worktrunk", "pick"]
 # observer (stale_days). A deletion goes through the popup confirm, then the list comes back.
 [[panes]]
 id = "cleaner"
+title = "Worktrunk: clean"
+placement = "popup"
+width = "74%"
+height = "62%"
+command = ["bin/herdr-worktrunk", "cleaner"]
+
+[[panes]]
+id = "cleaner-big"
 title = "Worktrunk: clean"
 placement = "popup"
 width = "90%"
@@ -89,6 +107,14 @@ command = ["bin/herdr-worktrunk", "confirm"]
 # The output of wt merge.
 [[panes]]
 id = "merger"
+title = "Worktrunk: merge"
+placement = "popup"
+width = "74%"
+height = "62%"
+command = ["bin/herdr-worktrunk", "merger"]
+
+[[panes]]
+id = "merger-big"
 title = "Worktrunk: merge"
 placement = "popup"
 width = "90%"

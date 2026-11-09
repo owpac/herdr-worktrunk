@@ -386,12 +386,15 @@ pub fn close_workspace(workspace_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Open a pane of this plugin (an entrypoint of `[[panes]]`).
+/// Open a pane of this plugin (an entrypoint of `[[panes]]`). A large
+/// popup gets the size of the option `popup_size`.
 pub fn open_plugin_pane(
     entrypoint: &str,
     folder: &Path,
     environment: &[(&str, &str)],
 ) -> Result<(), Error> {
+    let entrypoint = crate::config::current().popup_size.entrypoint(entrypoint);
+    let entrypoint = entrypoint.as_str();
     let folder_text = folder.to_string_lossy();
     let mut arguments = vec![
         "plugin",

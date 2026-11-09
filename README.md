@@ -164,6 +164,10 @@ prune_merged = false
 # of days (default: 0, off). Needs prune_merged = true.
 stale_days = 0
 
+# The size of the picker, the cleaner and the merger: "default" (the size of herdr-bar,
+# 74 % × 62 % of the window) or "big" (90 % × 80 %).
+popup_size = "default"
+
 # What an agent can do without a question at the end of a task in a worktree: "ask" or "auto".
 # The plugin does not read this key: the agents read it (for example the skill worktrees of
 # owpac/prompts).
@@ -173,7 +177,7 @@ agent_mode = "ask"
 agent_mode = "auto"
 ```
 
-The plugin reads only the top-level keys `observe`, `prune_merged` and `stale_days`, and ignores the other keys.
+The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days` and `popup_size`, and ignores the other keys.
 
 ## Requirements
 
