@@ -21,6 +21,7 @@ mod picker;
 mod process;
 mod prune;
 mod stale;
+mod style;
 mod ui;
 mod wt;
 
@@ -154,6 +155,10 @@ fn main() -> ExitCode {
         }
         ["cleaner-verify", list] => {
             cleaner::print_verified_rows(Path::new(list));
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-rows", list] => {
+            cleaner::print_list_rows(Path::new(list));
             return ExitCode::SUCCESS;
         }
         ["picker-tab", cache, direction] => {

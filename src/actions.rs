@@ -551,7 +551,18 @@ pub fn cleaner(stale_days: u32, state_dir: &Path) -> Result<(), Error> {
     }
     let list_text = list_path.to_string_lossy();
     let folder_text = folder.to_string_lossy();
-    match cleaner::choose(&old, &list_path, warning.as_deref(), verify)? {
+    // The scope of the list: one repository, or all the repositories.
+    let scope = env::var_os(SCOPE_VARIABLE)
+        .map(PathBuf::from)
+        .and_then(|scope| git::checkout_of(&scope))
+        .and_then(|checkout| {
+            checkout
+                .main_checkout()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "all repositories".to_owned());
+    match cleaner::choose(&old, &list_path, &scope, warning.as_deref(), verify)? {
         None => {
             let _ = std::fs::remove_file(&list_path);
             Ok(())

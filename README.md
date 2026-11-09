@@ -19,11 +19,18 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 
 | Key | Result |
 |-----|--------|
-| `Enter` | Opens the selected worktree, or the worktree of the selected branch (wt creates it). If the typed name matches no branch, the first row is `+ Create worktree <name>`: `Enter` on this row creates the worktree. |
+| `Enter` | Opens the selected worktree, or the worktree of the selected branch (wt creates it). If the typed name matches no branch, the first row is `+ <name> — new worktree from the default branch`: `Enter` on this row creates the worktree. |
 | `⌫` | With an empty filter: asks to delete the selected worktree. The picker closes, a small popup asks the question, then the picker comes back. wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. With text in the filter: erases a character. |
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff` (all the changes since the branch left the default branch, `wt step diff`), `log` (the commits), `changes` (the changes that are not committed). |
 | `shift-↑`, `shift-↓` | Scroll the preview. |
 | `Esc` | Cancels. |
+
+Each row of the picker gives:
+
+- on the left: the state (`✓` no change, `●` changes that are not committed, `○` a branch without worktree, `+` a new worktree), the branch, and the subject of its last commit,
+- on the right: the folder of the worktree, `main` or `current`, the symbols of wt (`↑` ahead, `↓` behind, `|` in sync with the upstream), and the age of the last commit.
+
+The picker and the cleaner use the design of the plugins [herdr-bar](https://github.com/jeffarese/herdr-bar) and [herdr-newtab-plus](https://github.com/jeffarese/herdr-newtab-plus): the hints of the keys are at the bottom, the repository is on the right of the prompt, and the first line of the preview gives its tabs.
 
 The question has 2 buttons: `[ Cancel ]`, the default button, and `[ Delete ]` in red (or `[ Merge ]`). `←` `→` and `Tab` change the button, `Enter` presses it, `y` confirms, `Esc` cancels. herdr shows one popup at a time: a detached process of the plugin opens the next popup when the previous popup is closed.
 
@@ -120,6 +127,8 @@ The action `herdr-worktrunk.clean` opens the list of the old worktrees of **all 
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker). |
 | `Esc` | Quits. |
 
+Each row gives the branch, its repository, the folder of the worktree, and the days without activity.
+
 Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner keeps a worktree where an agent works, and closes the workspace of each deleted worktree.
 
 From a shell, `clean` opens the same popup, for one repository or for all of them. `list-stale` prints the old worktrees of one repository without a popup.
@@ -165,7 +174,7 @@ The plugin reads only the top-level keys `observe`, `prune_merged` and `stale_da
 
 - herdr 0.9.0 or later, on macOS or Linux.
 - worktrunk (`wt`) and git on the `PATH` of the herdr server.
-- [fzf](https://github.com/junegunn/fzf) for the picker. The plugin uses its events `change`, `reload` and `execute` (tested with fzf 0.74).
+- [fzf](https://github.com/junegunn/fzf) 0.66 or later, for the picker and the cleaner. The plugin uses its events `start`, `change`, `resize` and `load`, and its options `--footer`, `--ghost` and `--gutter` (tested with fzf 0.74).
 - With `prune_merged = true` only: [gh](https://cli.github.com) on the `PATH` of the herdr server, with a login (`gh auth login`).
 
 ## Installation

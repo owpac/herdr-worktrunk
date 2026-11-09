@@ -46,7 +46,7 @@ fn stty(arguments: &[&str]) -> Option<String> {
 }
 
 /// The size of the terminal: rows, then columns.
-fn terminal_size() -> (usize, usize) {
+pub(crate) fn terminal_size() -> (usize, usize) {
     let size = stty(&["size"]).unwrap_or_default();
     let mut numbers = size.split_whitespace().map(str::parse::<usize>);
     match (numbers.next(), numbers.next()) {

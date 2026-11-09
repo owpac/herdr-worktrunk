@@ -1,7 +1,7 @@
 //! The worktree picker of the plugin: fzf over the worktrees and the
 //! branches that `wt list` gives.
 //!
-//! Keys (the header of the picker shows them):
+//! Keys (the footer of the picker shows them):
 //!
 //! - `Enter` opens the selected worktree or branch. When the typed name
 //!   matches no branch, the first row is `+ Create worktree <name>`:
@@ -19,6 +19,9 @@
 //! the typed name, `picker-preview` gives the preview, `picker-tab`
 //! changes the tab of the preview, and `picker-backspace` decides what
 //! `⌫` does.
+//!
+//! The style comes from the module `style`: the design of herdr-bar and
+//! herdr-newtab-plus.
 
 use std::env;
 use std::fs;
@@ -30,13 +33,21 @@ use serde_json::Value;
 
 use crate::git;
 use crate::herdr::Error;
+use crate::stale;
+use crate::style::{self, part, Part, ACCENT, DIM, GREEN, MUTED, RULE, YELLOW};
 
 /// fzf exits with 130 when the user cancels.
 pub(crate) const FZF_CANCEL_EXIT_CODE: i32 = 130;
 /// fzf exits with 1 when no row matches.
 pub(crate) const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
-const HEADER: &str =
-    "Enter: open or create · ⌫ on an empty filter: delete · Tab: preview · Esc: cancel";
+const GHOST: &str = "worktree — type a name to filter, or a new name to create it";
+const HINTS: [(&str, &str); 5] = [
+    ("↑↓", "move"),
+    ("⏎", "open or create"),
+    ("⌫", "delete"),
+    ("⇥", "preview"),
+    ("esc", "close"),
+];
 /// The first line that fzf prints when `⌫` asks for a deletion.
 const DELETE_REQUEST: &str = "delete";
 const PREVIEW_COMMIT_COUNT: &str = "20";
@@ -86,32 +97,119 @@ impl Row {
         }
     }
 
+    fn path(&self) -> String {
+        match self {
+            Row::Worktree { path, .. } => path.display().to_string(),
+            _ => String::new(),
+        }
+    }
+
     /// The line of fzf: kind, branch, path and text, separated by tabs.
-    fn line(&self, status: &str) -> String {
-        let (path, text) = match self {
-            Row::Create { name } => (
-                String::new(),
-                format!("\x1b[32m+ Create worktree\x1b[0m {name}"),
-            ),
-            Row::Worktree { path, .. } => {
+    /// The text fills `width` columns: the state, the branch and the
+    /// subject of its last commit on the left, the folder, the symbols of
+    /// wt and the age of the last commit on the right.
+    fn line(&self, details: &Details, now: u64, width: usize) -> String {
+        let (state, mut right) = match self {
+            Row::Create { .. } => (part(GREEN, "+ "), Vec::new()),
+            Row::Worktree { path, is_main, .. } => {
                 // The folder name is sufficient: the full path is long.
-                let folder = path.file_name().unwrap_or(path.as_os_str());
-                (
-                    path.display().to_string(),
-                    format!("{status}  \x1b[2m{}\x1b[0m", folder.to_string_lossy()),
-                )
+                let folder = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned();
+                let state = if details.has_changes {
+                    part(YELLOW, "● ")
+                } else {
+                    part(GREEN, "✓ ")
+                };
+                let mut right = vec![part(MUTED, folder)];
+                if *is_main {
+                    right.push(part(ACCENT, "main"));
+                } else if details.is_current {
+                    right.push(part(ACCENT, "current"));
+                }
+                (state, right)
             }
-            Row::Branch { .. } => (
-                String::new(),
-                format!("{status}  \x1b[2mbranch, no worktree\x1b[0m"),
-            ),
+            Row::Branch { .. } => (part(DIM, "○ "), vec![part(DIM, "no worktree")]),
         };
-        format!("{}\t{}\t{path}\t{text}", self.kind(), self.branch())
+        let mut left: Vec<Part> = vec![state, part("", self.branch())];
+        let subject = match self {
+            Row::Create { .. } => "new worktree from the default branch",
+            _ => details.subject.as_str(),
+        };
+        if !subject.is_empty() {
+            left.push(part(RULE, " — "));
+            left.push(part(MUTED, subject));
+        }
+        right.push(part(MUTED, details.symbols.clone()));
+        if let Some(time) = details.committed_at {
+            right.push(part(MUTED, style::age(now.saturating_sub(time))));
+        }
+        let text = style::row(&left, &right, width);
+        format!(
+            "{}\t{}\t{}\t{text}",
+            self.kind(),
+            self.branch(),
+            self.path()
+        )
     }
 }
 
-/// Read the rows of `wt list --format json --branches`, as fzf lines.
-fn list_lines(repository: &Path) -> Result<Vec<String>, Error> {
+/// What the picker shows about a worktree or a branch, from `wt list`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Details {
+    /// The subject of the last commit.
+    subject: String,
+    /// The symbols of wt: `↑` ahead, `↓` behind, `!` modified...
+    symbols: String,
+    /// The time of the last commit, in seconds since 1970.
+    committed_at: Option<u64>,
+    /// The worktree has changes that are not committed.
+    has_changes: bool,
+    /// The worktree of the folder of the popup.
+    is_current: bool,
+}
+
+/// A row of the cache: the row and its details, in 8 fields separated by
+/// tabs. fzf does not read it: `print_rows` makes the lines of fzf with
+/// the width of the popup.
+fn record(row: &Row, details: &Details) -> String {
+    let clean = |text: &str| text.replace(['\t', '\n'], " ");
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        row.kind(),
+        clean(row.branch()),
+        row.path(),
+        clean(&details.subject),
+        clean(&details.symbols),
+        details
+            .committed_at
+            .map(|time| time.to_string())
+            .unwrap_or_default(),
+        u8::from(details.has_changes),
+        u8::from(details.is_current),
+    )
+}
+
+/// Read a row of the cache.
+fn parse_record(line: &str) -> Option<(Row, Details)> {
+    let row = parse_row(line)?;
+    let fields: Vec<&str> = line.split('\t').collect();
+    let field = |index: usize| fields.get(index).copied().unwrap_or_default();
+    let details = Details {
+        subject: field(3).to_owned(),
+        symbols: field(4).to_owned(),
+        committed_at: field(5).parse().ok(),
+        has_changes: field(6) == "1",
+        is_current: field(7) == "1",
+    };
+    Some((row, details))
+}
+
+/// Read the rows of `wt list --format json --branches`, as rows of the
+/// cache.
+fn list_records(repository: &Path) -> Result<Vec<String>, Error> {
     let output = Command::new("wt")
         .arg("-C")
         .arg(repository)
@@ -125,12 +223,39 @@ fn list_lines(repository: &Path) -> Result<Vec<String>, Error> {
     let json: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| Error::Command(format!("wt list: invalid JSON: {error}")))?;
     let items = json["items"].as_array().cloned().unwrap_or_default();
-    let mut lines = Vec::new();
+    let mut records = Vec::new();
     for item in items {
         let Some(branch) = item["branch"].as_str() else {
             continue;
         };
-        let status = item["display"]["statusline"].as_str().unwrap_or(branch);
+        let changes = &item["worktree"]["changes"];
+        let has_changes = [
+            "staged",
+            "modified",
+            "untracked",
+            "renamed",
+            "deleted",
+            "conflicted",
+        ]
+        .iter()
+        .any(|kind| changes[kind].as_bool().unwrap_or(false));
+        let details = Details {
+            subject: item["head"]["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            // `_`: the same commit as the default branch. The age says it.
+            symbols: item["display"]["symbols"]
+                .as_str()
+                .filter(|symbols| *symbols != "_")
+                .unwrap_or_default()
+                .to_owned(),
+            committed_at: item["head"]["committed_at"]
+                .as_str()
+                .and_then(style::parse_time),
+            has_changes,
+            is_current: item["worktree"]["current"].as_bool().unwrap_or(false),
+        };
         let row = match item["worktree"]["path"].as_str() {
             Some(path) => Row::Worktree {
                 branch: branch.to_owned(),
@@ -141,25 +266,30 @@ fn list_lines(repository: &Path) -> Result<Vec<String>, Error> {
                 branch: branch.to_owned(),
             },
         };
-        lines.push(row.line(status));
+        records.push(record(&row, &details));
     }
-    Ok(lines)
+    Ok(records)
 }
 
-/// The rows for the typed name: the create row first (if the name is new),
-/// then the rows of `wt list`.
-pub fn rows_for_query(cached_lines: &[String], query: &str) -> Vec<String> {
+/// The lines of fzf for the typed name, in `width` columns: the create
+/// row first (if the name is new), then the rows of `wt list`.
+pub fn rows_for_query(records: &[String], query: &str, width: usize, now: u64) -> Vec<String> {
     // A tab separates the fields of a row: a name cannot contain it.
     let name = query.trim().replace('\t', " ");
-    let is_known_branch = cached_lines
+    let rows: Vec<(Row, Details)> = records
         .iter()
-        .any(|line| line.split('\t').nth(1) == Some(name.as_str()));
-    let mut rows = Vec::new();
+        .filter_map(|line| parse_record(line))
+        .collect();
+    let is_known_branch = rows.iter().any(|(row, _)| row.branch() == name);
+    let mut lines = Vec::new();
     if !name.is_empty() && !is_known_branch {
-        rows.push(Row::Create { name }.line(""));
+        lines.push(Row::Create { name }.line(&Details::default(), now, width));
     }
-    rows.extend(cached_lines.iter().cloned());
-    rows
+    lines.extend(
+        rows.iter()
+            .map(|(row, details)| row.line(details, now, width)),
+    );
+    lines
 }
 
 /// Put `text` in single quotes for the shell that runs the fzf commands.
@@ -173,10 +303,10 @@ fn cache_path() -> PathBuf {
 }
 
 fn write_cache(cache: &Path, repository: &Path) -> Result<Vec<String>, Error> {
-    let lines = list_lines(repository)?;
-    fs::write(cache, lines.join("\n"))
+    let records = list_records(repository)?;
+    fs::write(cache, records.join("\n"))
         .map_err(|error| Error::Command(format!("cannot write {}: {error}", cache.display())))?;
-    Ok(lines)
+    Ok(records)
 }
 
 fn read_cache(cache: &Path) -> Vec<String> {
@@ -187,7 +317,8 @@ fn read_cache(cache: &Path) -> Vec<String> {
         .collect()
 }
 
-/// fzf event `picker-rows`: print the rows for the typed name.
+/// fzf event `picker-rows`: print the rows for the typed name, with the
+/// width of the popup (fzf runs it again when the popup changes size).
 ///
 /// The first call reads `wt list` and writes the cache: fzf shows the
 /// picker at once, with a spinner until the rows arrive. A key during the
@@ -198,8 +329,9 @@ pub fn print_rows(repository: &Path, cache: &Path, query: &str) {
         // Without rows, the picker still offers the create row.
         let _ = write_cache(cache, repository);
     }
+    let width = style::row_width(style::fzf_columns());
     let mut stdout = io::stdout().lock();
-    for row in rows_for_query(&read_cache(cache), query) {
+    for row in rows_for_query(&read_cache(cache), query, width, stale::now()) {
         // fzf closes the pipe when the user types again: stop without error.
         if writeln!(stdout, "{row}").is_err() {
             return;
@@ -220,24 +352,9 @@ fn read_tab(cache: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// The label of the preview: the tabs, with the current tab in brackets.
-pub(crate) fn preview_label(current: usize) -> String {
-    let tabs: Vec<String> = PREVIEW_TABS
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            if index == current {
-                format!("[{tab}]")
-            } else {
-                format!(" {tab} ")
-            }
-        })
-        .collect();
-    format!(" {} ", tabs.join(" "))
-}
-
 /// fzf event `picker-tab`: go to the next (or the previous) tab of the
-/// preview, and print the fzf actions that show it.
+/// preview, and print the fzf action that shows it. The first line of the
+/// preview shows the tabs.
 pub fn change_tab(cache: &Path, is_next: bool) {
     let count = PREVIEW_TABS.len();
     let current = read_tab(cache);
@@ -248,10 +365,7 @@ pub fn change_tab(cache: &Path, is_next: bool) {
     };
     // Without the file, the preview stays on its first tab.
     let _ = fs::write(tab_path(cache), tab.to_string());
-    println!(
-        "refresh-preview+change-preview-label:{}",
-        preview_label(tab)
-    );
+    println!("refresh-preview");
 }
 
 /// Run a command for the preview, and print its output and its errors.
@@ -273,13 +387,20 @@ fn print_command(command: &mut Command) {
     }
 }
 
-/// fzf event `picker-preview`: print the current tab of the preview.
+/// fzf event `picker-preview`: print the tabs, a rule, then the current
+/// tab of the preview.
 pub fn print_preview(repository: &Path, cache: &Path, kind: &str, branch: &str, path: &str) {
     if kind == "create" {
-        println!("Enter creates the worktree {branch} from the default branch.");
+        println!(
+            "{MUTED}⏎ creates the worktree {branch} from the default branch.{}",
+            style::RESET
+        );
         return;
     }
-    match PREVIEW_TABS[read_tab(cache)] {
+    let tab = read_tab(cache);
+    println!("{}", style::tabs(&PREVIEW_TABS, tab));
+    println!("{}", style::rule(style::preview_columns()));
+    match PREVIEW_TABS[tab] {
         "diff" => print_command(Command::new("wt").arg("-C").arg(repository).args([
             "step",
             "diff",
@@ -297,7 +418,10 @@ pub fn print_preview(repository: &Path, cache: &Path, kind: &str, branch: &str, 
                 .arg(branch)
                 .arg("--"),
         ),
-        _ if path.is_empty() => println!("{branch} has no worktree: no changes to show."),
+        _ if path.is_empty() => println!(
+            "{MUTED}{branch} has no worktree: no changes to show.{}",
+            style::RESET
+        ),
         _ => {
             print_command(Command::new("git").arg("-C").arg(path).args([
                 "-c",
@@ -320,15 +444,15 @@ pub fn print_preview(repository: &Path, cache: &Path, kind: &str, branch: &str, 
 ///
 /// With text in the filter, `⌫` erases a character. With an empty filter,
 /// on a worktree, it ends the picker with a deletion request. On another
-/// row, the header tells why nothing happens.
+/// row, the header tells why nothing happens, until the next key.
 pub fn backspace_action(query: &str, kind: &str, branch: &str) {
     let actions = if !query.is_empty() {
         "backward-delete-char".to_owned()
     } else {
         match kind {
             "worktree" => format!("print({DELETE_REQUEST})+accept"),
-            "main" => format!("change-header:The main checkout cannot be deleted. · {HEADER}"),
-            _ => format!("change-header:{branch} has no worktree to delete. · {HEADER}"),
+            "main" => "change-header:The main checkout cannot be deleted.".to_owned(),
+            _ => format!("change-header:{branch} has no worktree to delete."),
         }
     };
     println!("{actions}");
@@ -350,25 +474,16 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
     let cache_text = shell_quote(&cache.to_string_lossy());
     let rows_command = format!("{binary} picker-rows {repository_text} {cache_text} {{q}}");
     let _ = fs::remove_file(tab_path(&cache));
+    let repository_name = main_checkout
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let fzf = Command::new("fzf")
-        .args([
-            "--ansi",
-            "--layout",
-            "reverse",
-            "--no-sort",
-            "--delimiter",
-            "\t",
-            "--with-nth",
-            "4..",
-            "--prompt",
-            "worktree> ",
-            "--header",
-            HEADER,
-            "--preview-window",
-            "right,50%",
-        ])
-        .arg("--preview-label")
-        .arg(preview_label(0))
+        .env(
+            style::COLUMNS_VARIABLE,
+            style::terminal_columns().to_string(),
+        )
+        .args(style::fzf_arguments(GHOST, &repository_name, &HINTS))
         .arg("--preview")
         .arg(format!(
             "{binary} picker-preview {repository_text} {cache_text} {{1}} {{2}} {{3}}"
@@ -376,9 +491,9 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
         .arg("--bind")
         .arg(format!("start:reload({rows_command})"))
         .arg("--bind")
-        .arg(format!(
-            "change:reload({rows_command})+change-header:{HEADER}"
-        ))
+        .arg(format!("change:reload({rows_command})+change-header:"))
+        .arg("--bind")
+        .arg(format!("resize:reload({rows_command})"))
         .arg("--bind")
         .arg(format!(
             "bspace:transform({binary} picker-backspace {{q}} {{1}} {{2}})"
@@ -437,56 +552,89 @@ fn parse_row(line: &str) -> Option<Row> {
 mod tests {
     use super::*;
 
-    fn worktree_line() -> String {
-        Row::Worktree {
-            branch: "feat-a".to_owned(),
-            path: PathBuf::from("/work/repo.feat-a"),
-            is_main: false,
-        }
-        .line("feat-a  \x1b[2m_\x1b[22m")
+    const WIDTH: usize = 60;
+    const NOW: u64 = 1_000_000;
+
+    fn worktree() -> (Row, Details) {
+        (
+            Row::Worktree {
+                branch: "feat-a".to_owned(),
+                path: PathBuf::from("/work/repo.feat-a"),
+                is_main: false,
+            },
+            Details {
+                subject: "Add a parser".to_owned(),
+                symbols: "↑".to_owned(),
+                committed_at: Some(NOW - 3 * 3600),
+                has_changes: true,
+                is_current: false,
+            },
+        )
+    }
+
+    fn worktree_record() -> String {
+        let (row, details) = worktree();
+        record(&row, &details)
     }
 
     #[test]
     fn a_new_name_gets_the_create_row_first() {
-        let rows = rows_for_query(&[worktree_line()], "fix-parser");
+        let rows = rows_for_query(&[worktree_record()], "fix-parser", WIDTH, NOW);
 
-        assert!(rows[0].starts_with("create\tfix-parser\t"));
+        assert!(rows[0].starts_with("create\tfix-parser\t\t"));
+        assert!(rows[1].starts_with("worktree\tfeat-a\t/work/repo.feat-a\t"));
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn a_known_branch_gets_no_create_row() {
-        let rows = rows_for_query(&[worktree_line()], "feat-a");
+        let rows = rows_for_query(&[worktree_record()], "feat-a", WIDTH, NOW);
 
-        assert_eq!(rows, [worktree_line()]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].starts_with("worktree\tfeat-a\t"));
     }
 
     #[test]
     fn an_empty_query_gets_no_create_row() {
-        let rows = rows_for_query(&[worktree_line()], "  ");
+        let rows = rows_for_query(&[worktree_record()], "  ", WIDTH, NOW);
 
-        assert_eq!(rows, [worktree_line()]);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
     fn a_tab_in_the_name_does_not_break_the_row() {
-        let rows = rows_for_query(&[], "a\tb");
+        let rows = rows_for_query(&[], "a\tb", WIDTH, NOW);
 
         assert!(rows[0].starts_with("create\ta b\t"));
     }
 
     #[test]
-    fn parse_reads_a_worktree_row_and_its_path() {
-        let row = parse_row(&worktree_line());
+    fn a_record_keeps_the_row_and_its_details() {
+        let (row, details) = worktree();
 
-        assert_eq!(
-            row,
-            Some(Row::Worktree {
-                branch: "feat-a".to_owned(),
-                path: PathBuf::from("/work/repo.feat-a"),
-                is_main: false,
-            })
-        );
+        assert_eq!(parse_record(&record(&row, &details)), Some((row, details)));
+    }
+
+    #[test]
+    fn the_text_of_a_worktree_gives_its_state_subject_folder_and_age() {
+        let (row, details) = worktree();
+
+        let line = row.line(&details, NOW, WIDTH);
+        let text = line.split('\t').nth(3).unwrap();
+
+        assert!(text.contains("● "));
+        assert!(text.contains("feat-a"));
+        assert!(text.contains("Add a parser"));
+        assert!(text.contains("repo.feat-a"));
+        assert!(text.contains("3h"));
+    }
+
+    #[test]
+    fn parse_reads_a_worktree_row_and_its_path() {
+        let (row, details) = worktree();
+        let line = row.line(&details, NOW, WIDTH);
+
+        assert_eq!(parse_row(&line), Some(row));
     }
 
     #[test]
@@ -494,7 +642,7 @@ mod tests {
         let line = Row::Create {
             name: "fix-parser".to_owned(),
         }
-        .line("");
+        .line(&Details::default(), NOW, WIDTH);
 
         let row = parse_row(&line);
 
