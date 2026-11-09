@@ -13,6 +13,7 @@
 mod actions;
 mod cleaner;
 mod config;
+mod fzf;
 mod git;
 mod github;
 mod herdr;
@@ -149,12 +150,29 @@ fn main() -> ExitCode {
             picker::print_preview(Path::new(repository), Path::new(cache), kind, branch, path);
             return ExitCode::SUCCESS;
         }
-        ["cleaner-verify", list] => {
-            cleaner::print_verified_rows(Path::new(list));
+        ["cleaner-rows", state, query @ ..] => {
+            cleaner::print_rows(Path::new(state), &query.join(" "));
             return ExitCode::SUCCESS;
         }
-        ["cleaner-rows", list] => {
-            cleaner::print_list_rows(Path::new(list));
+        ["cleaner-move", state, direction, current, query @ ..] => {
+            let direction = match *direction {
+                "up" => cleaner::Move::Up,
+                "down" => cleaner::Move::Down,
+                _ => cleaner::Move::Keep,
+            };
+            cleaner::print_move(Path::new(state), direction, current, &query.join(" "));
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-enter", kind] => {
+            cleaner::print_enter(kind);
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-delete-all", state] => {
+            cleaner::print_delete_all(Path::new(state));
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-preview", state, id, branch, main_checkout, kind] => {
+            cleaner::print_preview(Path::new(state), id, branch, main_checkout, kind);
             return ExitCode::SUCCESS;
         }
         ["picker-tab", cache, direction] => {
@@ -199,10 +217,7 @@ fn main() -> ExitCode {
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
-        ["cleaner"] => (
-            actions::cleaner(stale_days_or_default(), &state_dir()),
-            Some("cleaner"),
-        ),
+        ["cleaner"] => (actions::cleaner(stale_days_or_default()), Some("cleaner")),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

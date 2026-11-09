@@ -42,8 +42,11 @@ const TITLE_VARIABLE: &str = "TRUNK_MESSAGE_TITLE";
 const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 /// The reason of a question that the observer asks (an old worktree).
 const REASON_VARIABLE: &str = "TRUNK_REASON";
-/// The file of the list of the popup cleaner.
+/// The file of the worktrees that the popup confirm deletes together.
 const LIST_VARIABLE: &str = "TRUNK_CLEANER_LIST";
+/// The state file of the popup cleaner: the results of its checks. The
+/// cleaner comes back after a question with these results.
+const STATE_VARIABLE: &str = "TRUNK_CLEANER_STATE";
 /// The repository of the popup cleaner, else all the repositories of the
 /// herdr workspaces.
 const SCOPE_VARIABLE: &str = "TRUNK_CLEANER_SCOPE";
@@ -312,25 +315,26 @@ pub fn confirm() -> Result<(), Error> {
         ui::show_message(TITLE, &error.to_string());
     }
     if return_to == RETURN_TO_CLEANER {
-        // The cleaner comes back with the same list, without the deleted
-        // worktrees.
+        // The cleaner comes back with the results of its checks, without
+        // the deleted worktrees.
         let folder = popup_folder()?;
         let folder = if folder.exists() {
             folder
         } else {
             env::temp_dir()
         };
-        let list = env::var(LIST_VARIABLE).unwrap_or_default();
+        let state = env::var(STATE_VARIABLE).unwrap_or_default();
         let folder_text = folder.to_string_lossy();
-        return open_after_this_popup(
-            "cleaner",
-            &folder,
-            &[
-                (LIST_VARIABLE, &list),
-                (FOLDER_VARIABLE, &folder_text),
-                (RETURN_VARIABLE, RETURN_TO_CLEANER),
-            ],
-        );
+        let mut environment = vec![
+            (STATE_VARIABLE, state.as_str()),
+            (FOLDER_VARIABLE, folder_text.as_ref()),
+            (RETURN_VARIABLE, RETURN_TO_CLEANER),
+        ];
+        let scope = env::var(SCOPE_VARIABLE).unwrap_or_default();
+        if !scope.is_empty() {
+            environment.push((SCOPE_VARIABLE, scope.as_str()));
+        }
+        return open_after_this_popup("cleaner", &folder, &environment);
     }
     // The folder of the picker can be the deleted worktree: then the
     // picker comes back in the main checkout.
@@ -492,108 +496,86 @@ fn delete_all() -> Result<(), Error> {
     Ok(())
 }
 
-/// Popup cleaner: the list of the old worktrees. `Enter` deletes one,
-/// `ctrl-a` deletes all of them, through the popup confirm. Then the list
-/// comes back, without the deleted worktrees.
+/// Popup cleaner: all the linked worktrees, checked in the background.
+/// `Enter` deletes one, `ctrl-a` deletes the group "To delete", through
+/// the popup confirm. Then the list comes back, without the deleted
+/// worktrees.
 ///
-/// The list comes from `TRUNK_CLEANER_LIST` (the observer, or the return
-/// after a question). Else the popup looks for the old worktrees of
-/// `TRUNK_CLEANER_SCOPE`, or of all the repositories of the herdr
-/// workspaces.
-pub fn cleaner(stale_days: u32, state_dir: &Path) -> Result<(), Error> {
+/// The list covers `TRUNK_CLEANER_SCOPE`, or all the repositories of the
+/// herdr workspaces. After a question, `TRUNK_CLEANER_STATE` gives the
+/// results of the last checks: these worktrees need no new check.
+pub fn cleaner(stale_days: u32) -> Result<(), Error> {
     let folder = popup_folder()?;
-    let given_list = env::var_os(LIST_VARIABLE)
+    let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
+    let scope = env::var_os(SCOPE_VARIABLE).map(PathBuf::from);
+    let given_state = env::var_os(STATE_VARIABLE)
         .map(PathBuf::from)
         .filter(|path| path.is_file());
-    let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
-    // A list of the observer, of a daily pass, or of a return after a
-    // deletion can be older than a new pull request: fzf checks it again.
-    let (list_path, old, failures, verify) = match given_list {
-        Some(path) => {
-            let old = stale::read_list(&path);
-            (path, old, Vec::new(), true)
-        }
-        None => {
-            ui::show_progress("Clean the worktrees", "Looking for old worktrees…");
-            let scope = env::var_os(SCOPE_VARIABLE).map(PathBuf::from);
-            // The worktrees without pull request of the last pass of the
-            // observer: no call to GitHub for these repositories.
-            let known = stale::read_no_pull_request(
-                state_dir,
-                stale::now(),
-                stale::NO_PULL_REQUEST_MAX_AGE,
-            );
-            let search = cleaner::find_old_worktrees(scope.as_deref(), stale_days, known.as_ref())?;
-            let path = env::temp_dir().join(format!(
-                "herdr-worktrunk-cleaner-{}.tsv",
-                std::process::id()
-            ));
-            stale::write_list(&path, &search.old)
-                .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
-            (path, search.old, search.failures, search.uses_observer)
-        }
-    };
-    // The repositories that the search could not check: the list does not
-    // show their worktrees.
-    let warning = (!failures.is_empty()).then(|| format!("Not checked: {}", failures.join(" · ")));
-    if old.is_empty() {
-        let _ = std::fs::remove_file(&list_path);
+    let previous = given_state
+        .as_deref()
+        .map(cleaner::read_state)
+        .unwrap_or_default();
+    let state_path = given_state.unwrap_or_else(|| {
+        env::temp_dir().join(format!(
+            "herdr-worktrunk-cleaner-{}.tsv",
+            std::process::id()
+        ))
+    });
+    let entries = cleaner::list_worktrees(scope.as_deref(), &previous)?;
+    if entries.is_empty() {
+        let _ = std::fs::remove_file(&state_path);
         if !is_return {
-            let mut message = format!(
-                "No old worktree to clean: no worktree without pull request and without change for {stale_days} days."
+            ui::show_message(
+                "Clean the worktrees",
+                "No worktree to clean: the repositories of the herdr workspaces have no linked worktree.",
             );
-            if let Some(warning) = &warning {
-                message.push_str(&format!("\n{warning}"));
-            }
-            ui::show_message("Clean the worktrees", &message);
         }
         return Ok(());
     }
-    let list_text = list_path.to_string_lossy();
     let folder_text = folder.to_string_lossy();
-    match cleaner::choose(&old, &list_path, warning.as_deref(), verify)? {
+    let state_text = state_path.to_string_lossy();
+    let scope_text = scope
+        .as_ref()
+        .map(|scope| scope.to_string_lossy().into_owned());
+    let mut environment = vec![
+        (STATE_VARIABLE, state_text.as_ref()),
+        (RETURN_VARIABLE, RETURN_TO_CLEANER),
+        (FOLDER_VARIABLE, folder_text.as_ref()),
+    ];
+    if let Some(scope_text) = &scope_text {
+        environment.push((SCOPE_VARIABLE, scope_text.as_str()));
+    }
+    match cleaner::choose(entries, &state_path, stale_days)? {
         None => {
-            let _ = std::fs::remove_file(&list_path);
+            let _ = std::fs::remove_file(&state_path);
             Ok(())
         }
-        Some(cleaner::Choice::DeleteAll) => open_after_this_popup(
-            "confirm",
-            &folder,
-            &[
-                (OPERATION_VARIABLE, DELETE_ALL),
-                (LIST_VARIABLE, &list_text),
-                (RETURN_VARIABLE, RETURN_TO_CLEANER),
-                (FOLDER_VARIABLE, &folder_text),
-            ],
-        ),
-        Some(cleaner::Choice::Delete(worktree)) => {
-            let reason = format!("No pull request, and no change for {} days.", worktree.days);
-            open_after_this_popup(
-                "confirm",
-                &folder,
-                &[
-                    (OPERATION_VARIABLE, DELETE),
-                    (CHECKOUT_VARIABLE, &worktree.path.to_string_lossy()),
-                    (REASON_VARIABLE, &reason),
-                    (LIST_VARIABLE, &list_text),
-                    (RETURN_VARIABLE, RETURN_TO_CLEANER),
-                    (FOLDER_VARIABLE, &folder_text),
-                ],
-            )
+        Some(cleaner::Choice::DeleteAll(leftovers)) => {
+            let list_path = state_path.with_extension("delete");
+            stale::write_list(&list_path, &leftovers)
+                .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
+            let list_text = list_path.to_string_lossy();
+            environment.push((OPERATION_VARIABLE, DELETE_ALL));
+            environment.push((LIST_VARIABLE, list_text.as_ref()));
+            open_after_this_popup("confirm", &folder, &environment)
+        }
+        Some(cleaner::Choice::Delete(entry)) => {
+            let reason = entry.question();
+            let checkout_text = entry.path.to_string_lossy();
+            environment.push((OPERATION_VARIABLE, DELETE));
+            environment.push((CHECKOUT_VARIABLE, checkout_text.as_ref()));
+            environment.push((REASON_VARIABLE, reason.as_str()));
+            open_after_this_popup("confirm", &folder, &environment)
         }
     }
 }
 
-/// Open the popup cleaner with a list of old worktrees (the daily pass of
-/// the observer). herdr shows one popup at a time: wait while another
-/// popup is open, for 10 minutes at most.
-pub fn open_cleaner(folder: &Path, list_path: &Path) -> Result<(), Error> {
-    let list_text = list_path.to_string_lossy();
+/// Open the popup cleaner for the daily pass of the observer. herdr shows
+/// one popup at a time: wait while another popup is open, for 10 minutes
+/// at most.
+pub fn open_cleaner(folder: &Path) -> Result<(), Error> {
     let folder_text = folder.to_string_lossy();
-    let environment = [
-        (LIST_VARIABLE, list_text.as_ref()),
-        (FOLDER_VARIABLE, folder_text.as_ref()),
-    ];
+    let environment = [(FOLDER_VARIABLE, folder_text.as_ref())];
     for _ in 0..ASK_ATTEMPTS {
         match herdr::open_plugin_pane("cleaner", folder, &environment) {
             Err(Error::Herdr { code, .. }) if code == "ui_busy" => thread::sleep(ASK_INTERVAL),

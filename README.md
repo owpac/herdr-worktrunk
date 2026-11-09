@@ -119,22 +119,35 @@ With `prune_merged = true` and `stale_days = <days>`, the thread also asks about
 - no change that is not committed,
 - no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the reflog of `HEAD` of the worktree (its creation, a commit, a checkout, a reset). Thus a new worktree on an old commit is not old. A `git status` does not change the activity.
 
-If old worktrees exist, the thread opens the popup cleaner with them (see below). The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
+If old worktrees exist, the thread opens the popup cleaner (see below). The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
 
 ### The popup cleaner
 
-The action `herdr-worktrunk.clean` opens the list of the old worktrees of **all the repositories of the herdr workspaces**, in fzf. It uses the criteria above, with `stale_days` (or 7 days if `stale_days` is 0), and ignores the last questions.
+The action `herdr-worktrunk.clean` opens the list of **all the linked worktrees of the repositories of the herdr workspaces**, in fzf. The list shows at once. Threads check each worktree in the background, and its row shows a spinner until its check ends.
+
+The list has groups:
+
+- **To delete**, at the top: the leftovers, the oldest first.
+- One group for each project, with the other worktrees. Each row gives the reason that keeps the worktree.
+
+A leftover has no agent, no change that is not committed, and one of these conditions:
+
+- A merged or closed pull request contains the commit of its branch, with the same proofs as `prune_merged`. The age does not count.
+- It has no pull request, and no activity for `stale_days` days (or 7 days if `stale_days` is 0). The cleaner ignores the last questions of the daily pass.
+
+The other reasons keep a worktree: an open pull request, a recent activity, changes that are not committed, an agent, work after a finished pull request, or a check that failed (gh, or no remote on GitHub).
 
 | Key | Result |
 |-----|--------|
-| `Enter` | Asks to delete the selected worktree, then the list comes back. |
-| `ctrl-a` | Asks to delete all the worktrees of the list. A progress popup, then a summary, shows the result. |
-| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker). |
+| `↑` `↓` | Move to the next worktree. The cursor skips the titles of the groups. |
+| `Enter` | Asks to delete the selected worktree, then the list comes back. The question gives the reason of the row, for example an open pull request. |
+| `ctrl-a` | Asks to delete all the worktrees of the group "To delete". A progress popup, then a summary, shows the result. |
+| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker). The title of a group shows the summary of its worktrees. |
 | `Esc` | Quits. |
 
-Each row gives the branch, its repository, the folder of the worktree, and the days without activity.
+A filter hides the titles of the groups. Each row gives the state, the branch and its reason on the left, and the folder and the days without activity on the right.
 
-Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner keeps a worktree where an agent works, and closes the workspace of each deleted worktree.
+Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner refuses a worktree where an agent works, and closes the workspace of each deleted worktree.
 
 From a shell, `clean` opens the same popup, for one repository or for all of them. `list-stale` prints the old worktrees of one repository without a popup.
 
@@ -143,7 +156,12 @@ bin/herdr-worktrunk clean [<folder of a repository>]
 bin/herdr-worktrunk list-stale <folder of the repository>
 ```
 
-The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh. At each pass (every 5 minutes), the observer writes the worktrees without pull request of each repository in `no-pull-request.tsv`, in its state folder. The popup reads this file if it is younger than 15 minutes: for these repositories, it does the local checks only, without gh. For the other repositories, it does the local checks first, then calls gh only for the old worktrees, with one thread for each repository. The header of the list gives the repositories that it could not check. A pull request can be younger than this file: thus the popup shows the list at once, then checks the pull requests of the listed worktrees only (one gh call for each, in parallel), and reloads the list without the worktrees that got one.
+How the checks work:
+
+1. The popup lists the worktrees with git and herdr only, then shows the list.
+2. 8 threads check the worktrees: `git status`, the last activity, then one call to gh for the pull requests of the branch. A worktree with an agent or with changes needs no call to gh.
+3. After each result, the popup writes its state file, and sends a reload to fzf through the socket of fzf (`--listen`).
+4. The cursor stays on its worktree when the list reloads. After a question, the list comes back with the results of the last checks: these worktrees need no new check.
 
 Limits:
 
@@ -183,7 +201,7 @@ The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`
 
 - herdr 0.9.0 or later, on macOS or Linux.
 - worktrunk (`wt`) and git on the `PATH` of the herdr server.
-- [fzf](https://github.com/junegunn/fzf) 0.66 or later, for the picker and the cleaner. The plugin uses its events `start`, `change`, `resize` and `load`, and its options `--footer`, `--ghost` and `--gutter` (tested with fzf 0.74).
+- [fzf](https://github.com/junegunn/fzf) 0.73 or later, for the picker and the cleaner. The plugin uses its events `start`, `change`, `resize`, `load` and `every`, its server `--listen`, and its options `--footer`, `--ghost` and `--gutter` (tested with fzf 0.74).
 - With `prune_merged = true` only: [gh](https://cli.github.com) on the `PATH` of the herdr server, with a login (`gh auth login`).
 
 ## Installation

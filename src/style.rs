@@ -46,7 +46,7 @@ footer:246,footer-border:239";
 
 /// The error of a popup when fzf fails, for example an fzf without the
 /// options of the design.
-pub const FZF_FAILED: &str = "fzf failed. The popups need fzf 0.66 or later: run fzf --version.";
+pub const FZF_FAILED: &str = "fzf failed. The popups need fzf 0.73 or later: run fzf --version.";
 
 /// The width of the preview, in percent of the popup.
 const PREVIEW_PERCENT: usize = 50;
@@ -74,8 +74,10 @@ const DAY: u64 = 24 * HOUR;
 /// `hints` shows at the bottom.
 pub fn fzf_arguments(ghost: &str, scope: &str, hints: &[(&str, &str)]) -> Vec<String> {
     // fzf shows the prefix of the info in the color of the prompt (bold,
-    // accent), without a process at each key.
-    let info = format!("inline-right:{scope}  ");
+    // accent), without a process at each key. When the count gets shorter
+    // (13/13, then 4/13), fzf 0.74 does not clear the first characters of
+    // the old prefix: the 4 spaces make them invisible.
+    let info = format!("inline-right:    {scope}  ");
     [
         "--ansi",
         "--layout",
