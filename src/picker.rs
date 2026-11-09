@@ -42,8 +42,8 @@ pub(crate) const FZF_CANCEL_EXIT_CODE: i32 = 130;
 /// fzf exits with 1 when no row matches.
 pub(crate) const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
 const GHOST: &str = "worktree — type a name to filter, or a new name to create it";
-const HINTS: [(&str, &str); 5] = [
-    ("↑↓", "move"),
+// The footer has the width of the list: the arrows need no hint.
+const HINTS: [(&str, &str); 4] = [
     ("⏎", "open or create"),
     ("⌫", "delete (empty filter)"),
     ("⇥", "preview"),
@@ -398,20 +398,21 @@ fn tab_path(cache: &Path) -> PathBuf {
     cache.with_extension("tab")
 }
 
-fn read_tab(cache: &Path) -> usize {
+/// The current tab of a preview with `count` tabs.
+pub(crate) fn read_tab(cache: &Path, count: usize) -> usize {
     fs::read_to_string(tab_path(cache))
         .ok()
         .and_then(|text| text.trim().parse().ok())
-        .filter(|tab| *tab < PREVIEW_TABS.len())
+        .filter(|tab| *tab < count)
         .unwrap_or(0)
 }
 
 /// fzf event `picker-tab`: go to the next (or the previous) tab of the
 /// preview, and print the fzf action that shows it. The first line of the
 /// preview shows the tabs.
-pub fn change_tab(cache: &Path, is_next: bool) {
-    let count = PREVIEW_TABS.len();
-    let current = read_tab(cache);
+pub fn change_tab(cache: &Path, is_next: bool, count: usize) {
+    let count = count.max(1);
+    let current = read_tab(cache, count);
     let tab = if is_next {
         (current + 1) % count
     } else {
@@ -451,10 +452,16 @@ pub fn print_preview(repository: &Path, cache: &Path, kind: &str, branch: &str, 
         );
         return;
     }
-    let tab = read_tab(cache);
+    let tab = read_tab(cache, PREVIEW_TABS.len());
     println!("{}", style::tabs(&PREVIEW_TABS, tab));
     println!("{}", style::rule(style::preview_columns()));
-    match PREVIEW_TABS[tab] {
+    print_tab(repository, PREVIEW_TABS[tab], branch, path);
+}
+
+/// Print the content of the tab `name` of the preview: `diff`, `log` or
+/// `changes`.
+pub(crate) fn print_tab(repository: &Path, name: &str, branch: &str, path: &str) {
+    match name {
         "diff" => print_command(Command::new("wt").arg("-C").arg(repository).args([
             "step",
             "diff",
@@ -555,11 +562,11 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
         ))
         .arg("--bind")
         .arg(format!(
-            "tab:transform({binary} picker-tab {cache_text} next)"
+            "tab:transform({binary} picker-tab {cache_text} next 3)"
         ))
         .arg("--bind")
         .arg(format!(
-            "btab:transform({binary} picker-tab {cache_text} previous)"
+            "btab:transform({binary} picker-tab {cache_text} previous 3)"
         ))
         // The event start loads the rows.
         .stdin(Stdio::null())

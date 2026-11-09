@@ -181,12 +181,25 @@ fn main() -> ExitCode {
             cleaner::print_delete_all(Path::new(state));
             return ExitCode::SUCCESS;
         }
-        ["cleaner-preview", state, id, branch, main_checkout, kind] => {
-            cleaner::print_preview(Path::new(state), id, branch, main_checkout, kind);
+        ["cleaner-preview", state, stale_days, id, branch, main_checkout, kind] => {
+            let stale_days = stale_days.parse().unwrap_or(DEFAULT_STALE_DAYS);
+            cleaner::print_preview(
+                Path::new(state),
+                stale_days,
+                id,
+                branch,
+                main_checkout,
+                kind,
+            );
             return ExitCode::SUCCESS;
         }
-        ["picker-tab", cache, direction] => {
-            picker::change_tab(Path::new(cache), *direction == "next");
+        ["picker-tab", cache, direction, count @ ..] => {
+            // The picker has 3 tabs, the cleaner 4.
+            let count = count
+                .first()
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(3);
+            picker::change_tab(Path::new(cache), *direction == "next", count);
             return ExitCode::SUCCESS;
         }
         ["picker-backspace", query, kind, branch] => {

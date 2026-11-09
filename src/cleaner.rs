@@ -45,13 +45,16 @@ use crate::style::{
 
 const DELETE_ALL_REQUEST: &str = "delete-all";
 const GHOST: &str = "worktree — type to filter";
-const HINTS: [(&str, &str); 5] = [
-    ("↑↓", "move"),
+// The footer has the width of the list: the hints must be short.
+const HINTS: [(&str, &str); 4] = [
     ("⏎", "delete"),
-    ("^a", "delete the group To delete"),
+    ("^a", "delete all"),
     ("⇥", "preview"),
     ("esc", "close"),
 ];
+/// The tabs of the preview: the 3 tabs of the picker, then the checklist.
+const PREVIEW_TABS: [&str; 4] = ["diff", "log", "changes", "checks"];
+const CHECKS_TAB: usize = 3;
 /// The frames of the spinner of a row in check.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// The fields of a row before its frames: id, branch, main checkout, kind.
@@ -591,6 +594,10 @@ pub fn remember_cursor(state_path: &Path, id: &str) {
     if !id.is_empty() {
         let _ = fs::write(cursor_path(state_path), id);
     }
+    // The checklist shows the new results of the checks.
+    if picker::read_tab(state_path, PREVIEW_TABS.len()) == CHECKS_TAB {
+        println!("refresh-preview");
+    }
 }
 
 /// The file that keeps the rows that fzf shows, in their order: one line
@@ -919,14 +926,198 @@ pub fn print_delete_all(state_path: &Path) {
     }
 }
 
+/// The result of a check in the checklist of a worktree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mark {
+    Pass,
+    Fail,
+    /// The cleaner did not need this check.
+    Skip,
+    /// The check runs.
+    Wait,
+    /// The check failed: no result.
+    Unknown,
+}
+
+impl Mark {
+    fn glyph(self) -> (&'static str, &'static str) {
+        match self {
+            Mark::Pass => (GREEN, "✓"),
+            Mark::Fail => (RED, "✗"),
+            Mark::Skip => (DIM, "–"),
+            Mark::Wait => (ACCENT, "…"),
+            Mark::Unknown => (YELLOW, "?"),
+        }
+    }
+}
+
+/// The checklist of a worktree: the 4 checks of the cleaner, in their
+/// order, with their results. The cleaner stops at the first check that
+/// keeps the worktree: the next checks show as not needed.
+fn checklist(entry: &Entry, stale_days: u32) -> [(Mark, String); 4] {
+    let number = entry.number();
+    let days = entry.days.unwrap_or(0);
+    let not_needed = |what: &str| (Mark::Skip, format!("{what}: not needed."));
+    let agent_pass = (Mark::Pass, "No agent works in it.".to_owned());
+    let clean_pass = (Mark::Pass, "No change that is not committed.".to_owned());
+    let no_pull_request = (Mark::Pass, "No pull request.".to_owned());
+    // The check that failed, from the error text.
+    let unknown_step = match entry.detail.as_str() {
+        "git status failed" => 2,
+        "no date of activity" => 4,
+        _ => 3,
+    };
+    match entry.reason {
+        Reason::Checking => [
+            agent_pass,
+            (Mark::Wait, "Changes: checking…".to_owned()),
+            (Mark::Wait, "Pull requests: checking…".to_owned()),
+            (Mark::Wait, "Activity: checking…".to_owned()),
+        ],
+        Reason::Agent => [
+            (Mark::Fail, "An agent works in it.".to_owned()),
+            not_needed("Changes"),
+            not_needed("Pull requests"),
+            not_needed("Activity"),
+        ],
+        Reason::Changes => [
+            agent_pass,
+            (
+                Mark::Fail,
+                "It has changes that are not committed.".to_owned(),
+            ),
+            not_needed("Pull requests"),
+            not_needed("Activity"),
+        ],
+        Reason::Unknown => {
+            let failed = (Mark::Unknown, format!("Not checked: {}.", entry.detail));
+            match unknown_step {
+                2 => [
+                    agent_pass,
+                    failed,
+                    not_needed("Pull requests"),
+                    not_needed("Activity"),
+                ],
+                4 => [agent_pass, clean_pass, no_pull_request, failed],
+                _ => [agent_pass, clean_pass, failed, not_needed("Activity")],
+            }
+        }
+        Reason::Open | Reason::WorkAfter | Reason::InDefault => {
+            let text = match entry.reason {
+                Reason::Open => format!("Pull request {number} is open."),
+                Reason::WorkAfter => {
+                    format!(
+                        "Pull request {number} is finished, but the branch has commits after it."
+                    )
+                }
+                _ => format!(
+                    "Pull request {number} is finished, but the default branch contains the commit."
+                ),
+            };
+            [
+                agent_pass,
+                clean_pass,
+                (Mark::Fail, text),
+                not_needed("Activity"),
+            ]
+        }
+        Reason::Merged | Reason::Closed => {
+            let state = if entry.reason == Reason::Merged {
+                "merged"
+            } else {
+                "closed"
+            };
+            [
+                agent_pass,
+                clean_pass,
+                (
+                    Mark::Pass,
+                    format!(
+                        "Pull request {number} is {state}, with the last commit of the branch."
+                    ),
+                ),
+                (
+                    Mark::Skip,
+                    "Activity: not needed after a finished pull request.".to_owned(),
+                ),
+            ]
+        }
+        Reason::Old => [
+            agent_pass,
+            clean_pass,
+            no_pull_request,
+            (
+                Mark::Pass,
+                format!("No activity for {days} days (limit: {stale_days} days)."),
+            ),
+        ],
+        Reason::Recent => [
+            agent_pass,
+            clean_pass,
+            no_pull_request,
+            (
+                Mark::Fail,
+                format!("Activity {days} days ago (limit: {stale_days} days)."),
+            ),
+        ],
+    }
+}
+
+/// The tab `checks`: the verdict, the checklist, and the rule of a
+/// leftover.
+fn print_checklist(entry: &Entry, stale_days: u32) {
+    let verdict = match entry.reason {
+        Reason::Checking => format!("{BOLD}{ACCENT}Checking…{RESET}"),
+        reason if reason.is_leftover() => format!("{BOLD}{RED}To delete{RESET}"),
+        _ => format!(
+            "{BOLD}{GREEN}Kept{RESET}{RULE} · {RESET}{MUTED}{}{RESET}",
+            entry.reason_text()
+        ),
+    };
+    println!("{verdict}");
+    println!();
+    for (mark, text) in checklist(entry, stale_days) {
+        let (color, glyph) = mark.glyph();
+        let text_color = if mark == Mark::Skip { DIM } else { "" };
+        println!("{color}{glyph}{RESET} {text_color}{text}{RESET}");
+    }
+    println!();
+    // The rule of a leftover, on short lines: the preview does not wrap.
+    for line in [
+        "A worktree goes to the group To delete if:".to_owned(),
+        "- it has no agent and no change,".to_owned(),
+        "- and it has a finished pull request,".to_owned(),
+        format!("- or no pull request and no activity for {stale_days} days."),
+    ] {
+        println!("{DIM}{line}{RESET}");
+    }
+}
+
 /// fzf event `cleaner-preview`: the summary of a group, or the preview of
-/// a worktree (as in the picker).
-pub fn print_preview(state_path: &Path, id: &str, branch: &str, main_checkout: &str, kind: &str) {
+/// a worktree: the tabs of the picker, then the checklist (`checks`).
+pub fn print_preview(
+    state_path: &Path,
+    stale_days: u32,
+    id: &str,
+    branch: &str,
+    main_checkout: &str,
+    kind: &str,
+) {
+    let entries = read_state(state_path);
     if kind == WORKTREE_KIND {
-        picker::print_preview(Path::new(main_checkout), state_path, "worktree", branch, id);
+        let tab = picker::read_tab(state_path, PREVIEW_TABS.len());
+        println!("{}", style::tabs(&PREVIEW_TABS, tab));
+        println!("{}", style::rule(style::preview_columns()));
+        if tab == CHECKS_TAB {
+            match entries.iter().find(|entry| entry.path == Path::new(id)) {
+                Some(entry) => print_checklist(entry, stale_days),
+                None => println!("{MUTED}No result for this worktree.{RESET}"),
+            }
+        } else {
+            picker::print_tab(Path::new(main_checkout), PREVIEW_TABS[tab], branch, id);
+        }
         return;
     }
-    let entries = read_state(state_path);
     let members = entries.iter().filter(|entry| {
         if id == TO_DELETE_ID {
             entry.reason.is_leftover()
@@ -1002,7 +1193,7 @@ pub fn choose(
         .arg(&socket)
         .arg("--preview")
         .arg(format!(
-            "{binary} cleaner-preview {state} {{1}} {{2}} {{3}} {{4}}"
+            "{binary} cleaner-preview {state} {stale_days} {{1}} {{2}} {{3}} {{4}}"
         ));
     let mut binds = vec![
         format!("change:{reload_action}"),
@@ -1021,8 +1212,14 @@ pub fn choose(
         format!("enter:transform({binary} cleaner-enter {{4}})"),
         format!("double-click:transform({binary} cleaner-enter {{4}})"),
         format!("ctrl-a:transform({binary} cleaner-delete-all {state})"),
-        format!("tab:transform({binary} picker-tab {state} next)"),
-        format!("btab:transform({binary} picker-tab {state} previous)"),
+        format!(
+            "tab:transform({binary} picker-tab {state} next {})",
+            PREVIEW_TABS.len()
+        ),
+        format!(
+            "btab:transform({binary} picker-tab {state} previous {})",
+            PREVIEW_TABS.len()
+        ),
     ];
     if is_checking {
         // Rotate the frames of the spinner, without a process.
@@ -1217,6 +1414,44 @@ mod tests {
             .collect();
         assert_eq!(labels, ["/other/app", "/work/app"]);
         assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn the_checklist_gives_each_check_in_its_order() {
+        let marks = |entry: &Entry| -> Vec<Mark> {
+            checklist(entry, 7).iter().map(|(mark, _)| *mark).collect()
+        };
+        let mut merged = entry("a", "alpha", Reason::Merged, Some(1));
+        merged.pull_request = Some(12);
+        let mut failed = entry("b", "alpha", Reason::Unknown, None);
+        failed.detail = "git status failed".to_owned();
+
+        assert_eq!(
+            marks(&entry("a", "alpha", Reason::Old, Some(9))),
+            [Mark::Pass, Mark::Pass, Mark::Pass, Mark::Pass]
+        );
+        assert_eq!(
+            marks(&entry("a", "alpha", Reason::Recent, Some(2))),
+            [Mark::Pass, Mark::Pass, Mark::Pass, Mark::Fail]
+        );
+        assert_eq!(
+            marks(&merged),
+            [Mark::Pass, Mark::Pass, Mark::Pass, Mark::Skip]
+        );
+        assert_eq!(
+            marks(&entry("a", "alpha", Reason::Agent, None)),
+            [Mark::Fail, Mark::Skip, Mark::Skip, Mark::Skip]
+        );
+        assert_eq!(
+            marks(&failed),
+            [Mark::Pass, Mark::Unknown, Mark::Skip, Mark::Skip]
+        );
+        assert!(checklist(&merged, 7)[2].1.contains("#12 is merged"));
+        assert!(
+            checklist(&entry("a", "alpha", Reason::Recent, Some(2)), 7)[3]
+                .1
+                .contains("2 days ago (limit: 7 days)")
+        );
     }
 
     #[test]

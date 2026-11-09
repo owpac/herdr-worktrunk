@@ -142,7 +142,7 @@ The other reasons keep a worktree: an open pull request, a recent activity, chan
 | `↑` `↓` | Move to the next worktree. The cursor skips the titles of the groups. |
 | `Enter` | Asks to delete the selected worktree, then the list comes back. The question gives the reason of the row, for example an open pull request. |
 | `ctrl-a` | Asks to delete all the worktrees of the group "To delete". A progress popup, then a summary, shows the result. |
-| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker). The title of a group shows the summary of its worktrees. |
+| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker), and `checks`. `checks` gives the verdict and the checklist of the worktree: agent, changes, pull requests, activity. The title of a group shows the summary of its worktrees. |
 | `Esc` | Quits. |
 
 A filter hides the titles of the groups. Each row gives the state, the branch and its reason on the left, and the folder and the days without activity on the right.
