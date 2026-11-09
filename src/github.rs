@@ -1,5 +1,5 @@
-//! The calls to GitHub, with the gh CLI. Only the removal of the finished
-//! worktrees (`prune_merged`) uses them.
+//! The calls to GitHub, with the gh CLI: the removal of the finished
+//! worktrees (`prune_merged`) and the checks of the popup cleaner.
 
 use std::process::Command;
 use std::time::Duration;
@@ -9,8 +9,10 @@ use serde::Deserialize;
 use crate::herdr::Error;
 use crate::process;
 
-/// The time limit of a gh command.
-const GH_TIME_LIMIT: Duration = Duration::from_secs(60);
+/// The time limit of a gh command of the observer, in the background.
+pub const GH_TIME_LIMIT: Duration = Duration::from_secs(60);
+/// The time limit of a gh command of a popup: the user waits for it.
+pub const POPUP_TIME_LIMIT: Duration = Duration::from_secs(15);
 
 /// The URL schemes of a remote. A remote without scheme has the form
 /// `[user@]host:owner/name`.
@@ -52,7 +54,7 @@ fn without_user(address: &str) -> &str {
 }
 
 /// Run gh without a terminal, and return its output.
-fn run(arguments: &[&str]) -> Result<String, Error> {
+fn run(arguments: &[&str], limit: Duration) -> Result<String, Error> {
     let label = arguments
         .iter()
         .take(2)
@@ -61,7 +63,7 @@ fn run(arguments: &[&str]) -> Result<String, Error> {
         .join(" ");
     let mut command = Command::new("gh");
     command.args(arguments).env("GH_PROMPT_DISABLED", "1");
-    let output = process::output_with_limit(&mut command, GH_TIME_LIMIT)
+    let output = process::output_with_limit(&mut command, limit)
         .map_err(|error| Error::Command(format!("gh {label}: {error}")))?;
     if !output.status.success() {
         let details = String::from_utf8_lossy(&output.stderr);
@@ -91,21 +93,28 @@ pub struct PullRequest {
 
 /// Return the pull requests of `branch` of the repository itself, in all
 /// the states. The list is empty if the branch has no pull request.
-pub fn pull_requests(repository: &str, branch: &str) -> Result<Vec<PullRequest>, Error> {
-    let text = run(&[
-        "pr",
-        "list",
-        "--repo",
-        repository,
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--limit",
-        "50",
-        "--json",
-        "number,state,headRefOid,isCrossRepository",
-    ])?;
+pub fn pull_requests(
+    repository: &str,
+    branch: &str,
+    limit: Duration,
+) -> Result<Vec<PullRequest>, Error> {
+    let text = run(
+        &[
+            "pr",
+            "list",
+            "--repo",
+            repository,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "50",
+            "--json",
+            "number,state,headRefOid,isCrossRepository",
+        ],
+        limit,
+    )?;
     parse_pull_requests(&text)
 }
 
@@ -134,9 +143,9 @@ fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
 /// GitHub compares `commit...head`: the status `ahead` tells that `head`
 /// contains `commit`. If GitHub does not know `commit` (it is not
 /// pushed), the call fails and the function returns false.
-pub fn contains(repository: &str, head: &str, commit: &str) -> bool {
+pub fn contains(repository: &str, head: &str, commit: &str, limit: Duration) -> bool {
     let endpoint = format!("repos/{repository}/compare/{commit}...{head}");
-    run(&["api", &endpoint, "--jq", ".status"]).is_ok_and(|status| status.trim() == "ahead")
+    run(&["api", &endpoint, "--jq", ".status"], limit).is_ok_and(|status| status.trim() == "ahead")
 }
 
 #[cfg(test)]

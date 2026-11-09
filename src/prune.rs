@@ -29,6 +29,7 @@
 //! the check can only remove a worktree of a finished pull request.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::git::{self, LinkedWorktree};
 use crate::github::{self, PullRequest, PullRequestState};
@@ -114,6 +115,100 @@ pub fn finished_pull_request<'a>(
     finished.find(|pull_request| head_contains(&pull_request.head))
 }
 
+/// The repository on GitHub of the remote `origin` of `main_checkout`,
+/// as `owner/name`.
+pub fn github_repository(main_checkout: &Path) -> Result<String, Error> {
+    let origin_url = git::origin_url(main_checkout)
+        .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
+    github::repository_of(&origin_url)
+        .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))
+}
+
+/// The pull requests of a branch, as the observer and the cleaner see
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchStatus {
+    /// The branch has no pull request.
+    NoPullRequest,
+    /// The branch has an open pull request, with this number.
+    Open(u64),
+    /// A finished pull request contains the local commit of the branch:
+    /// the worktree is finished.
+    Finished {
+        pull_request: PullRequest,
+        commit: String,
+    },
+    /// The pull requests of the branch are finished, but the worktree
+    /// must stay. The number is the last pull request.
+    Kept { number: u64, why: KeptWhy },
+}
+
+/// Why a worktree with finished pull requests stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptWhy {
+    /// The branch has a commit after its finished pull requests.
+    WorkAfter,
+    /// The default branch contains the commit of the branch: a new
+    /// worktree starts there, or wt merged it without a pull request.
+    /// `wt step prune` removes a merged worktree.
+    InDefaultBranch,
+    /// The local branch has no commit.
+    NoLocalCommit,
+}
+
+/// Read the pull requests of `branch` (one call to gh, sometimes 2), and
+/// tell the status of its worktree. `repository` is the repository on
+/// GitHub, and `default_branch` the default branch of `origin`, if git
+/// knows it. `limit` is the time limit of each call to gh.
+pub fn branch_status(
+    main_checkout: &Path,
+    repository: &str,
+    default_branch: Option<&str>,
+    branch: &str,
+    limit: Duration,
+) -> Result<BranchStatus, Error> {
+    let pull_requests = github::pull_requests(repository, branch, limit)?;
+    let Some(last) = pull_requests.first() else {
+        return Ok(BranchStatus::NoPullRequest);
+    };
+    if let Some(open) = pull_requests
+        .iter()
+        .find(|pull_request| pull_request.state == PullRequestState::Open)
+    {
+        return Ok(BranchStatus::Open(open.number));
+    }
+    let Some(local_commit) = git::branch_commit(main_checkout, branch) else {
+        return Ok(BranchStatus::Kept {
+            number: last.number,
+            why: KeptWhy::NoLocalCommit,
+        });
+    };
+    let place = match default_branch {
+        None => DefaultBranch::Unknown,
+        Some(default) if git::is_ancestor(main_checkout, &local_commit, default) => {
+            DefaultBranch::Contains
+        }
+        Some(_) => DefaultBranch::DoesNotContain,
+    };
+    let finished = finished_pull_request(&local_commit, &pull_requests, place, |head| {
+        github::contains(repository, head, &local_commit, limit)
+    });
+    Ok(match finished {
+        Some(pull_request) => BranchStatus::Finished {
+            pull_request: pull_request.clone(),
+            commit: local_commit,
+        },
+        None => BranchStatus::Kept {
+            number: last.number,
+            why: if place == DefaultBranch::Contains {
+                KeptWhy::InDefaultBranch
+            } else {
+                KeptWhy::WorkAfter
+            },
+        },
+    })
+}
+
 /// Sort the linked worktrees of the repository of `main_checkout` by their
 /// pull requests.
 ///
@@ -129,38 +224,28 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
     if worktrees.is_empty() {
         return Ok(Check::default());
     }
-    let origin_url = git::origin_url(main_checkout)
-        .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
-    let repository = github::repository_of(&origin_url)
-        .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))?;
+    let repository = github_repository(main_checkout)?;
     let default_branch = git::default_branch(main_checkout);
     let mut check = Check::default();
     for worktree in worktrees {
-        let pull_requests = github::pull_requests(&repository, &worktree.branch)?;
-        if pull_requests.is_empty() {
-            check.without_pull_request.push(worktree);
-            continue;
-        }
-        let Some(local_commit) = git::branch_commit(main_checkout, &worktree.branch) else {
-            continue;
-        };
-        let place = match &default_branch {
-            None => DefaultBranch::Unknown,
-            Some(branch) if git::is_ancestor(main_checkout, &local_commit, branch) => {
-                DefaultBranch::Contains
-            }
-            Some(_) => DefaultBranch::DoesNotContain,
-        };
-        let finished = finished_pull_request(&local_commit, &pull_requests, place, |head| {
-            github::contains(&repository, head, &local_commit)
-        });
-        if let Some(pull_request) = finished {
-            check.finished.push(FinishedWorktree {
+        match branch_status(
+            main_checkout,
+            &repository,
+            default_branch.as_deref(),
+            &worktree.branch,
+            github::GH_TIME_LIMIT,
+        )? {
+            BranchStatus::NoPullRequest => check.without_pull_request.push(worktree),
+            BranchStatus::Finished {
+                pull_request,
+                commit,
+            } => check.finished.push(FinishedWorktree {
                 path: worktree.path,
                 branch: worktree.branch,
-                pull_request: pull_request.clone(),
-                commit: local_commit,
-            });
+                pull_request,
+                commit,
+            }),
+            BranchStatus::Open(_) | BranchStatus::Kept { .. } => {}
         }
     }
     Ok(check)
@@ -179,13 +264,10 @@ pub fn without_pull_request(
     if old.is_empty() {
         return Ok(old);
     }
-    let origin_url = git::origin_url(main_checkout)
-        .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
-    let repository = github::repository_of(&origin_url)
-        .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))?;
+    let repository = github_repository(main_checkout)?;
     let mut kept = Vec::new();
     for worktree in old {
-        if github::pull_requests(&repository, &worktree.branch)?.is_empty() {
+        if github::pull_requests(&repository, &worktree.branch, github::GH_TIME_LIMIT)?.is_empty() {
             kept.push(worktree);
         }
     }

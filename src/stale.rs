@@ -12,18 +12,11 @@
 //!
 //! - `stale-last`: the time of the last pass.
 //! - `stale-asked`: one line for each question, `<time>\t<path>`.
-//!
-//! At each pass (every 5 minutes), the thread also writes
-//! `no-pull-request.tsv`: the worktrees without pull request of each
-//! repository that it checked. The popup cleaner reads this file, so it
-//! calls GitHub only for a repository that the thread did not check.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::git::LinkedWorktree;
 
 /// The number of seconds in a day.
 pub const DAY: u64 = 86_400;
@@ -179,9 +172,18 @@ pub fn write_list(path: &Path, old: &[OldWorktree]) -> Result<(), std::io::Error
             )
         })
         .collect();
-    // Write a new file, then rename it: a reader never sees a part of the
-    // list, also if the writer stops.
-    let new_path = path.with_extension("new");
+    write_atomically(path, &text)
+}
+
+/// Write a file in one rename: a reader never sees a part of it, also if
+/// the writer stops. The temporary file has the name of the file and the
+/// process: 2 files or 2 processes never share it.
+pub fn write_atomically(path: &Path, text: &str) -> Result<(), std::io::Error> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let new_path = path.with_file_name(format!(".{name}.{}.new", std::process::id()));
     fs::write(&new_path, text)?;
     fs::rename(&new_path, path)
 }
@@ -211,149 +213,9 @@ fn parse_list(text: &str) -> Vec<OldWorktree> {
         .collect()
 }
 
-/// The age after which the popup cleaner does not use
-/// `no-pull-request.tsv`: 3 passes of the thread.
-pub const NO_PULL_REQUEST_MAX_AGE: u64 = 15 * 60;
-
-fn no_pull_request_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("no-pull-request.tsv")
-}
-
-/// Write the worktrees without pull request of the checked repositories.
-/// A temporary file and a rename: the popup never reads a partial file.
-///
-/// Lines: `checked\t<time>`, then `repository\t<main checkout>` for each
-/// checked repository, and `worktree\t<main checkout>\t<path>\t<branch>`
-/// for each worktree without pull request.
-pub fn write_no_pull_request(
-    state_dir: &Path,
-    checked: &[(PathBuf, Vec<LinkedWorktree>)],
-    now: u64,
-) -> Result<(), std::io::Error> {
-    let mut text = format!("checked\t{now}\n");
-    for (main_checkout, worktrees) in checked {
-        text.push_str(&format!("repository\t{}\n", main_checkout.display()));
-        for worktree in worktrees {
-            text.push_str(&format!(
-                "worktree\t{}\t{}\t{}\n",
-                main_checkout.display(),
-                worktree.path.display(),
-                worktree.branch
-            ));
-        }
-    }
-    let path = no_pull_request_path(state_dir);
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::create_dir_all(state_dir)?;
-    fs::write(&temporary, text)?;
-    fs::rename(&temporary, &path)
-}
-
-/// Read the worktrees without pull request of each checked repository, or
-/// None if the file is missing or older than `max_age` seconds. The
-/// worktrees that do not exist anymore are left out.
-pub fn read_no_pull_request(
-    state_dir: &Path,
-    now: u64,
-    max_age: u64,
-) -> Option<HashMap<PathBuf, Vec<LinkedWorktree>>> {
-    let text = fs::read_to_string(no_pull_request_path(state_dir)).ok()?;
-    let (checked_at, repositories) = parse_no_pull_request(&text)?;
-    if now.saturating_sub(checked_at) > max_age {
-        return None;
-    }
-    Some(
-        repositories
-            .into_iter()
-            .map(|(main_checkout, worktrees)| {
-                let existing = worktrees
-                    .into_iter()
-                    .filter(|worktree| worktree.path.exists())
-                    .collect();
-                (main_checkout, existing)
-            })
-            .collect(),
-    )
-}
-
-type NoPullRequest = (u64, HashMap<PathBuf, Vec<LinkedWorktree>>);
-
-fn parse_no_pull_request(text: &str) -> Option<NoPullRequest> {
-    let mut checked_at = None;
-    let mut repositories: HashMap<PathBuf, Vec<LinkedWorktree>> = HashMap::new();
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
-        match fields.as_slice() {
-            ["checked", time] => checked_at = time.parse().ok(),
-            ["repository", main_checkout] => {
-                repositories
-                    .entry(PathBuf::from(main_checkout))
-                    .or_default();
-            }
-            ["worktree", main_checkout, path, branch] => repositories
-                .entry(PathBuf::from(main_checkout))
-                .or_default()
-                .push(LinkedWorktree {
-                    path: PathBuf::from(path),
-                    branch: (*branch).to_owned(),
-                }),
-            _ => {}
-        }
-    }
-    Some((checked_at?, repositories))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_worktrees_without_pull_request_are_read_back_while_fresh() {
-        let folder =
-            std::env::temp_dir().join(format!("herdr-worktrunk-npr-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&folder);
-        let existing = folder.join("repo.old");
-        fs::create_dir_all(&existing).unwrap();
-        let checked = vec![
-            (
-                PathBuf::from("/work/repo"),
-                vec![
-                    LinkedWorktree {
-                        path: existing.clone(),
-                        branch: "old".to_owned(),
-                    },
-                    LinkedWorktree {
-                        path: PathBuf::from("/gone"),
-                        branch: "gone".to_owned(),
-                    },
-                ],
-            ),
-            (PathBuf::from("/work/empty"), Vec::new()),
-        ];
-        write_no_pull_request(&folder, &checked, 1000).unwrap();
-
-        let read = read_no_pull_request(
-            &folder,
-            1000 + NO_PULL_REQUEST_MAX_AGE,
-            NO_PULL_REQUEST_MAX_AGE,
-        )
-        .unwrap();
-        assert_eq!(
-            read[Path::new("/work/repo")],
-            vec![LinkedWorktree {
-                path: existing,
-                branch: "old".to_owned()
-            }]
-        );
-        assert!(read[Path::new("/work/empty")].is_empty());
-        assert!(read_no_pull_request(
-            &folder,
-            1001 + NO_PULL_REQUEST_MAX_AGE,
-            NO_PULL_REQUEST_MAX_AGE
-        )
-        .is_none());
-        fs::remove_dir_all(&folder).unwrap();
-    }
 
     #[test]
     fn a_list_of_old_worktrees_is_read_back() {

@@ -684,19 +684,12 @@ fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: 
     let Some(folder) = old.first().map(|worktree| worktree.main_checkout.clone()) else {
         return;
     };
-    let list_path = settings.state_dir.join("stale-list.tsv");
-    if let Err(error) = stale::write_list(&list_path, &old) {
-        log.write(&format!(
-            "cannot write the list of the old worktrees: {error}"
-        ));
-        return;
-    }
     let thread_log = Arc::clone(&log);
     let started = thread::Builder::new()
         .name("stale_days".to_owned())
         .spawn(move || {
             let log = thread_log;
-            if let Err(error) = actions::open_cleaner(&folder, &list_path) {
+            if let Err(error) = actions::open_cleaner(&folder) {
                 log.write(&format!(
                     "cannot open the popup cleaner: {}",
                     one_line(&error)
@@ -743,14 +736,12 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
         let mut old = Vec::new();
         let mut is_checked = false;
         let mut errors = HashSet::new();
-        let mut checked = Vec::new();
         for repository in repositories {
             let Some(without_pull_request) = prune_repository(&repository, view, log, &mut errors)
             else {
                 continue;
             };
             is_checked = true;
-            checked.push((repository.clone(), without_pull_request.clone()));
             if is_stale_pass {
                 old.extend(old_worktrees(
                     &repository,
@@ -760,12 +751,6 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
                     settings.stale_days,
                 ));
             }
-        }
-        // The popup cleaner reads this file instead of calling GitHub.
-        if let Err(error) =
-            stale::write_no_pull_request(&settings.state_dir, &checked, stale::now())
-        {
-            errors.insert(format!("cannot write no-pull-request.tsv: {error}"));
         }
         // A pass without a checked repository (no workspace yet, or gh
         // fails) does not count: the next pass tries again.

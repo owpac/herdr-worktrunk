@@ -13,6 +13,7 @@
 mod actions;
 mod cleaner;
 mod config;
+mod fzf;
 mod git;
 mod github;
 mod herdr;
@@ -149,16 +150,56 @@ fn main() -> ExitCode {
             picker::print_preview(Path::new(repository), Path::new(cache), kind, branch, path);
             return ExitCode::SUCCESS;
         }
-        ["cleaner-verify", list] => {
-            cleaner::print_verified_rows(Path::new(list));
+        ["cleaner-rows", state, query @ ..] => {
+            cleaner::print_rows(Path::new(state), &query.join(" "));
             return ExitCode::SUCCESS;
         }
-        ["cleaner-rows", list] => {
-            cleaner::print_list_rows(Path::new(list));
+        ["cleaner-move", state, direction, current_index, current_id, query @ ..] => {
+            let direction = match *direction {
+                "up" => cleaner::Move::Up,
+                "down" => cleaner::Move::Down,
+                _ => cleaner::Move::Keep,
+            };
+            cleaner::print_move(
+                Path::new(state),
+                direction,
+                current_index,
+                current_id,
+                &query.join(" "),
+            );
             return ExitCode::SUCCESS;
         }
-        ["picker-tab", cache, direction] => {
-            picker::change_tab(Path::new(cache), *direction == "next");
+        ["cleaner-remember", state, id] => {
+            cleaner::remember_cursor(Path::new(state), id);
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-enter", kind] => {
+            cleaner::print_enter(kind);
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-delete-all", state] => {
+            cleaner::print_delete_all(Path::new(state));
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-preview", state, stale_days, id, branch, main_checkout, kind] => {
+            let stale_days = stale_days.parse().unwrap_or(DEFAULT_STALE_DAYS);
+            cleaner::print_preview(
+                Path::new(state),
+                stale_days,
+                id,
+                branch,
+                main_checkout,
+                kind,
+            );
+            return ExitCode::SUCCESS;
+        }
+        ["picker-tab", cache, direction, count @ ..] => {
+            // The picker has 3 tabs, the cleaner 4.
+            let count = count
+                .first()
+                .and_then(|count| count.parse().ok())
+                .unwrap_or(3);
+            picker::change_tab(Path::new(cache), *direction == "next", count);
             return ExitCode::SUCCESS;
         }
         ["picker-backspace", query, kind, branch] => {
@@ -199,10 +240,7 @@ fn main() -> ExitCode {
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
-        ["cleaner"] => (
-            actions::cleaner(stale_days_or_default(), &state_dir()),
-            Some("cleaner"),
-        ),
+        ["cleaner"] => (actions::cleaner(stale_days_or_default()), Some("cleaner")),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

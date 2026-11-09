@@ -8,6 +8,8 @@ use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -177,6 +179,28 @@ pub fn snapshot() -> Result<Snapshot, Error> {
     decode(result["snapshot"].clone(), "herdr api snapshot")
 }
 
+/// herdr refuses a worktree command while too many worktree checks wait
+/// (`worktree_busy`): try again this number of times.
+const BUSY_ATTEMPTS: u32 = 20;
+const BUSY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Run a herdr worktree command. If herdr answers `worktree_busy`, wait,
+/// then try again: herdr asks for it.
+fn run_when_free(arguments: &[&str]) -> Result<serde_json::Value, Error> {
+    let mut attempt = 1;
+    loop {
+        match run(arguments) {
+            Err(Error::Herdr { code, .. })
+                if code == "worktree_busy" && attempt < BUSY_ATTEMPTS =>
+            {
+                attempt += 1;
+                thread::sleep(BUSY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Return the git checkout of a workspace, if the workspace is in git.
 ///
 /// herdr gives the checkout in 3 places. In this order:
@@ -190,7 +214,7 @@ pub fn snapshot() -> Result<Snapshot, Error> {
 ///    for example the main checkout of a workspace that
 ///    `herdr workspace create` made in a repository.
 pub fn workspace_checkout(workspace_id: &str) -> Result<Option<WorkspaceCheckout>, Error> {
-    let listed = match run(&["worktree", "list", "--workspace", workspace_id]) {
+    let listed = match run_when_free(&["worktree", "list", "--workspace", workspace_id]) {
         Ok(result) => Some(result),
         Err(Error::Herdr { code, .. }) if code == "not_git_worktree" => None,
         Err(error) => return Err(error),

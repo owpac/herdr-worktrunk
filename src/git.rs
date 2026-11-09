@@ -192,8 +192,15 @@ pub fn branch_commit(main_checkout: &Path, branch: &str) -> Option<String> {
 /// committed. With `--no-optional-locks`, git does not write the index:
 /// the check does not change the last activity of the worktree.
 pub fn is_clean(checkout: &Path) -> bool {
+    clean_status(checkout).unwrap_or(false)
+}
+
+/// Return true if the checkout has no change that is not committed, or
+/// None if `git status` fails.
+pub fn clean_status(checkout: &Path) -> Option<bool> {
     run_in(checkout, &["--no-optional-locks", "status", "--porcelain"])
-        .is_ok_and(|text| text.is_empty())
+        .ok()
+        .map(|text| text.is_empty())
 }
 
 /// Return the last activity of the worktree `checkout`, in seconds since
