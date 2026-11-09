@@ -25,12 +25,17 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 | `shift-↑`, `shift-↓` | Scroll the preview. |
 | `Esc` | Cancels. |
 
-Each row of the picker gives:
+Each row of the picker gives these items, from left to right:
 
-- on the left: the state (`✓` no change, `●` changes that are not committed, `○` a branch without worktree, `+` a new worktree), the branch, and the subject of its last commit,
-- on the right: the folder of the worktree, `main` or `current`, the symbols of wt (`↑` ahead, `↓` behind, `|` in sync with the upstream), and the age of the last commit.
+- the state: `✓` no change, `●` changes that are not committed, `○` a branch without worktree, `+` a new worktree,
+- the branch, and the subject of its last commit,
+- the folder of the worktree, and `main` or `current`,
+- the lines and the commits since the default branch (`+30 -4`, `↑2 ↓1`), and the marker of wt (`💬`),
+- the age of the last commit.
 
-The picker and the cleaner use the design of the plugins [herdr-bar](https://github.com/jeffarese/herdr-bar) and [herdr-newtab-plus](https://github.com/jeffarese/herdr-newtab-plus): the hints of the keys are at the bottom, the repository is on the right of the prompt, and the first line of the preview gives its tabs.
+If a row is too long, the folder goes away first.
+
+The picker and the cleaner use the design of the plugins [herdr-bar](https://github.com/jeffarese/herdr-bar) and [herdr-newtab-plus](https://github.com/jeffarese/herdr-newtab-plus). The hints of the keys are at the bottom. The repository shows on the right of the prompt. The first line of the preview gives its tabs.
 
 The question has 2 buttons: `[ Cancel ]`, the default button, and `[ Delete ]` in red (or `[ Merge ]`). `←` `→` and `Tab` change the button, `Enter` presses it, `y` confirms, `Esc` cancels. herdr shows one popup at a time: a detached process of the plugin opens the next popup when the previous popup is closed.
 

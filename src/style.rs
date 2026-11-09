@@ -11,7 +11,6 @@ use std::env;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::picker::shell_quote;
 use crate::ui;
 
 pub const RESET: &str = "\x1b[0m";
@@ -24,6 +23,8 @@ pub const REPOSITORY: &str = "\x1b[38;5;14m";
 pub const GREEN: &str = "\x1b[38;5;10m";
 /// A worktree with changes that are not committed.
 pub const YELLOW: &str = "\x1b[38;5;11m";
+/// The deleted lines, and the commits behind the default branch.
+pub const RED: &str = "\x1b[38;5;9m";
 /// The secondary text: a commit subject, a folder, an age.
 pub const MUTED: &str = "\x1b[38;5;249m";
 /// The labels of the hints, and the tabs of the preview that are not
@@ -42,6 +43,10 @@ const FZF_COLORS: &str = "fg:-1,bg:-1,hl:12,fg+:-1:regular,bg+:237,hl+:12:bold,\
 gutter:-1,pointer:12:bold,prompt:12:bold,query:-1:regular,info:246,spinner:12,\
 separator:239,border:239,preview-border:239,ghost:246,header:11,\
 footer:246,footer-border:239";
+
+/// The error of a popup when fzf fails, for example an fzf without the
+/// options of the design.
+pub const FZF_FAILED: &str = "fzf failed. The popups need fzf 0.66 or later: run fzf --version.";
 
 /// The width of the preview, in percent of the popup.
 const PREVIEW_PERCENT: usize = 50;
@@ -65,13 +70,12 @@ const HOUR: u64 = 60 * MINUTE;
 const DAY: u64 = 24 * HOUR;
 
 /// The fzf options of the 2 popups. `ghost` shows in the empty prompt,
-/// `scope` shows on the right of the prompt, after the count, and
+/// `scope` shows on the right of the prompt, before the count, and
 /// `hints` shows at the bottom.
 pub fn fzf_arguments(ghost: &str, scope: &str, hints: &[(&str, &str)]) -> Vec<String> {
-    let info = format!(
-        "printf '%s  {BOLD}{ACCENT}%s{RESET}' \"$FZF_INFO\" {}",
-        shell_quote(scope)
-    );
+    // fzf shows the prefix of the info in the color of the prompt (bold,
+    // accent), without a process at each key.
+    let info = format!("inline-right:{scope}  ");
     [
         "--ansi",
         "--layout",
@@ -81,8 +85,8 @@ pub fn fzf_arguments(ghost: &str, scope: &str, hints: &[(&str, &str)]) -> Vec<St
         "\t",
         "--with-nth",
         "4..",
-        // sh starts faster than the shell of the user: fzf runs a command
-        // at each key.
+        // sh starts faster than the shell of the user: fzf runs the rows
+        // command at each key.
         "--with-shell",
         "sh -c",
         "--padding",
@@ -99,8 +103,6 @@ pub fn fzf_arguments(ghost: &str, scope: &str, hints: &[(&str, &str)]) -> Vec<St
         "--ghost",
         ghost,
         "--info",
-        "inline-right",
-        "--info-command",
         &info,
         "--separator",
         "─",
@@ -110,7 +112,9 @@ pub fn fzf_arguments(ghost: &str, scope: &str, hints: &[(&str, &str)]) -> Vec<St
         "--footer-border",
         "line",
         "--preview-window",
-        &format!("right,{PREVIEW_PERCENT}%,border-left,noinfo"),
+        // ~2: the tabs and the rule stay on the screen when the preview
+        // scrolls.
+        &format!("right,{PREVIEW_PERCENT}%,border-left,noinfo,~2"),
         "--color",
         FZF_COLORS,
     ]
@@ -160,7 +164,39 @@ pub fn row_width(columns: usize) -> usize {
     columns.saturating_sub(preview + ROW_GUTTER + ROW_GAP)
 }
 
-/// A part of a row: its color (or "") and its text.
+/// The width of `text` on the screen, without its ANSI codes.
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut in_code = false;
+    for character in text.chars() {
+        match (in_code, character) {
+            (false, '\x1b') => in_code = true,
+            (true, 'm') => in_code = false,
+            (false, _) => width += character.width().unwrap_or(0),
+            _ => {}
+        }
+    }
+    width
+}
+
+/// The text of `line` without its ANSI codes.
+#[cfg(test)]
+pub(crate) fn visible(line: &str) -> String {
+    let mut text = String::new();
+    let mut in_code = false;
+    for character in line.chars() {
+        match (in_code, character) {
+            (false, '\x1b') => in_code = true,
+            (true, 'm') => in_code = false,
+            (false, _) => text.push(character),
+            _ => {}
+        }
+    }
+    text
+}
+
+/// A part of a row: its color (or "") and its text. The text of a part
+/// on the right side can have its own ANSI codes, with the color "".
 pub struct Part {
     color: &'static str,
     text: String,
@@ -215,20 +251,28 @@ fn cut(parts: &[Part], width: usize) -> (String, usize) {
 
 /// A row of a list in `width` columns: `left` at the start, `right` at
 /// the end, with ` · ` between the parts of `right`. If the 2 sides do not
-/// fit, the end of `left` is cut with `…`. In a small popup, `right` goes
-/// away.
+/// fit, the first parts of `right` go away (give the least useful part
+/// first), then the end of `left` is cut with `…`.
 pub fn row(left: &[Part], right: &[Part], width: usize) -> String {
-    let right: Vec<&Part> = right.iter().filter(|part| !part.text.is_empty()).collect();
-    let right_width: usize = right.iter().map(|part| part.text.width()).sum::<usize>()
-        + SEPARATOR.width() * right.len().saturating_sub(1);
-    let has_right = !right.is_empty() && right_width + ROW_GAP + MIN_LEFT_WIDTH <= width;
-    let left_space = if has_right {
-        width - right_width - ROW_GAP
-    } else {
+    let mut right: Vec<&Part> = right.iter().filter(|part| !part.text.is_empty()).collect();
+    let width_of = |parts: &[&Part]| {
+        parts
+            .iter()
+            .map(|part| visible_width(&part.text))
+            .sum::<usize>()
+            + SEPARATOR.width() * parts.len().saturating_sub(1)
+    };
+    while !right.is_empty() && width_of(&right) + ROW_GAP + MIN_LEFT_WIDTH > width {
+        right.remove(0);
+    }
+    let right_width = width_of(&right);
+    let left_space = if right.is_empty() {
         width
+    } else {
+        width - right_width - ROW_GAP
     };
     let (left_text, left_width) = cut(left, left_space);
-    if !has_right {
+    if right.is_empty() {
         return left_text;
     }
     let separator = format!("{RULE}{SEPARATOR}{RESET}");
@@ -330,21 +374,6 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use super::*;
 
-    /// The text of `line` without the ANSI codes.
-    fn visible(line: &str) -> String {
-        let mut text = String::new();
-        let mut in_code = false;
-        for character in line.chars() {
-            match (in_code, character) {
-                (false, '\x1b') => in_code = true,
-                (true, 'm') => in_code = false,
-                (false, _) => text.push(character),
-                _ => {}
-            }
-        }
-        text
-    }
-
     #[test]
     fn a_row_puts_the_right_side_at_the_end() {
         let line = row(
@@ -385,6 +414,32 @@ mod tests {
         );
 
         assert_eq!(visible(&line), "feat-a");
+    }
+
+    #[test]
+    fn the_first_parts_of_the_right_side_go_away_first() {
+        let line = row(
+            &[part("", "feat/popup-design")],
+            &[
+                part(MUTED, "herdr-worktrunk.feat-popup-design"),
+                part(MUTED, "↑1"),
+                part(MUTED, "3h"),
+            ],
+            40,
+        );
+
+        let text = visible(&line);
+        assert_eq!(text.width(), 40);
+        assert!(text.ends_with("↑1 · 3h"), "{text}");
+        assert!(!text.contains("herdr-worktrunk."));
+    }
+
+    #[test]
+    fn a_right_part_with_ansi_codes_counts_its_visible_width() {
+        let diff = format!("{GREEN}+804{RESET} {RED}-163{RESET}");
+        let line = row(&[part("", "feat-a")], &[part("", diff)], 30);
+
+        assert_eq!(visible(&line).width(), 30);
     }
 
     #[test]

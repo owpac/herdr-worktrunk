@@ -4,8 +4,9 @@
 //! Keys (the footer of the picker shows them):
 //!
 //! - `Enter` opens the selected worktree or branch. When the typed name
-//!   matches no branch, the first row is `+ Create worktree <name>`:
-//!   `Enter` on this row creates the worktree.
+//!   matches no branch, the first row is
+//!   `+ <name> — new worktree from the default branch`: `Enter` on this
+//!   row creates the worktree.
 //! - `⌫` asks to delete the selected worktree, when the filter is empty:
 //!   the picker closes, the popup confirm asks the question, then the
 //!   picker comes back. When the filter has text, `⌫` erases a character,
@@ -34,7 +35,7 @@ use serde_json::Value;
 use crate::git;
 use crate::herdr::Error;
 use crate::stale;
-use crate::style::{self, part, Part, ACCENT, DIM, GREEN, MUTED, RULE, YELLOW};
+use crate::style::{self, part, ACCENT, DIM, GREEN, MUTED, RED, RESET, RULE, YELLOW};
 
 /// fzf exits with 130 when the user cancels.
 pub(crate) const FZF_CANCEL_EXIT_CODE: i32 = 130;
@@ -44,10 +45,13 @@ const GHOST: &str = "worktree — type a name to filter, or a new name to create
 const HINTS: [(&str, &str); 5] = [
     ("↑↓", "move"),
     ("⏎", "open or create"),
-    ("⌫", "delete"),
+    ("⌫", "delete (empty filter)"),
     ("⇥", "preview"),
     ("esc", "close"),
 ];
+/// The variable that gives the checkout of the popup to the rows command:
+/// its row gets the label `current`.
+const CURRENT_VARIABLE: &str = "TRUNK_CURRENT_CHECKOUT";
 /// The first line that fzf prints when `⌫` asks for a deletion.
 const DELETE_REQUEST: &str = "delete";
 const PREVIEW_COMMIT_COUNT: &str = "20";
@@ -105,25 +109,22 @@ impl Row {
     }
 
     /// The line of fzf: kind, branch, path and text, separated by tabs.
-    /// The text fills `width` columns: the state, the branch and the
-    /// subject of its last commit on the left, the folder, the symbols of
-    /// wt and the age of the last commit on the right.
+    /// The text fills `width` columns. On the left: the state, the branch
+    /// and the subject of its last commit. On the right: the folder,
+    /// `main` or `current`, the lines and the commits since the default
+    /// branch, the marker of wt and the age of the last commit. A small
+    /// popup drops the folder first.
     fn line(&self, details: &Details, now: u64, width: usize) -> String {
         let (state, mut right) = match self {
             Row::Create { .. } => (part(GREEN, "+ "), Vec::new()),
             Row::Worktree { path, is_main, .. } => {
-                // The folder name is sufficient: the full path is long.
-                let folder = path
-                    .file_name()
-                    .unwrap_or(path.as_os_str())
-                    .to_string_lossy()
-                    .into_owned();
                 let state = if details.has_changes {
                     part(YELLOW, "● ")
                 } else {
                     part(GREEN, "✓ ")
                 };
-                let mut right = vec![part(MUTED, folder)];
+                // The folder name is sufficient: the full path is long.
+                let mut right = vec![part(MUTED, git::folder_name(path))];
                 if *is_main {
                     right.push(part(ACCENT, "main"));
                 } else if details.is_current {
@@ -133,7 +134,7 @@ impl Row {
             }
             Row::Branch { .. } => (part(DIM, "○ "), vec![part(DIM, "no worktree")]),
         };
-        let mut left: Vec<Part> = vec![state, part("", self.branch())];
+        let mut left = vec![state, part("", self.branch())];
         let subject = match self {
             Row::Create { .. } => "new worktree from the default branch",
             _ => details.subject.as_str(),
@@ -142,7 +143,9 @@ impl Row {
             left.push(part(RULE, " — "));
             left.push(part(MUTED, subject));
         }
-        right.push(part(MUTED, details.symbols.clone()));
+        right.push(part("", details.lines_text()));
+        right.push(part("", details.commits_text()));
+        right.push(part("", details.marker.clone()));
         if let Some(time) = details.committed_at {
             right.push(part(MUTED, style::age(now.saturating_sub(time))));
         }
@@ -161,8 +164,16 @@ impl Row {
 struct Details {
     /// The subject of the last commit.
     subject: String,
-    /// The symbols of wt: `↑` ahead, `↓` behind, `!` modified...
-    symbols: String,
+    /// The commits ahead of the default branch.
+    ahead: u64,
+    /// The commits behind the default branch.
+    behind: u64,
+    /// The lines added since the default branch.
+    added: u64,
+    /// The lines deleted since the default branch.
+    deleted: u64,
+    /// The marker of wt, for example the state of an agent (`💬`).
+    marker: String,
     /// The time of the last commit, in seconds since 1970.
     committed_at: Option<u64>,
     /// The worktree has changes that are not committed.
@@ -171,25 +182,55 @@ struct Details {
     is_current: bool,
 }
 
-/// A row of the cache: the row and its details, in 8 fields separated by
+impl Details {
+    /// The lines since the default branch, as wt shows them: `+804 -163`.
+    fn lines_text(&self) -> String {
+        let mut texts = Vec::new();
+        if self.added > 0 {
+            texts.push(format!("{GREEN}+{}{RESET}", self.added));
+        }
+        if self.deleted > 0 {
+            texts.push(format!("{RED}-{}{RESET}", self.deleted));
+        }
+        texts.join(" ")
+    }
+
+    /// The commits since the default branch, as wt shows them: `↑1 ↓2`.
+    fn commits_text(&self) -> String {
+        let mut texts = Vec::new();
+        if self.ahead > 0 {
+            texts.push(format!("{GREEN}↑{}{RESET}", self.ahead));
+        }
+        if self.behind > 0 {
+            texts.push(format!("{RED}↓{}{RESET}", self.behind));
+        }
+        texts.join(" ")
+    }
+}
+
+/// A row of the cache: the row and its details, in 12 fields separated by
 /// tabs. fzf does not read it: `print_rows` makes the lines of fzf with
 /// the width of the popup.
 fn record(row: &Row, details: &Details) -> String {
     let clean = |text: &str| text.replace(['\t', '\n'], " ");
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        row.kind(),
+    [
+        row.kind().to_owned(),
         clean(row.branch()),
         row.path(),
         clean(&details.subject),
-        clean(&details.symbols),
+        details.ahead.to_string(),
+        details.behind.to_string(),
+        details.added.to_string(),
+        details.deleted.to_string(),
+        clean(&details.marker),
         details
             .committed_at
             .map(|time| time.to_string())
             .unwrap_or_default(),
-        u8::from(details.has_changes),
-        u8::from(details.is_current),
-    )
+        u8::from(details.has_changes).to_string(),
+        u8::from(details.is_current).to_string(),
+    ]
+    .join("\t")
 }
 
 /// Read a row of the cache.
@@ -197,19 +238,25 @@ fn parse_record(line: &str) -> Option<(Row, Details)> {
     let row = parse_row(line)?;
     let fields: Vec<&str> = line.split('\t').collect();
     let field = |index: usize| fields.get(index).copied().unwrap_or_default();
+    let number = |index: usize| field(index).parse().unwrap_or(0);
     let details = Details {
         subject: field(3).to_owned(),
-        symbols: field(4).to_owned(),
-        committed_at: field(5).parse().ok(),
-        has_changes: field(6) == "1",
-        is_current: field(7) == "1",
+        ahead: number(4),
+        behind: number(5),
+        added: number(6),
+        deleted: number(7),
+        marker: field(8).to_owned(),
+        committed_at: field(9).parse().ok(),
+        has_changes: field(10) == "1",
+        is_current: field(11) == "1",
     };
     Some((row, details))
 }
 
 /// Read the rows of `wt list --format json --branches`, as rows of the
-/// cache.
-fn list_records(repository: &Path) -> Result<Vec<String>, Error> {
+/// cache. `current` is the checkout of the popup: wt runs in the main
+/// checkout, so its own `current` flag is always on the main checkout.
+fn list_records(repository: &Path, current: Option<&Path>) -> Result<Vec<String>, Error> {
     let output = Command::new("wt")
         .arg("-C")
         .arg(repository)
@@ -222,6 +269,7 @@ fn list_records(repository: &Path) -> Result<Vec<String>, Error> {
     }
     let json: Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| Error::Command(format!("wt list: invalid JSON: {error}")))?;
+    let current = current.map(git::canonical);
     let items = json["items"].as_array().cloned().unwrap_or_default();
     let mut records = Vec::new();
     for item in items {
@@ -239,27 +287,32 @@ fn list_records(repository: &Path) -> Result<Vec<String>, Error> {
         ]
         .iter()
         .any(|kind| changes[kind].as_bool().unwrap_or(false));
+        let path = item["worktree"]["path"].as_str().map(PathBuf::from);
+        let number = |value: &Value| value.as_u64().unwrap_or(0);
+        let default_branch = &item["default_branch"];
         let details = Details {
             subject: item["head"]["subject"]
                 .as_str()
                 .unwrap_or_default()
                 .to_owned(),
-            // `_`: the same commit as the default branch. The age says it.
-            symbols: item["display"]["symbols"]
-                .as_str()
-                .filter(|symbols| *symbols != "_")
-                .unwrap_or_default()
-                .to_owned(),
+            ahead: number(&default_branch["ahead"]),
+            behind: number(&default_branch["behind"]),
+            added: number(&default_branch["diff"]["added"]),
+            deleted: number(&default_branch["diff"]["deleted"]),
+            marker: item["marker"].as_str().unwrap_or_default().to_owned(),
             committed_at: item["head"]["committed_at"]
                 .as_str()
                 .and_then(style::parse_time),
             has_changes,
-            is_current: item["worktree"]["current"].as_bool().unwrap_or(false),
+            is_current: match (&path, &current) {
+                (Some(path), Some(current)) => git::canonical(path) == *current,
+                _ => false,
+            },
         };
-        let row = match item["worktree"]["path"].as_str() {
+        let row = match path {
             Some(path) => Row::Worktree {
                 branch: branch.to_owned(),
-                path: PathBuf::from(path),
+                path,
                 is_main: item["worktree"]["main"].as_bool().unwrap_or(false),
             },
             None => Row::Branch {
@@ -303,7 +356,8 @@ fn cache_path() -> PathBuf {
 }
 
 fn write_cache(cache: &Path, repository: &Path) -> Result<Vec<String>, Error> {
-    let records = list_records(repository)?;
+    let current = env::var_os(CURRENT_VARIABLE).map(PathBuf::from);
+    let records = list_records(repository, current.as_deref())?;
     fs::write(cache, records.join("\n"))
         .map_err(|error| Error::Command(format!("cannot write {}: {error}", cache.display())))?;
     Ok(records)
@@ -474,16 +528,17 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
     let cache_text = shell_quote(&cache.to_string_lossy());
     let rows_command = format!("{binary} picker-rows {repository_text} {cache_text} {{q}}");
     let _ = fs::remove_file(tab_path(&cache));
-    let repository_name = main_checkout
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let fzf = Command::new("fzf")
         .env(
             style::COLUMNS_VARIABLE,
             style::terminal_columns().to_string(),
         )
-        .args(style::fzf_arguments(GHOST, &repository_name, &HINTS))
+        .env(CURRENT_VARIABLE, repository)
+        .args(style::fzf_arguments(
+            GHOST,
+            &git::folder_name(&main_checkout),
+            &HINTS,
+        ))
         .arg("--preview")
         .arg(format!(
             "{binary} picker-preview {repository_text} {cache_text} {{1}} {{2}} {{3}}"
@@ -519,7 +574,7 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
     match output.status.code() {
         Some(0) => {}
         Some(FZF_CANCEL_EXIT_CODE) | Some(FZF_NO_MATCH_EXIT_CODE) => return Ok(None),
-        _ => return Err(Error::Command("fzf failed.".to_owned())),
+        _ => return Err(Error::Command(style::FZF_FAILED.to_owned())),
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
@@ -564,10 +619,14 @@ mod tests {
             },
             Details {
                 subject: "Add a parser".to_owned(),
-                symbols: "↑".to_owned(),
+                ahead: 2,
+                behind: 1,
+                added: 30,
+                deleted: 4,
+                marker: "💬".to_owned(),
                 committed_at: Some(NOW - 3 * 3600),
                 has_changes: true,
-                is_current: false,
+                is_current: true,
             },
         )
     }
@@ -619,14 +678,15 @@ mod tests {
     fn the_text_of_a_worktree_gives_its_state_subject_folder_and_age() {
         let (row, details) = worktree();
 
-        let line = row.line(&details, NOW, WIDTH);
+        let line = row.line(&details, NOW, 90);
         let text = line.split('\t').nth(3).unwrap();
 
-        assert!(text.contains("● "));
-        assert!(text.contains("feat-a"));
-        assert!(text.contains("Add a parser"));
-        assert!(text.contains("repo.feat-a"));
-        assert!(text.contains("3h"));
+        let text = style::visible(text);
+        assert!(text.starts_with("● feat-a — Add a parser"), "{text}");
+        assert!(
+            text.ends_with("repo.feat-a · current · +30 -4 · ↑2 ↓1 · 💬 · 3h"),
+            "{text}"
+        );
     }
 
     #[test]
