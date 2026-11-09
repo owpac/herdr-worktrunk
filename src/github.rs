@@ -14,24 +14,11 @@ pub const GH_TIME_LIMIT: Duration = Duration::from_secs(60);
 /// The time limit of a gh command of a popup: the user waits for it.
 pub const POPUP_TIME_LIMIT: Duration = Duration::from_secs(15);
 
-/// The URL schemes of a remote. A remote without scheme has the form
-/// `[user@]host:owner/name`.
-const SCHEMES: [&str; 4] = ["ssh://", "https://", "http://", "git://"];
-
 /// Return the GitHub repository (`owner/name`) of a remote URL, or None if
 /// the host of the remote is not `github.com`. An ssh alias of the host
 /// (`Host` in `~/.ssh/config`) gives None.
 pub fn repository_of(url: &str) -> Option<String> {
-    let (host, path) = match SCHEMES.iter().find_map(|scheme| url.strip_prefix(scheme)) {
-        // `[user@]host[:port]/owner/name`
-        Some(rest) => {
-            let (host_and_port, path) = without_user(rest).split_once('/')?;
-            let host = host_and_port.split(':').next().unwrap_or_default();
-            (host, path)
-        }
-        // `[user@]host:owner/name`
-        None => without_user(url).split_once(':')?,
-    };
+    let (host, path) = crate::forge::split_remote(url)?;
     if host != "github.com" {
         return None;
     }
@@ -42,15 +29,6 @@ pub fn repository_of(url: &str) -> Option<String> {
         return None;
     }
     Some(path.to_owned())
-}
-
-/// Remove the user (`user@`) at the start of a remote address.
-fn without_user(address: &str) -> &str {
-    let host_end = address.find(['/', ':']).unwrap_or(address.len());
-    match address[..host_end].rfind('@') {
-        Some(at) => &address[at + 1..],
-        None => address,
-    }
 }
 
 /// Run gh without a terminal, and return its output.

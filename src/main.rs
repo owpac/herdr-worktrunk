@@ -13,10 +13,12 @@
 mod actions;
 mod cleaner;
 mod config;
+mod forge;
 mod fzf;
 mod git;
 mod github;
 mod herdr;
+mod leftover;
 mod observer;
 mod picker;
 mod process;
@@ -240,7 +242,10 @@ fn main() -> ExitCode {
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
-        ["cleaner"] => (actions::cleaner(stale_days_or_default()), Some("cleaner")),
+        ["cleaner"] => (
+            actions::cleaner(stale_days_or_default(), load_config().fetch_before_check),
+            Some("cleaner"),
+        ),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

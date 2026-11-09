@@ -505,7 +505,7 @@ fn delete_all() -> Result<(), Error> {
 /// The list covers `TRUNK_CLEANER_SCOPE`, or all the repositories of the
 /// herdr workspaces. After a question, `TRUNK_CLEANER_STATE` gives the
 /// results of the last checks: these worktrees need no new check.
-pub fn cleaner(stale_days: u32) -> Result<(), Error> {
+pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
     let folder = popup_folder()?;
     let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
     // The main checkout of the scope: the return after a question needs a
@@ -561,7 +561,7 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
     if let Some(scope_text) = &scope_text {
         environment.push((SCOPE_VARIABLE, scope_text.as_str()));
     }
-    match cleaner::choose(entries, &state_path, stale_days)? {
+    match cleaner::choose(entries, &state_path, stale_days, fetch)? {
         None => {
             cleaner::stop_checks();
             let _ = std::fs::remove_file(&state_path);

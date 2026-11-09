@@ -195,6 +195,36 @@ pub fn is_clean(checkout: &Path) -> bool {
     clean_status(checkout).unwrap_or(false)
 }
 
+/// The local branches with their upstream and its state, one line each:
+/// `<branch>\t<upstream>\t<track>`. The track is `[gone]` when the last
+/// fetch removed the upstream.
+pub fn branch_upstreams(main_checkout: &Path) -> Option<String> {
+    run_in(
+        main_checkout,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)",
+            "refs/heads",
+        ],
+    )
+    .ok()
+}
+
+/// The remote branches, one line each: `<remote>/<branch>`.
+pub fn remote_branches(main_checkout: &Path) -> Option<String> {
+    run_in(
+        main_checkout,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    )
+    .ok()
+}
+
+/// Fetch `origin` and remove the remote branches that it does not have
+/// anymore. The fetch can ask the ssh agent for a key.
+pub fn fetch_prune(main_checkout: &Path) -> Result<(), Error> {
+    run_in(main_checkout, &["fetch", "--prune", "--quiet", "origin"]).map(|_| ())
+}
+
 /// Return true if the checkout has no change that is not committed, or
 /// None if `git status` fails.
 pub fn clean_status(checkout: &Path) -> Option<bool> {
