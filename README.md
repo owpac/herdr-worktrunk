@@ -105,7 +105,7 @@ With `prune_merged = true` and `stale_days = <days>`, the thread also asks about
 - no pull request,
 - no agent,
 - no change that is not committed,
-- no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the git folder of the worktree (a commit, a checkout, an add). Thus a new worktree on an old commit is not old.
+- no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the reflog of `HEAD` of the worktree (its creation, a commit, a checkout, a reset). Thus a new worktree on an old commit is not old. A `git status` does not change the activity.
 
 If old worktrees exist, the thread opens the popup cleaner with them (see below). The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
 
@@ -129,11 +129,10 @@ bin/herdr-worktrunk clean [<folder of a repository>]
 bin/herdr-worktrunk list-stale <folder of the repository>
 ```
 
-The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh.
+The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh. It does the local checks first, then calls gh only for the old worktrees, with one thread for each repository. The header of the list gives the repositories that it could not check.
 
 Limits:
 
-- A shell prompt that runs `git status` in the worktree changes the git folder. Thus a worktree with such a shell open never gets old.
 - The daily pass waits 10 minutes at most for a free popup. Then it stops, and tries again the next day.
 
 ## Configuration

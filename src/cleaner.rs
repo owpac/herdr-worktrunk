@@ -12,6 +12,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
@@ -84,10 +85,27 @@ pub fn find_old_worktrees(scope: Option<&Path>, stale_days: u32) -> Result<Searc
         repositories = vec![main];
     }
     let is_busy = |path: &Path| busy.contains(&canonical(path));
+    // One thread for each repository: gh takes about half a second for
+    // each old worktree.
+    let results: Vec<(PathBuf, Result<Vec<OldWorktree>, Error>)> = thread::scope(|scope| {
+        let handles: Vec<_> = repositories
+            .into_iter()
+            .map(|repository| {
+                scope.spawn(move || {
+                    let found = old_worktrees_of(&repository, is_busy, stale_days);
+                    (repository, found)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok())
+            .collect()
+    });
     let mut search = Search::default();
-    for repository in repositories {
-        let check = match prune::check_worktrees(&repository, is_busy) {
-            Ok(check) => check,
+    for (repository, found) in results {
+        match found {
+            Ok(old) => search.old.extend(old),
             Err(error) => {
                 let name = repository
                     .file_name()
@@ -96,18 +114,23 @@ pub fn find_old_worktrees(scope: Option<&Path>, stale_days: u32) -> Result<Searc
                 search
                     .failures
                     .push(format!("{name}: {}", error.to_string().replace('\n', " ")));
-                continue;
             }
-        };
-        search.old.extend(stale::select_old(
-            &repository,
-            check.without_pull_request,
-            is_busy,
-            None,
-            stale_days,
-        ));
+        }
     }
+    search.old.sort_by_key(|worktree| std::cmp::Reverse(worktree.days));
     Ok(search)
+}
+
+/// The old worktrees of one repository: the local checks first, then gh
+/// for the old worktrees only.
+fn old_worktrees_of(
+    repository: &Path,
+    is_busy: impl Fn(&Path) -> bool,
+    stale_days: u32,
+) -> Result<Vec<OldWorktree>, Error> {
+    let worktrees = git::linked_worktrees(repository)?;
+    let old = stale::select_old(repository, worktrees, is_busy, None, stale_days);
+    prune::without_pull_request(repository, old)
 }
 
 /// The line of a worktree in fzf: 3 hidden fields (path, branch, main

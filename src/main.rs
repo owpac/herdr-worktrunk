@@ -115,8 +115,9 @@ fn stale_days_or_default() -> u32 {
 fn list_stale(folder: &Path) -> Result<(), Error> {
     let main_checkout = main_checkout_of(folder)?;
     let stale_days = stale_days_or_default();
-    let worktrees = prune::check_worktrees(&main_checkout, |_| false)?.without_pull_request;
-    for worktree in stale::select_old(&main_checkout, worktrees, |_| false, None, stale_days) {
+    let worktrees = git::linked_worktrees(&main_checkout)?;
+    let old = stale::select_old(&main_checkout, worktrees, |_| false, None, stale_days);
+    for worktree in prune::without_pull_request(&main_checkout, old)? {
         println!(
             "{} ({}, no change for {} days)",
             worktree.path.display(),

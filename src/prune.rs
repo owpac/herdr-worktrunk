@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use crate::git::{self, LinkedWorktree};
 use crate::github::{self, PullRequest, PullRequestState};
 use crate::herdr::Error;
+use crate::stale::OldWorktree;
 
 /// A worktree of a finished pull request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +164,32 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
         }
     }
     Ok(check)
+}
+
+/// Keep the old worktrees whose branch has no pull request on GitHub.
+///
+/// The caller selects the old worktrees with local checks first (agents,
+/// activity, changes): this function then calls gh once for each of them
+/// only. Without old worktrees, it calls nothing, also for a repository
+/// without remote on GitHub.
+pub fn without_pull_request(
+    main_checkout: &Path,
+    old: Vec<OldWorktree>,
+) -> Result<Vec<OldWorktree>, Error> {
+    if old.is_empty() {
+        return Ok(old);
+    }
+    let origin_url = git::origin_url(main_checkout)
+        .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
+    let repository = github::repository_of(&origin_url)
+        .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))?;
+    let mut kept = Vec::new();
+    for worktree in old {
+        if github::pull_requests(&repository, &worktree.branch)?.is_empty() {
+            kept.push(worktree);
+        }
+    }
+    Ok(kept)
 }
 
 #[cfg(test)]

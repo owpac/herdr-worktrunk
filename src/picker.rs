@@ -256,7 +256,14 @@ pub fn change_tab(cache: &Path, is_next: bool) {
 
 /// Run a command for the preview, and print its output and its errors.
 fn print_command(command: &mut Command) {
-    let output = command.env("GIT_PAGER", "cat").env("PAGER", "cat").output();
+    // GIT_OPTIONAL_LOCKS=0: git status and git diff do not write the index.
+    // A write changes the last activity of the worktree, and can block an
+    // agent that works in it.
+    let output = command
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output();
     match output {
         Ok(output) => {
             print!("{}", String::from_utf8_lossy(&output.stdout));

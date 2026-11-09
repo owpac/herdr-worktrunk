@@ -191,18 +191,35 @@ pub fn is_clean(checkout: &Path) -> bool {
 
 /// Return the last activity of the worktree `checkout`, in seconds since
 /// 1970: the newest of the time of its last commit and the modification
-/// time of its git folder. git changes this folder at each commit,
-/// checkout or add. Thus a new worktree on an old commit looks new.
+/// time of the reflog of its HEAD (`logs/HEAD` in its git folder).
+///
+/// git writes this reflog when the worktree is created, and at each
+/// commit, checkout, reset or rebase. Thus a new worktree on an old commit
+/// looks new. A `git status` that refreshes the index does not change it,
+/// unlike the git folder. Without a reflog, the git folder gives the time.
 pub fn last_activity(checkout: &Path) -> Option<u64> {
     let commit_time = run_in(checkout, &["log", "-1", "--format=%ct"])
         .ok()
         .and_then(|text| text.parse::<u64>().ok());
     let folder_time = run_in(checkout, &["rev-parse", "--absolute-git-dir"])
         .ok()
-        .and_then(|git_dir| fs::metadata(git_dir).ok()?.modified().ok())
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs());
+        .map(PathBuf::from)
+        .and_then(|git_dir| {
+            modification_secs(&git_dir.join("logs").join("HEAD"))
+                .or_else(|| modification_secs(&git_dir))
+        });
     commit_time.into_iter().chain(folder_time).max()
+}
+
+/// The modification time of a file, in seconds since the epoch.
+fn modification_secs(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 /// Return true if `commit` is in the history of `branch`.
