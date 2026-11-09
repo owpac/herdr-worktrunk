@@ -6,7 +6,8 @@
 //!   herdr-worktrunk observe --run              the observer itself
 //!   herdr-worktrunk open picker|remover|merger an action: open a popup
 //!   herdr-worktrunk pick|confirm|merger|message  the command of a popup
-//!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the merged pull requests
+//!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the merged or closed pull requests
+//!   herdr-worktrunk list-stale [<folder>]      list the old worktrees without pull request
 
 mod actions;
 mod config;
@@ -17,6 +18,7 @@ mod observer;
 mod picker;
 mod process;
 mod prune;
+mod stale;
 mod ui;
 mod wt;
 
@@ -26,7 +28,10 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message | list-merged [<folder>]";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger | pick | confirm | merger | message | list-merged [<folder>] | list-stale [<folder>]";
+
+/// The days without activity of `list-stale` when `stale_days` is 0.
+const DEFAULT_STALE_DAYS: u32 = 7;
 
 /// A folder that herdr gives in an environment variable, else a default.
 fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
@@ -38,13 +43,26 @@ fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
     folder
 }
 
-/// Start the observer (`observe`), or be the observer (`observe --run`).
-fn observe(is_observer: bool) -> Result<(), Error> {
+/// The config of the plugin, from the config folder that herdr gives.
+fn load_config() -> config::Config {
     let config_dir = herdr_folder(
         "HERDR_PLUGIN_CONFIG_DIR",
         &[".config", "herdr", "plugins", "config", herdr::PLUGIN_ID],
     );
-    let config = config::load(&config_dir);
+    config::load(&config_dir)
+}
+
+/// The main checkout of the repository of `folder`, or an error for the
+/// commands `list-merged` and `list-stale`.
+fn main_checkout_of(folder: &Path) -> Result<PathBuf, Error> {
+    git::checkout_of(folder)
+        .map(|checkout| checkout.main_checkout())
+        .ok_or_else(|| Error::Command(format!("{} is not in a git repository", folder.display())))
+}
+
+/// Start the observer (`observe`), or be the observer (`observe --run`).
+fn observe(is_observer: bool) -> Result<(), Error> {
+    let config = load_config();
     if !config.observe {
         return Ok(());
     }
@@ -53,21 +71,55 @@ fn observe(is_observer: bool) -> Result<(), Error> {
         &[".local", "state", "herdr", "plugins", herdr::PLUGIN_ID],
     );
     if is_observer {
-        observer::run(&state_dir, config.prune_merged)
+        observer::run(&state_dir, config.prune_merged, config.stale_days)
     } else {
         observer::start(&state_dir)
     }
 }
 
-/// Print the worktrees of the merged pull requests in the repository of
-/// `folder`: the worktrees that the observer removes with `prune_merged`.
+/// Print the worktrees of the merged or closed pull requests in the
+/// repository of `folder`: the worktrees that the observer removes with
+/// `prune_merged`.
 /// Remove no worktree. This command does not know the agents of herdr.
 fn list_merged(folder: &Path) -> Result<(), Error> {
-    let checkout = git::checkout_of(folder).ok_or_else(|| {
-        Error::Command(format!("{} is not in a git repository", folder.display()))
-    })?;
-    for worktree in prune::merged_worktrees(&checkout.main_checkout(), |_| false)? {
-        println!("{} ({})", worktree.path.display(), worktree.branch);
+    for worktree in prune::check_worktrees(&main_checkout_of(folder)?, |_| false)?.finished {
+        let state = match worktree.pull_request.state {
+            github::PullRequestState::Closed => "closed",
+            _ => "merged",
+        };
+        println!(
+            "{} ({}, pull request #{} {state})",
+            worktree.path.display(),
+            worktree.branch,
+            worktree.pull_request.number
+        );
+    }
+    Ok(())
+}
+
+/// Print the old worktrees without pull request in the repository of
+/// `folder`: the worktrees of the daily question (`stale_days` of the
+/// config, or 7 days). This command does not know the agents of herdr, and
+/// ignores the last questions.
+fn list_stale(folder: &Path) -> Result<(), Error> {
+    let main_checkout = main_checkout_of(folder)?;
+    let stale_days = match load_config().stale_days {
+        0 => DEFAULT_STALE_DAYS,
+        days => days,
+    };
+    let now = stale::now();
+    for worktree in prune::check_worktrees(&main_checkout, |_| false)?.without_pull_request {
+        let Some(activity) = git::last_activity(&worktree.path) else {
+            continue;
+        };
+        if stale::is_stale(activity, now, stale_days) && git::is_clean(&worktree.path) {
+            println!(
+                "{} ({}, no change for {} days)",
+                worktree.path.display(),
+                worktree.branch,
+                now.saturating_sub(activity) / stale::DAY
+            );
+        }
     }
     Ok(())
 }
@@ -104,9 +156,14 @@ fn main() -> ExitCode {
             actions::open_later(entrypoint, Path::new(folder), assignments);
             return ExitCode::SUCCESS;
         }
-        ["list-merged", folder @ ..] if folder.len() <= 1 => {
+        [command @ ("list-merged" | "list-stale"), folder @ ..] if folder.len() <= 1 => {
             let folder = Path::new(folder.first().copied().unwrap_or("."));
-            if let Err(error) = list_merged(folder) {
+            let result = if *command == "list-merged" {
+                list_merged(folder)
+            } else {
+                list_stale(folder)
+            };
+            if let Err(error) = result {
                 eprintln!("herdr-worktrunk: {error}");
                 return ExitCode::FAILURE;
             }

@@ -30,9 +30,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::git::{self, Checkout};
+use crate::actions;
+use crate::git::{self, Checkout, LinkedWorktree};
+use crate::github::PullRequestState;
 use crate::herdr::{self, Error, Snapshot};
-use crate::prune;
+use crate::prune::{self, FinishedWorktree};
+use crate::stale;
 use crate::wt;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -55,6 +58,12 @@ pub struct AgentPane {
     /// The checkout of the folder of the agent, if the folder is in git.
     pub checkout: Option<Checkout>,
     pub is_focused: bool,
+    /// The kind of the agent: claude, codex...
+    pub kind: String,
+    /// The state of the agent: idle, working, blocked, done or unknown.
+    pub status: Option<String>,
+    /// The session ID of the agent, to resume its conversation.
+    pub session: Option<String>,
 }
 
 /// A workspace, with the checkout that it showed when the observer first
@@ -159,16 +168,98 @@ struct Observer {
 struct PruneView {
     /// The main checkout of each repository that a workspace shows.
     repositories: HashSet<PathBuf>,
-    /// The checkouts where an agent works.
-    busy_checkouts: HashSet<PathBuf>,
+    /// The agents, with their checkouts.
+    agents: Vec<ViewAgent>,
+}
+
+/// An agent, as the thread of the merged pull requests sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ViewAgent {
+    pane_id: String,
+    kind: String,
+    status: Option<String>,
+    session: Option<String>,
+    /// The checkout of the folder of the agent.
+    folder_root: Option<PathBuf>,
+    /// The checkout of the workspace of the agent. The actions remove and
+    /// merge refuse the same workspaces.
+    workspace_root: Option<PathBuf>,
+    /// The workspace of the agent has the focus.
+    is_workspace_focused: bool,
+}
+
+impl ViewAgent {
+    /// Return true if the folder of the agent is in `checkout`.
+    fn works_in(&self, checkout: &Path) -> bool {
+        self.folder_root
+            .as_deref()
+            .is_some_and(|root| canonical(root) == canonical(checkout))
+    }
+
+    /// Return true if the folder or the workspace of the agent is in
+    /// `checkout`.
+    fn uses(&self, checkout: &Path) -> bool {
+        self.works_in(checkout)
+            || self
+                .workspace_root
+                .as_deref()
+                .is_some_and(|root| canonical(root) == canonical(checkout))
+    }
 }
 
 impl PruneView {
-    fn is_busy(&self, checkout: &Path) -> bool {
-        let checkout = canonical(checkout);
-        self.busy_checkouts
+    /// The agents whose folder or workspace is in `checkout`.
+    fn agents_in(&self, checkout: &Path) -> Vec<ViewAgent> {
+        self.agents
             .iter()
-            .any(|busy| canonical(busy) == checkout)
+            .filter(|agent| agent.uses(checkout))
+            .cloned()
+            .collect()
+    }
+}
+
+/// What the thread does with the agents of a finished worktree.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentDecision {
+    /// No agent uses the worktree: remove it.
+    Remove,
+    /// All the agents are idle or done, and work in the folder of the
+    /// worktree: close their panes, then remove the worktree. The
+    /// conversations stay on the disk.
+    CloseThenRemove,
+    /// An agent works, waits for an answer, has the focus, or works in
+    /// another folder: keep the worktree until the next pass.
+    Wait,
+}
+
+/// Decide what to do with the agents of the finished worktree `checkout`.
+///
+/// An agent whose workspace shows the worktree, but whose folder is in
+/// another checkout, does not work for this worktree: the thread does not
+/// close it, and keeps the worktree.
+fn agent_decision(agents: &[ViewAgent], checkout: &Path) -> AgentDecision {
+    if agents.is_empty() {
+        return AgentDecision::Remove;
+    }
+    let may_close = |agent: &ViewAgent| {
+        matches!(agent.status.as_deref(), Some("idle" | "done"))
+            && !agent.is_workspace_focused
+            && agent.works_in(checkout)
+    };
+    if agents.iter().all(may_close) {
+        AgentDecision::CloseThenRemove
+    } else {
+        AgentDecision::Wait
+    }
+}
+
+/// The command that resumes the conversation of an agent.
+fn resume_command(agent: &ViewAgent) -> String {
+    let session = agent.session.as_deref().unwrap_or("<session>");
+    match agent.kind.as_str() {
+        "claude" => format!("claude --resume {session}"),
+        "codex" => format!("codex resume {session}"),
+        kind => format!("{kind}, session {session}"),
     }
 }
 
@@ -184,26 +275,27 @@ fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The checkouts where an agent works: the checkout of the folder of each
-/// agent, and the checkout of the workspace of each agent. The actions
-/// remove and merge refuse the same workspaces.
-fn busy_checkouts(
+/// The agents for the view: each agent with the checkout of its folder
+/// and the checkout of its workspace.
+fn view_agents(
     agent_panes: &[AgentPane],
     workspaces: &HashMap<String, FirstCheckout>,
-) -> HashSet<PathBuf> {
-    let mut busy = HashSet::new();
-    for pane in agent_panes {
-        if let Some(checkout) = &pane.checkout {
-            busy.insert(checkout.root.clone());
-        }
-        let workspace_root = workspaces
-            .get(&pane.workspace_id)
-            .and_then(|first| first.root.clone());
-        if let Some(root) = workspace_root {
-            busy.insert(root);
-        }
-    }
-    busy
+    focused_workspaces: &HashSet<String>,
+) -> Vec<ViewAgent> {
+    agent_panes
+        .iter()
+        .map(|pane| ViewAgent {
+            pane_id: pane.pane_id.clone(),
+            kind: pane.kind.clone(),
+            status: pane.status.clone(),
+            session: pane.session.clone(),
+            folder_root: pane.checkout.as_ref().map(|checkout| checkout.root.clone()),
+            workspace_root: workspaces
+                .get(&pane.workspace_id)
+                .and_then(|first| first.root.clone()),
+            is_workspace_focused: focused_workspaces.contains(&pane.workspace_id),
+        })
+        .collect()
 }
 
 /// The main checkout of each repository that a workspace shows.
@@ -280,6 +372,12 @@ impl Observer {
                 workspace_id: pane.workspace_id.clone(),
                 checkout,
                 is_focused: pane.focused,
+                kind: pane.agent.clone().unwrap_or_default(),
+                status: pane.agent_status.clone(),
+                session: pane
+                    .agent_session
+                    .as_ref()
+                    .map(|session| session.value.clone()),
             });
         }
         let known: Vec<KnownWorkspace> = self
@@ -297,9 +395,15 @@ impl Observer {
             })
             .collect();
         if let Some(view) = &self.prune_view {
+            let focused_workspaces: HashSet<String> = snapshot
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.focused)
+                .map(|workspace| workspace.workspace_id.clone())
+                .collect();
             let new_view = PruneView {
                 repositories: repositories(&self.workspaces),
-                busy_checkouts: busy_checkouts(&agent_panes, &self.workspaces),
+                agents: view_agents(&agent_panes, &self.workspaces, &focused_workspaces),
             };
             *lock(view) = new_view;
         }
@@ -402,13 +506,103 @@ impl Observer {
 /// Start the thread of the merged pull requests. gh and `wt remove` take
 /// several seconds: this thread keeps them out of the loop of the
 /// snapshots, so the panes do not wait for the network.
-fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>) {
+fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>, settings: PruneSettings) {
     let thread_log = Arc::clone(&log);
     let started = thread::Builder::new()
         .name("prune_merged".to_owned())
-        .spawn(move || prune_loop(&view, &thread_log));
+        .spawn(move || prune_loop(&view, &thread_log, &settings));
     if let Err(error) = started {
         log.write(&format!("cannot start the thread prune_merged: {error}"));
+    }
+}
+
+/// The settings of the thread of the merged pull requests.
+#[derive(Clone, Debug)]
+struct PruneSettings {
+    /// The state folder of the plugin: the files of the daily question.
+    state_dir: PathBuf,
+    /// The days without activity of an old worktree (0: no question).
+    stale_days: u32,
+}
+
+/// An old worktree without pull request, for the daily question.
+#[derive(Clone, Debug)]
+struct OldWorktree {
+    main_checkout: PathBuf,
+    path: PathBuf,
+    branch: String,
+    days: u64,
+}
+
+/// Select the old worktrees among the worktrees without pull request: no
+/// agent, a question allowed again, no activity for `stale_days` days, and
+/// no change that is not committed.
+fn old_worktrees(
+    main_checkout: &Path,
+    worktrees: Vec<LinkedWorktree>,
+    view: &Mutex<PruneView>,
+    asked: &HashMap<PathBuf, u64>,
+    stale_days: u32,
+) -> Vec<OldWorktree> {
+    let now = stale::now();
+    worktrees
+        .into_iter()
+        .filter_map(|worktree| {
+            if !lock(view).agents_in(&worktree.path).is_empty() {
+                return None;
+            }
+            let path = canonical(&worktree.path);
+            if !stale::may_ask(asked, &path, now, stale_days) {
+                return None;
+            }
+            let activity = git::last_activity(&path)?;
+            if !stale::is_stale(activity, now, stale_days) || !git::is_clean(&path) {
+                return None;
+            }
+            Some(OldWorktree {
+                main_checkout: main_checkout.to_path_buf(),
+                path,
+                branch: worktree.branch,
+                days: now.saturating_sub(activity) / stale::DAY,
+            })
+        })
+        .collect()
+}
+
+/// Ask about each old worktree in the popup confirm, one after the other,
+/// in a new thread: an open popup must not stop the removals.
+fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: Arc<Log>) {
+    if old.is_empty() {
+        return;
+    }
+    let thread_log = Arc::clone(&log);
+    let started = thread::Builder::new()
+        .name("stale_days".to_owned())
+        .spawn(move || {
+            let log = thread_log;
+            let mut asked = stale::read_asked(&settings.state_dir);
+            for worktree in old {
+                let reason = format!("No pull request, and no change for {} days.", worktree.days);
+                if let Err(error) =
+                    actions::ask_to_delete(&worktree.main_checkout, &worktree.path, &reason)
+                {
+                    log.write(&format!(
+                        "cannot ask about the old worktree of {}: {}",
+                        worktree.branch,
+                        one_line(&error)
+                    ));
+                    return;
+                }
+                asked.insert(worktree.path.clone(), stale::now());
+                stale::write_asked(&settings.state_dir, &asked);
+                log.write(&format!(
+                    "asked about the old worktree of {} ({} days)",
+                    worktree.branch, worktree.days
+                ));
+            }
+        });
+    if let Err(error) = started {
+        log.write(&format!("cannot start the thread stale_days: {error}"));
     }
 }
 
@@ -417,7 +611,7 @@ fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>) {
 /// The thread writes each removal in the log. It writes an error only if
 /// the previous pass did not write it: an error that stays gives one line,
 /// not one line every 5 minutes.
-fn prune_loop(view: &Mutex<PruneView>, log: &Log) {
+fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings) {
     let mut previous_errors = HashSet::new();
     thread::sleep(PRUNE_FIRST_DELAY);
     loop {
@@ -426,9 +620,37 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Log) {
             .iter()
             .map(|repository| canonical(repository))
             .collect();
+        let is_stale_pass = settings.stale_days > 0
+            && stale::is_pass_due(stale::read_last_pass(&settings.state_dir), stale::now());
+        let asked = if is_stale_pass {
+            stale::read_asked(&settings.state_dir)
+        } else {
+            HashMap::new()
+        };
+        let mut old = Vec::new();
+        let mut is_checked = false;
         let mut errors = HashSet::new();
         for repository in repositories {
-            prune_repository(&repository, view, log, &mut errors);
+            let Some(without_pull_request) = prune_repository(&repository, view, log, &mut errors)
+            else {
+                continue;
+            };
+            is_checked = true;
+            if is_stale_pass {
+                old.extend(old_worktrees(
+                    &repository,
+                    without_pull_request,
+                    view,
+                    &asked,
+                    settings.stale_days,
+                ));
+            }
+        }
+        // A pass without a checked repository (no workspace yet, or gh
+        // fails) does not count: the next pass tries again.
+        if is_stale_pass && is_checked {
+            stale::write_last_pass(&settings.state_dir, stale::now());
+            ask_about_old_worktrees(old, settings.clone(), Arc::clone(log));
         }
         for error in &errors {
             if !previous_errors.contains(error) {
@@ -440,53 +662,112 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Log) {
     }
 }
 
-/// Remove the merged worktrees of one repository. Write each removal in
-/// the log, and add each error to `errors`.
+/// Remove the finished worktrees of one repository. Write each removal in
+/// the log, and add each error to `errors`. Return the worktrees without
+/// pull request, for the daily question, or None if the check failed.
 ///
-/// Before each removal, ask the view again and read the commit of the
-/// branch again: during the calls to GitHub, an agent can enter the
-/// worktree, or a commit can change the branch. `wt remove` runs at once
-/// after the second check.
+/// A worktree where an agent must stay (see `agent_decision`) costs no
+/// call to GitHub.
 fn prune_repository(
     main_checkout: &Path,
     view: &Mutex<PruneView>,
     log: &Log,
     errors: &mut HashSet<String>,
-) {
-    let is_busy = |checkout: &Path| lock(view).is_busy(checkout);
-    let worktrees = match prune::merged_worktrees(main_checkout, is_busy) {
-        Ok(worktrees) => worktrees,
+) -> Option<Vec<LinkedWorktree>> {
+    let must_stay = |checkout: &Path| {
+        let agents = lock(view).agents_in(checkout);
+        agent_decision(&agents, checkout) == AgentDecision::Wait
+    };
+    let check = match prune::check_worktrees(main_checkout, must_stay) {
+        Ok(check) => check,
         Err(error) => {
             errors.insert(format!(
                 "prune_merged {}: {}",
                 main_checkout.display(),
                 one_line(&error)
             ));
-            return;
+            return None;
         }
     };
-    for worktree in worktrees {
-        if is_busy(&worktree.path) {
-            continue;
+    for worktree in &check.finished {
+        if let Err(error) = finish_worktree(main_checkout, worktree, view, log) {
+            errors.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
         }
-        let current_commit = git::branch_commit(main_checkout, &worktree.branch);
-        if !worktree.is_unchanged(current_commit.as_deref()) {
-            continue;
-        }
-        match wt::remove_merged(main_checkout, &worktree.path) {
-            Ok(()) => log.write(&format!(
-                "removed the worktree of {}: its pull request is merged",
-                worktree.branch
-            )),
-            Err(error) => {
-                errors.insert(format!(
-                    "wt remove {}: {}",
+    }
+    Some(check.without_pull_request)
+}
+
+/// Remove one finished worktree and its branch.
+///
+/// The thread reads the view and the commit of the branch just before the
+/// removal: during the calls to GitHub, an agent can enter the worktree,
+/// or a commit can change the branch. If idle agents work in the worktree,
+/// the thread first closes their panes. Then the observer closes the
+/// workspace of the removed worktree (rule 2).
+fn finish_worktree(
+    main_checkout: &Path,
+    worktree: &FinishedWorktree,
+    view: &Mutex<PruneView>,
+    log: &Log,
+) -> Result<(), Error> {
+    let agents = lock(view).agents_in(&worktree.path);
+    let decision = agent_decision(&agents, &worktree.path);
+    if decision == AgentDecision::Wait {
+        return Ok(());
+    }
+    // Check the branch and the changes before an agent closes: if the
+    // worktree must stay, its agents stay too.
+    let current_commit = git::branch_commit(main_checkout, &worktree.branch);
+    if !worktree.is_unchanged(current_commit.as_deref()) || !git::is_clean(&worktree.path) {
+        return Ok(());
+    }
+    match decision {
+        AgentDecision::Wait | AgentDecision::Remove => {}
+        AgentDecision::CloseThenRemove => {
+            for agent in &agents {
+                herdr::close_pane(&agent.pane_id)?;
+                log.write(&format!(
+                    "closed the idle agent of {} (pane {}): {}",
                     worktree.branch,
-                    one_line(&error)
+                    agent.pane_id,
+                    resume_command(agent)
                 ));
+            }
+            if !wait_for_no_agent(view, &worktree.path) {
+                return Ok(());
             }
         }
     }
+    let current_commit = git::branch_commit(main_checkout, &worktree.branch);
+    if !worktree.is_unchanged(current_commit.as_deref()) {
+        return Ok(());
+    }
+    wt::remove_finished(main_checkout, &worktree.path)?;
+    let number = worktree.pull_request.number;
+    let message = match worktree.pull_request.state {
+        PullRequestState::Closed => format!(
+            "removed the worktree of {}: its pull request #{number} is closed. To get the branch back: git fetch origin pull/{number}/head:{}",
+            worktree.branch, worktree.branch
+        ),
+        _ => format!(
+            "removed the worktree of {}: its pull request #{number} is merged",
+            worktree.branch
+        ),
+    };
+    log.write(&message);
+    Ok(())
+}
+
+/// Wait until the view shows no agent in `checkout`, for 10 seconds at
+/// most. Return false if an agent stays.
+fn wait_for_no_agent(view: &Mutex<PruneView>, checkout: &Path) -> bool {
+    for _ in 0..20 {
+        thread::sleep(Duration::from_millis(500));
+        if lock(view).agents_in(checkout).is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The text of an error on one line of the log.
@@ -687,7 +968,7 @@ impl BinaryWatch {
 /// the binary of the last `observe` command, or its own binary again if
 /// this binary changed (see `binary_to_run`). With `prune_merged`, the
 /// observer also starts the thread of the merged pull requests.
-pub fn run(state_dir: &Path, prune_merged: bool) -> Result<(), Error> {
+pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), Error> {
     let lock = open_lock(state_dir)?;
     if lock.try_lock().is_err() {
         return Ok(());
@@ -704,7 +985,14 @@ pub fn run(state_dir: &Path, prune_merged: bool) -> Result<(), Error> {
     observer.log.write("observer started");
     if let Some(view) = prune_view {
         observer.log.write("prune_merged: on");
-        start_prune_thread(view, log);
+        if stale_days > 0 {
+            observer.log.write(&format!("stale_days: {stale_days}"));
+        }
+        let settings = PruneSettings {
+            state_dir: state_dir.to_path_buf(),
+            stale_days,
+        };
+        start_prune_thread(view, log, settings);
     }
     let mut binary_watch = match env::current_exe() {
         Ok(binary) => Some(BinaryWatch::new(canonical(&binary))),
@@ -769,6 +1057,9 @@ mod tests {
             workspace_id: workspace_id.to_owned(),
             checkout: folder_checkout,
             is_focused: true,
+            kind: "claude".to_owned(),
+            status: Some("idle".to_owned()),
+            session: Some("s1".to_owned()),
         }
     }
 
@@ -881,20 +1172,91 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_makes_busy_its_checkout_and_the_checkout_of_its_workspace() {
+    fn an_agent_has_its_checkout_and_the_checkout_of_its_workspace() {
         let workspaces =
             HashMap::from([("w1".to_owned(), first_checkout(Some("/work/repo.feature")))]);
         let panes = [agent_in("w1", Some(checkout("/work/repo.other")))];
 
-        let busy = busy_checkouts(&panes, &workspaces);
+        let agents = view_agents(&panes, &workspaces, &HashSet::from(["w1".to_owned()]));
 
         assert_eq!(
-            busy,
-            HashSet::from([
-                PathBuf::from("/work/repo.feature"),
-                PathBuf::from("/work/repo.other"),
-            ])
+            agents[0].folder_root,
+            Some(PathBuf::from("/work/repo.other"))
         );
+        assert_eq!(
+            agents[0].workspace_root,
+            Some(PathBuf::from("/work/repo.feature"))
+        );
+        assert!(agents[0].is_workspace_focused);
+        let view = PruneView {
+            repositories: HashSet::new(),
+            agents,
+        };
+        assert_eq!(view.agents_in(Path::new("/work/repo.feature")).len(), 1);
+        assert_eq!(view.agents_in(Path::new("/work/repo.other")).len(), 1);
+        assert!(view.agents_in(Path::new("/work/repo")).is_empty());
+    }
+
+    const FEATURE: &str = "/work/repo.feature";
+
+    fn view_agent(status: &str, is_workspace_focused: bool) -> ViewAgent {
+        ViewAgent {
+            pane_id: "w2:p1".to_owned(),
+            kind: "claude".to_owned(),
+            status: Some(status.to_owned()),
+            session: Some("s1".to_owned()),
+            folder_root: Some(PathBuf::from(FEATURE)),
+            workspace_root: Some(PathBuf::from(FEATURE)),
+            is_workspace_focused,
+        }
+    }
+
+    fn decide(agents: &[ViewAgent]) -> AgentDecision {
+        agent_decision(agents, Path::new(FEATURE))
+    }
+
+    #[test]
+    fn a_finished_worktree_without_agent_is_removed() {
+        assert_eq!(decide(&[]), AgentDecision::Remove);
+    }
+
+    #[test]
+    fn idle_or_done_agents_are_closed_then_the_worktree_is_removed() {
+        let agents = [view_agent("idle", false), view_agent("done", false)];
+
+        assert_eq!(decide(&agents), AgentDecision::CloseThenRemove);
+    }
+
+    #[test]
+    fn a_working_blocked_or_unknown_agent_keeps_the_worktree() {
+        for status in ["working", "blocked", "unknown"] {
+            let agents = [view_agent("idle", false), view_agent(status, false)];
+
+            assert_eq!(decide(&agents), AgentDecision::Wait, "{status}");
+        }
+    }
+
+    #[test]
+    fn an_idle_agent_in_the_focused_workspace_keeps_the_worktree() {
+        assert_eq!(decide(&[view_agent("idle", true)]), AgentDecision::Wait);
+    }
+
+    #[test]
+    fn an_idle_agent_in_another_folder_is_not_closed() {
+        // Its workspace shows the worktree, but it works in another
+        // repository.
+        let mut agent = view_agent("idle", false);
+        agent.folder_root = Some(PathBuf::from("/work/other"));
+
+        assert_eq!(decide(&[agent]), AgentDecision::Wait);
+    }
+
+    #[test]
+    fn the_resume_command_depends_on_the_agent() {
+        let mut agent = view_agent("idle", false);
+        assert_eq!(resume_command(&agent), "claude --resume s1");
+        agent.kind = "codex".to_owned();
+        assert_eq!(resume_command(&agent), "codex resume s1");
     }
 
     #[test]

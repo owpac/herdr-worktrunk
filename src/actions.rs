@@ -38,6 +38,13 @@ const RETURN_VARIABLE: &str = "TRUNK_RETURN";
 const REPOSITORY_VARIABLE: &str = "TRUNK_REPOSITORY";
 const TITLE_VARIABLE: &str = "TRUNK_MESSAGE_TITLE";
 const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
+/// The reason of a question that the observer asks (an old worktree).
+const REASON_VARIABLE: &str = "TRUNK_REASON";
+
+/// The observer waits this number of times for a free popup, 2 seconds
+/// each time: 10 minutes at most.
+const ASK_ATTEMPTS: u32 = 300;
+const ASK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The popup `confirm` asks before one of these operations.
 const DELETE: &str = "delete";
@@ -170,6 +177,31 @@ pub fn open_later(entrypoint: &str, folder: &Path, assignments: &[&str]) {
             _ => return,
         }
     }
+}
+
+/// Open the popup confirm about the deletion of the worktree `checkout`,
+/// with `reason` before the question. The observer calls this function:
+/// the popup removes the worktree if the user says yes.
+///
+/// herdr shows one popup at a time. Thus the function waits while another
+/// popup is open, for 10 minutes at most. It returns when the popup
+/// opens, not when the user answers.
+pub fn ask_to_delete(main_checkout: &Path, checkout: &Path, reason: &str) -> Result<(), Error> {
+    let checkout_text = checkout.to_string_lossy();
+    let environment = [
+        (CHECKOUT_VARIABLE, checkout_text.as_ref()),
+        (OPERATION_VARIABLE, DELETE),
+        (REASON_VARIABLE, reason),
+    ];
+    for _ in 0..ASK_ATTEMPTS {
+        match herdr::open_plugin_pane("confirm", main_checkout, &environment) {
+            Err(Error::Herdr { code, .. }) if code == "ui_busy" => thread::sleep(ASK_INTERVAL),
+            other => return other,
+        }
+    }
+    Err(Error::Command(
+        "another popup stayed open for 10 minutes".to_owned(),
+    ))
 }
 
 /// The checkout that holds `folder`, or an error for the user.
@@ -331,9 +363,12 @@ fn ask_and_run() -> Result<(), Error> {
         }
         return open_after_this_popup("merger", &checkout.root, &environment);
     }
-    let question = format!(
+    let mut question = format!(
         "Delete the worktree of {branch}?\n{folder_name}\nwt keeps the branch if it is not merged."
     );
+    if let Ok(reason) = env::var(REASON_VARIABLE) {
+        question = format!("{reason}\n{question}");
+    }
     if !ui::confirm("Delete the worktree", &question, "Delete", true) {
         return Ok(());
     }

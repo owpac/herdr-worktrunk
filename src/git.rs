@@ -1,8 +1,9 @@
 //! The git facts that the plugin needs about a folder.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::herdr::Error;
 use crate::process;
@@ -171,6 +172,30 @@ pub fn branch_commit(main_checkout: &Path, branch: &str) -> Option<String> {
         &["rev-parse", "--verify", "--quiet", &reference],
     )
     .ok()
+}
+
+/// Return true if the worktree `checkout` has no change that is not
+/// committed. With `--no-optional-locks`, git does not write the index:
+/// the check does not change the last activity of the worktree.
+pub fn is_clean(checkout: &Path) -> bool {
+    run_in(checkout, &["--no-optional-locks", "status", "--porcelain"])
+        .is_ok_and(|text| text.is_empty())
+}
+
+/// Return the last activity of the worktree `checkout`, in seconds since
+/// 1970: the newest of the time of its last commit and the modification
+/// time of its git folder. git changes this folder at each commit,
+/// checkout or add. Thus a new worktree on an old commit looks new.
+pub fn last_activity(checkout: &Path) -> Option<u64> {
+    let commit_time = run_in(checkout, &["log", "-1", "--format=%ct"])
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok());
+    let folder_time = run_in(checkout, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .and_then(|git_dir| fs::metadata(git_dir).ok()?.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    commit_time.into_iter().chain(folder_time).max()
 }
 
 /// Return true if `commit` is in the history of `branch`.

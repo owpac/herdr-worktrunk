@@ -42,11 +42,24 @@ pub struct Pane {
     pub workspace_id: String,
     /// The kind of the agent in the pane (claude, codex...), if any.
     pub agent: Option<String>,
+    /// The state of the agent: idle, working, blocked, done or unknown.
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    /// The session of the agent, to resume its conversation.
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
     pub cwd: Option<PathBuf>,
     /// The folder of the foreground process: the agent, else the shell.
     pub foreground_cwd: Option<PathBuf>,
     #[serde(default)]
     pub focused: bool,
+}
+
+/// The session of an agent, as herdr gives it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AgentSession {
+    /// The session ID of the agent.
+    pub value: String,
 }
 
 impl Pane {

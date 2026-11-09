@@ -50,24 +50,35 @@ The versions up to 2026.11.7 do not read `observer.binary`. After the update fro
 
 The observer reads `config.toml` when it starts. After a change, stop the observer: `pkill -f 'herdr-worktrunk observe --run'`. The next agent that herdr detects starts it again.
 
-### The worktrees of the merged pull requests
+### The worktrees of the finished pull requests
 
-With `prune_merged = true` (see [Configuration](#configuration)), the observer also removes the worktree of each merged pull request. A second thread checks the repositories every 5 minutes. It checks a repository if a herdr workspace shows one of its checkouts.
+With `prune_merged = true` (see [Configuration](#configuration)), the observer also removes the worktree of each finished pull request: merged or closed. A second thread checks the repositories every 5 minutes. It checks a repository if a herdr workspace shows one of its checkouts.
 
-The thread removes the worktree of a branch only if GitHub merged a pull request of this branch, if the default branch does not contain the local commit, and if one of these conditions is true:
+The thread removes the worktree of a branch only if the branch has no open pull request, if the default branch does not contain the local commit, and if one of these conditions is true for a merged or closed pull request of the branch:
 
 - The last commit of the pull request is the local commit of the branch.
 - The pull request contains the local commit. This case covers the button "Update branch" of GitHub: it adds a commit that the local branch does not have.
 
+Thus GitHub keeps each local commit: in the default branch after a merge, and in `refs/pull/<number>/head` after a close. After the removal of a closed pull request, the log gives the command that gets the branch back: `git fetch origin pull/<number>/head:<branch>`.
+
+An agent in a finished worktree (its folder is in the worktree, or its workspace shows the worktree):
+
+- If all these agents are `idle` or `done`, the thread closes their panes, then removes the worktree. The conversation stays on the disk: the log gives the command that resumes it, for example `claude --resume <session>`.
+- If an agent is `working`, `blocked` or `unknown`, or if its workspace has the focus, the thread keeps the worktree, and tries again at the next pass.
+- If the workspace of an agent shows the worktree, but the agent works in another folder, the thread does not close it, and keeps the worktree.
+- The thread closes no agent if the worktree must stay: a new commit on the branch, or a change that is not committed.
+
+The thread ignores a pull request from a fork, also with the same branch name.
+
 The thread keeps:
 
-- a worktree where an agent works: the folder of the agent is in the worktree, or the workspace of the agent shows the worktree,
+- a worktree whose branch has an open pull request,
 - a worktree whose local commit is in the default branch. A new worktree starts there, also on the name of an old branch. `wt step prune` removes this worktree, for example after a merge with a merge commit.
 - the main worktree, a detached worktree and a locked worktree,
 - a worktree with changes that are not committed: `wt remove` refuses it,
 - a branch that got a new commit after the check. Just before the removal, the thread reads the commit of the branch again.
 
-The thread removes the worktree and its branch with `wt remove --force-delete`. GitHub merged the local commit, so the default branch has the work, also after a squash merge. Without `--force-delete`, wt keeps a branch if it does not find its content in the default branch, for example if the default branch later changed the same files. `--force-delete` acts only on the branch: the thread never uses `--force`, which removes the changes that are not committed. GitHub keeps the commits of the pull request (`refs/pull/<number>/head`). Then the observer closes the workspace of the worktree (rule 2).
+The thread removes the worktree and its branch with `wt remove --force-delete`. Without `--force-delete`, wt keeps a branch if it does not find its content in the default branch, for example after a close, or if the default branch later changed the same files. `--force-delete` acts only on the branch: the thread never uses `--force`, which removes the changes that are not committed. GitHub keeps the commits of the pull request (`refs/pull/<number>/head`). Then the observer closes the workspace of the worktree (rule 2).
 
 The thread does not run `git fetch`. A fetch every 5 minutes can ask the ssh agent (for example 1Password) for a key while nobody is at the computer. gh uses the API of GitHub, with its own token.
 
@@ -86,6 +97,32 @@ Limits:
 - The thread never approves the hooks of a project (`--yes`). If a `pre-remove` or `post-remove` hook of the project has no approval, `wt remove` fails, and the log shows the error. Run `wt config approvals add` in the repository.
 - The observer writes each removal and each new error in `observer.log`. An error that stays gives one line. When the thread starts, the log shows `prune_merged: on`.
 
+### The old worktrees without pull request
+
+With `prune_merged = true` and `stale_days = <days>`, the thread also asks about the old worktrees, once a day. An old worktree has:
+
+- no pull request,
+- no agent,
+- no change that is not committed,
+- no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the git folder of the worktree (a commit, a checkout, an add). Thus a new worktree on an old commit is not old.
+
+For each old worktree, the thread opens the popup of the plugin: `No pull request, and no change for <n> days. Delete the worktree of <branch>?`. `Delete` removes the worktree with `wt remove`: wt keeps the branch if it is not merged. `Cancel` keeps it. The popups come one after the other.
+
+The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree).
+
+To see the old worktrees without a wait, run `list-stale` with the binary of the plugin. This command uses `stale_days`, or 7 days if `stale_days` is 0. It does not know the agents of herdr, and ignores the last questions.
+
+```sh
+bin/herdr-worktrunk list-stale <folder of the repository>
+```
+
+To ask again at once, delete `stale-last` in the state folder: the next pass of the thread asks. The thread checks only the repositories of the herdr workspaces, with a remote `origin` on GitHub.
+
+Limits:
+
+- A shell prompt that runs `git status` in the worktree changes the git folder. Thus a worktree with such a shell open never gets old.
+- The thread waits 10 minutes at most for the answer to a popup. Then it stops, and asks about the other worktrees the next day.
+
 ## Configuration
 
 `config.toml` in the config folder of the plugin (`herdr plugin config-dir herdr-worktrunk`):
@@ -94,8 +131,12 @@ Limits:
 # Start the observer (default: true).
 observe = true
 
-# The observer removes the worktree of each merged pull request (default: false). Needs gh.
+# The observer removes the worktree of each merged or closed pull request (default: false). Needs gh.
 prune_merged = false
+
+# Once a day, ask about the worktrees without pull request and without change for this number
+# of days (default: 0, off). Needs prune_merged = true.
+stale_days = 0
 
 # What an agent can do without a question at the end of a task in a worktree: "ask" or "auto".
 # The plugin does not read this key: the agents read it (for example the skill worktrees of
@@ -106,7 +147,7 @@ agent_mode = "ask"
 agent_mode = "auto"
 ```
 
-The plugin reads only the top-level keys `observe` and `prune_merged`, and ignores the other keys.
+The plugin reads only the top-level keys `observe`, `prune_merged` and `stale_days`, and ignores the other keys.
 
 ## Requirements
 

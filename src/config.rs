@@ -3,8 +3,8 @@
 //!
 //! The agents also read this file (the skill worktrees of the agent
 //! plugin herdr): `agent_mode` and the `[repositories."<path>"]` tables
-//! are for them. The plugin reads only the top-level keys `observe` and
-//! `prune_merged`.
+//! are for them. The plugin reads only the top-level keys `observe`,
+//! `prune_merged` and `stale_days`.
 
 use std::fs;
 use std::path::Path;
@@ -14,9 +14,13 @@ use std::path::Path;
 pub struct Config {
     /// Start the observer (default: true).
     pub observe: bool,
-    /// The observer removes the worktrees of the merged pull requests
-    /// (default: false).
+    /// The observer removes the worktrees of the merged or closed pull
+    /// requests (default: false).
     pub prune_merged: bool,
+    /// Once a day, the observer asks about the worktrees without pull
+    /// request and without change for this number of days (default: 0,
+    /// off). It needs `prune_merged`.
+    pub stale_days: u32,
 }
 
 impl Default for Config {
@@ -24,6 +28,7 @@ impl Default for Config {
         Config {
             observe: true,
             prune_merged: false,
+            stale_days: 0,
         }
     }
 }
@@ -52,6 +57,7 @@ fn parse(text: &str) -> Config {
         match key.trim() {
             "observe" => config.observe = value != "false",
             "prune_merged" => config.prune_merged = value == "true",
+            "stale_days" => config.stale_days = value.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -81,6 +87,13 @@ mod tests {
         let text = "prune_merged = true # with gh\n";
 
         assert!(parse(text).prune_merged);
+    }
+
+    #[test]
+    fn stale_days_gives_a_number_of_days() {
+        assert_eq!(parse("stale_days = 7 # a week\n").stale_days, 7);
+        assert_eq!(parse("stale_days = \"x\"\n").stale_days, 0);
+        assert_eq!(Config::default().stale_days, 0);
     }
 
     #[test]
