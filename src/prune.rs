@@ -138,9 +138,21 @@ pub enum BranchStatus {
         commit: String,
     },
     /// The pull requests of the branch are finished, but the worktree
-    /// must stay: the branch has work after them, or the default branch
-    /// contains its commit. The number is the last pull request.
-    Kept(u64),
+    /// must stay. The number is the last pull request.
+    Kept { number: u64, why: KeptWhy },
+}
+
+/// Why a worktree with finished pull requests stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeptWhy {
+    /// The branch has a commit after its finished pull requests.
+    WorkAfter,
+    /// The default branch contains the commit of the branch: a new
+    /// worktree starts there, or wt merged it without a pull request.
+    /// `wt step prune` removes a merged worktree.
+    InDefaultBranch,
+    /// The local branch has no commit.
+    NoLocalCommit,
 }
 
 /// Read the pull requests of `branch` (one call to gh, sometimes 2), and
@@ -164,7 +176,10 @@ pub fn branch_status(
         return Ok(BranchStatus::Open(open.number));
     }
     let Some(local_commit) = git::branch_commit(main_checkout, branch) else {
-        return Ok(BranchStatus::Kept(last.number));
+        return Ok(BranchStatus::Kept {
+            number: last.number,
+            why: KeptWhy::NoLocalCommit,
+        });
     };
     let place = match default_branch {
         None => DefaultBranch::Unknown,
@@ -181,7 +196,14 @@ pub fn branch_status(
             pull_request: pull_request.clone(),
             commit: local_commit,
         },
-        None => BranchStatus::Kept(last.number),
+        None => BranchStatus::Kept {
+            number: last.number,
+            why: if place == DefaultBranch::Contains {
+                KeptWhy::InDefaultBranch
+            } else {
+                KeptWhy::WorkAfter
+            },
+        },
     })
 }
 
@@ -220,7 +242,7 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
                 pull_request,
                 commit,
             }),
-            BranchStatus::Open(_) | BranchStatus::Kept(_) => {}
+            BranchStatus::Open(_) | BranchStatus::Kept { .. } => {}
         }
     }
     Ok(check)

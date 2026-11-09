@@ -154,13 +154,23 @@ fn main() -> ExitCode {
             cleaner::print_rows(Path::new(state), &query.join(" "));
             return ExitCode::SUCCESS;
         }
-        ["cleaner-move", state, direction, current, query @ ..] => {
+        ["cleaner-move", state, direction, current_index, current_id, query @ ..] => {
             let direction = match *direction {
                 "up" => cleaner::Move::Up,
                 "down" => cleaner::Move::Down,
                 _ => cleaner::Move::Keep,
             };
-            cleaner::print_move(Path::new(state), direction, current, &query.join(" "));
+            cleaner::print_move(
+                Path::new(state),
+                direction,
+                current_index,
+                current_id,
+                &query.join(" "),
+            );
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-remember", state, id] => {
+            cleaner::remember_cursor(Path::new(state), id);
             return ExitCode::SUCCESS;
         }
         ["cleaner-enter", kind] => {

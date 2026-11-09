@@ -26,6 +26,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -36,7 +37,7 @@ use crate::git::{self, canonical};
 use crate::github::PullRequestState;
 use crate::herdr::{self, Error};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
-use crate::prune::{self, BranchStatus};
+use crate::prune::{self, BranchStatus, KeptWhy};
 use crate::stale::{self, OldWorktree, DAY};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
@@ -63,6 +64,9 @@ const RELOAD_INTERVAL: Duration = Duration::from_millis(100);
 const SOCKET_ATTEMPTS: u32 = 30;
 /// The checks that run at the same time: each one calls gh.
 const WORKERS: usize = 8;
+/// Set when the popup closes without a choice: the checks stop writing
+/// the state file, so the plugin can remove it.
+static CHECKS_STOPPED: AtomicBool = AtomicBool::new(false);
 /// The threads that list the checkouts of the workspaces.
 const LIST_THREADS: usize = 4;
 /// The id of the title of the group "To delete".
@@ -89,14 +93,16 @@ pub enum Reason {
     Changes,
     /// Kept: an agent works in the worktree.
     Agent,
-    /// Kept: the branch has work after its finished pull request, or the
-    /// default branch contains its commit.
+    /// Kept: the branch has work after its finished pull request.
     WorkAfter,
+    /// Kept: a finished pull request, and the default branch contains the
+    /// commit of the branch (a new worktree, or a merge of wt).
+    InDefault,
     /// Kept: the check failed (gh, no remote on GitHub...).
     Unknown,
 }
 
-const REASON_CODES: [(Reason, &str); 10] = [
+const REASON_CODES: [(Reason, &str); 11] = [
     (Reason::Checking, "checking"),
     (Reason::Merged, "merged"),
     (Reason::Closed, "closed"),
@@ -106,6 +112,7 @@ const REASON_CODES: [(Reason, &str); 10] = [
     (Reason::Changes, "changes"),
     (Reason::Agent, "agent"),
     (Reason::WorkAfter, "work-after"),
+    (Reason::InDefault, "in-default"),
     (Reason::Unknown, "unknown"),
 ];
 
@@ -135,7 +142,7 @@ impl Reason {
         match self {
             Reason::Checking => (ACCENT, SPINNER[0]),
             Reason::Merged | Reason::Closed | Reason::Old => (RED, "✕"),
-            Reason::Open | Reason::Recent | Reason::WorkAfter => (GREEN, "✓"),
+            Reason::Open | Reason::Recent | Reason::WorkAfter | Reason::InDefault => (GREEN, "✓"),
             Reason::Changes => (YELLOW, "●"),
             Reason::Agent => (ACCENT, "◐"),
             Reason::Unknown => (DIM, "?"),
@@ -190,6 +197,7 @@ impl Entry {
             Reason::Changes => "changes not committed".to_owned(),
             Reason::Agent => "an agent works here".to_owned(),
             Reason::WorkAfter => format!("work after PR {number}"),
+            Reason::InDefault => format!("PR {number} finished, commit in the default branch"),
             Reason::Unknown => format!("not checked: {}", self.detail),
         }
     }
@@ -207,6 +215,9 @@ impl Entry {
             Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
             Reason::Agent => "Careful: an agent works in it.".to_owned(),
             Reason::WorkAfter => format!("Careful: the branch has work after {number}."),
+            Reason::InDefault => format!(
+                "Its pull request {number} is finished, and the default branch contains its commit."
+            ),
             Reason::Checking | Reason::Unknown => "The cleaner did not check it.".to_owned(),
         }
     }
@@ -258,9 +269,7 @@ fn parse_record(line: &str) -> Option<Entry> {
 /// Write the state file in one rename: fzf reads it at the same time.
 pub fn write_state(path: &Path, entries: &[Entry]) -> io::Result<()> {
     let text: String = entries.iter().map(|entry| record(entry) + "\n").collect();
-    let new_path = path.with_extension("new");
-    fs::write(&new_path, text)?;
-    fs::rename(&new_path, path)
+    stale::write_atomically(path, &text)
 }
 
 pub fn read_state(path: &Path) -> Vec<Entry> {
@@ -354,7 +363,12 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
     }
     let known: HashMap<&Path, &Entry> = previous
         .iter()
-        .filter(|entry| !matches!(entry.reason, Reason::Checking | Reason::Agent))
+        .filter(|entry| {
+            !matches!(
+                entry.reason,
+                Reason::Checking | Reason::Agent | Reason::Unknown
+            )
+        })
         .map(|entry| (entry.path.as_path(), entry))
         .collect();
     let listed: Vec<(PathBuf, Vec<git::LinkedWorktree>)> = thread::scope(|scope| {
@@ -417,18 +431,26 @@ fn repository_facts(main_checkout: &Path) -> RepositoryFacts {
 /// The result of a check, from its facts: the reason, the number of the
 /// pull request, and the error text of a failed check.
 fn classify(
-    is_clean: bool,
+    is_clean: Option<bool>,
     days: Option<u64>,
     status: Result<&BranchStatus, &str>,
     stale_days: u32,
 ) -> (Reason, Option<u64>, String) {
-    if !is_clean {
-        return (Reason::Changes, None, String::new());
+    match is_clean {
+        None => return (Reason::Unknown, None, "git status failed".to_owned()),
+        Some(false) => return (Reason::Changes, None, String::new()),
+        Some(true) => {}
     }
     match status {
         Err(error) => (Reason::Unknown, None, error.to_owned()),
         Ok(BranchStatus::Open(number)) => (Reason::Open, Some(*number), String::new()),
-        Ok(BranchStatus::Kept(number)) => (Reason::WorkAfter, Some(*number), String::new()),
+        Ok(BranchStatus::Kept { number, why }) => match why {
+            KeptWhy::WorkAfter => (Reason::WorkAfter, Some(*number), String::new()),
+            KeptWhy::InDefaultBranch => (Reason::InDefault, Some(*number), String::new()),
+            KeptWhy::NoLocalCommit => {
+                (Reason::Unknown, Some(*number), "no local commit".to_owned())
+            }
+        },
         Ok(BranchStatus::Finished { pull_request, .. }) => {
             let reason = if pull_request.state == PullRequestState::Merged {
                 Reason::Merged
@@ -448,10 +470,10 @@ fn classify(
 /// Check one worktree: the local criteria first, then gh.
 fn check(entry: &Entry, facts: &RepositoryFacts, stale_days: u32) -> Entry {
     let mut result = entry.clone();
-    let is_clean = git::is_clean(&entry.path);
+    let is_clean = git::clean_status(&entry.path);
     let now = stale::now();
     result.days = git::last_activity(&entry.path).map(|time| now.saturating_sub(time) / DAY);
-    let status = if !is_clean {
+    let status = if is_clean != Some(true) {
         Err("not needed".to_owned())
     } else {
         match &facts.github {
@@ -484,7 +506,7 @@ fn start_checks(
     entries: Vec<Entry>,
     state_path: PathBuf,
     socket: PathBuf,
-    rows_command: String,
+    reload_action: String,
     stale_days: u32,
 ) {
     let todo: VecDeque<usize> = entries
@@ -534,6 +556,9 @@ fn start_checks(
                 };
                 let result = check(&entry, facts, stale_days);
                 if let Ok(mut entries) = entries.lock() {
+                    if CHECKS_STOPPED.load(Ordering::SeqCst) {
+                        return;
+                    }
                     entries[index] = result;
                     let _ = write_state(&state_path, &entries);
                 }
@@ -541,15 +566,31 @@ fn start_checks(
             });
         }
     });
-    thread::spawn(move || notify_fzf(&receiver, &socket, &rows_command));
+    thread::spawn(move || notify_fzf(&receiver, &socket, &reload_action));
 }
 
-/// The file that keeps the id of the row where the user moved the cursor.
-/// Without this file, the cursor stays on the first worktree, also when
-/// the group "To delete" grows. The plugin does it without the tracking
-/// of fzf: this tracking blocks the input during a reload.
-fn moved_path(state_path: &Path) -> PathBuf {
-    state_path.with_extension("moved")
+/// Stop the checks: they do not write the state file anymore. The threads
+/// stop with the process.
+pub fn stop_checks() {
+    CHECKS_STOPPED.store(true, Ordering::SeqCst);
+}
+
+/// The file that keeps the id of the row of the cursor before a reload:
+/// the cursor goes back to this row after the reload (event load). A
+/// reload does not keep the cursor on its row, because the rows change
+/// their place. The plugin does it without the tracking of fzf: this
+/// tracking blocks the input during a reload.
+fn cursor_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("cursor")
+}
+
+/// fzf event `cleaner-remember`: keep the id of the row of the cursor,
+/// just before a reload. The id comes from fzf (`{1}`), so it is the row
+/// that the user sees, also after a click.
+pub fn remember_cursor(state_path: &Path, id: &str) {
+    if !id.is_empty() {
+        let _ = fs::write(cursor_path(state_path), id);
+    }
 }
 
 /// The file that keeps the rows that fzf shows, in their order: one line
@@ -570,10 +611,7 @@ fn write_shown(state_path: &Path, rows: &[Row]) {
             format!("{kind}\t{}\n", row_id(row))
         })
         .collect();
-    let new_path = shown_path(state_path).with_extension("shown-new");
-    if fs::write(&new_path, text).is_ok() {
-        let _ = fs::rename(&new_path, shown_path(state_path));
-    }
+    let _ = stale::write_atomically(&shown_path(state_path), &text);
 }
 
 /// The rows that fzf shows: for each row, true for a title, and its id.
@@ -589,22 +627,20 @@ fn read_shown(state_path: &Path) -> Option<Vec<(bool, String)>> {
 
 /// Reload the list of fzf after the results, at most once in each reload
 /// interval. When the checks end, stop the spinner.
-fn notify_fzf(receiver: &mpsc::Receiver<()>, socket: &Path, rows_command: &str) {
-    // The event load of fzf puts the cursor back on its worktree after
-    // each reload.
-    let reload = format!("reload({rows_command})");
+fn notify_fzf(receiver: &mpsc::Receiver<()>, socket: &Path, reload: &str) {
     loop {
         match receiver.recv_timeout(Duration::from_secs(60)) {
             Ok(()) => {
                 thread::sleep(RELOAD_INTERVAL);
                 while receiver.try_recv().is_ok() {}
-                post_with_retries(socket, &reload);
+                post_with_retries(socket, reload);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    let last = format!("{reload}+unbind(every({FRAME_INTERVAL}))");
+    // The checks end: the header of a refused ctrl-a is not true anymore.
+    let last = format!("{reload}+unbind(every({FRAME_INTERVAL}))+change-header:");
     post_with_retries(socket, &last);
 }
 
@@ -640,11 +676,30 @@ fn layout(entries: &[Entry], with_titles: bool) -> Vec<Row<'_>> {
         .filter(|entry| entry.reason.is_leftover())
         .collect();
     leftovers.sort_by(|a, b| b.days.cmp(&a.days).then_with(|| a.branch.cmp(&b.branch)));
-    let mut projects: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
+    // One group for each repository, sorted by name, then by path.
+    let mut projects: BTreeMap<(String, &Path), Vec<&Entry>> = BTreeMap::new();
     for entry in entries.iter().filter(|entry| !entry.reason.is_leftover()) {
         let name = git::folder_name(&entry.main_checkout);
-        projects.entry(name).or_default().push(entry);
+        projects
+            .entry((name, entry.main_checkout.as_path()))
+            .or_default()
+            .push(entry);
     }
+    let mut name_count: HashMap<&str, usize> = HashMap::new();
+    for (name, _) in projects.keys() {
+        *name_count.entry(name.as_str()).or_default() += 1;
+    }
+    let labels: Vec<String> = projects
+        .keys()
+        .map(|(name, main_checkout)| {
+            // 2 repositories with the same folder name show their path.
+            if name_count.get(name.as_str()).copied().unwrap_or(0) > 1 {
+                main_checkout.display().to_string()
+            } else {
+                name.clone()
+            }
+        })
+        .collect();
     let mut rows = Vec::new();
     if !leftovers.is_empty() {
         if with_titles {
@@ -657,12 +712,12 @@ fn layout(entries: &[Entry], with_titles: bool) -> Vec<Row<'_>> {
         }
         rows.extend(leftovers.into_iter().map(Row::Worktree));
     }
-    for (name, mut group) in projects {
+    for (((_, main_checkout), mut group), label) in projects.into_iter().zip(labels) {
         group.sort_by(|a, b| a.branch.cmp(&b.branch));
         if with_titles {
             rows.push(Row::Title {
-                id: format!("group:{}", group[0].main_checkout.display()),
-                label: name,
+                id: format!("group:{}", main_checkout.display()),
+                label,
                 count: group.len(),
                 is_to_delete: false,
             });
@@ -696,7 +751,13 @@ fn line(row: &Row, width: usize) -> String {
             )
         }
         Row::Worktree(entry) => {
-            let frames = (0..SPINNER.len())
+            // A finished check has the same text in each frame.
+            let frame_count = if entry.reason == Reason::Checking {
+                SPINNER.len()
+            } else {
+                1
+            };
+            let mut frames: Vec<String> = (0..frame_count)
                 .map(|frame| {
                     let (color, glyph) = if entry.reason == Reason::Checking {
                         (ACCENT, SPINNER[frame])
@@ -722,6 +783,7 @@ fn line(row: &Row, width: usize) -> String {
                     style::row(&left, &right, width)
                 })
                 .collect();
+            frames.resize(SPINNER.len(), frames[0].clone());
             (
                 [
                     entry.path.display().to_string(),
@@ -778,10 +840,17 @@ fn target(is_title: &[bool], current: usize, direction: Move) -> Option<usize> {
 
 /// fzf event `cleaner-move`: print the fzf action that moves the cursor
 /// to the next worktree row, over the titles of the groups, or back to
-/// its worktree after a reload. `current` is the index of the cursor
-/// (`{n}`). With a filter, the list has no title: an arrow is a normal
+/// its worktree after a reload. `current_index` (`{n}`) and `current_id`
+/// (`{1}`) give the row of the cursor: the id finds it also if the list
+/// changed. With a filter, the list has no title: an arrow is a normal
 /// move, and a reload keeps the place of fzf.
-pub fn print_move(state_path: &Path, direction: Move, current: &str, query: &str) {
+pub fn print_move(
+    state_path: &Path,
+    direction: Move,
+    current_index: &str,
+    current_id: &str,
+    query: &str,
+) {
     if !query.trim().is_empty() {
         match direction {
             Move::Up => println!("up"),
@@ -797,19 +866,18 @@ pub fn print_move(state_path: &Path, direction: Move, current: &str, query: &str
             .collect()
     });
     let (is_title, ids): (Vec<bool>, Vec<String>) = shown.into_iter().unzip();
-    let moved = moved_path(state_path);
     let index = match direction {
-        Move::Keep => fs::read_to_string(&moved)
+        Move::Keep => fs::read_to_string(cursor_path(state_path))
             .ok()
             .and_then(|id| ids.iter().position(|known| *known == id))
             .or_else(|| target(&is_title, 0, Move::Keep)),
         Move::Up | Move::Down => {
-            let found = target(&is_title, current.parse().unwrap_or(0), direction);
-            if let Some(index) = found {
-                // The reloads keep the cursor on this worktree from now on.
-                let _ = fs::write(&moved, &ids[index]);
-            }
-            found
+            let current = ids
+                .iter()
+                .position(|known| known == current_id)
+                .or_else(|| current_index.parse().ok())
+                .unwrap_or(0);
+            target(&is_title, current, direction)
         }
     };
     if let Some(index) = index {
@@ -841,6 +909,11 @@ pub fn print_delete_all(state_path: &Path) {
         .any(|entry| entry.reason.is_leftover())
     {
         println!("print({DELETE_ALL_REQUEST})+accept");
+    } else if read_state(state_path)
+        .iter()
+        .any(|entry| entry.reason == Reason::Checking)
+    {
+        println!("change-header:The checks run: wait for the group To delete.");
     } else {
         println!("change-header:The group To delete is empty.");
     }
@@ -907,13 +980,21 @@ pub fn choose(
     let binary = shell_quote(&executable.to_string_lossy());
     let state = shell_quote(&state_path.to_string_lossy());
     let rows_command = format!("{binary} cleaner-rows {state} {{q}}");
-    let keep_command = format!("{binary} cleaner-move {state} keep {{n}} {{q}}");
+    let keep_command = format!("{binary} cleaner-move {state} keep {{n}} {{1}} {{q}}");
+    // Each reload first keeps the id of the row of the cursor.
+    let reload_action =
+        format!("transform({binary} cleaner-remember {state} {{1}})+reload({rows_command})");
+    let move_command = |direction: &str| {
+        format!("transform({binary} cleaner-move {state} {direction} {{n}} {{1}} {{q}})")
+    };
     let socket = fzf::socket_path("herdr-worktrunk-cleaner");
     let columns = style::terminal_columns();
     let is_checking = entries.iter().any(|entry| entry.reason == Reason::Checking);
     let mut command = Command::new("fzf");
     command
         .env(style::COLUMNS_VARIABLE, columns.to_string())
+        // With an API key, fzf refuses the actions of the checks.
+        .env_remove("FZF_API_KEY")
         .args(style::fzf_arguments(GHOST, &scope_of(&entries), &HINTS))
         // The first frame of the spinner.
         .args(["--with-nth", &(ROW_FIELDS + 1).to_string()])
@@ -924,17 +1005,21 @@ pub fn choose(
             "{binary} cleaner-preview {state} {{1}} {{2}} {{3}} {{4}}"
         ));
     let mut binds = vec![
-        format!("change:reload({rows_command})"),
-        format!("resize:reload({rows_command})"),
+        format!("change:{reload_action}"),
+        format!("resize:{reload_action}"),
         // After each load of the list (the first one, and each reload),
         // the cursor goes back to its worktree. A reload does not keep
         // the cursor on its row: the rows change their place.
         format!("load:transform({keep_command})"),
-        format!("up:transform({binary} cleaner-move {state} up {{n}} {{q}})"),
-        format!("down:transform({binary} cleaner-move {state} down {{n}} {{q}})"),
-        format!("ctrl-p:transform({binary} cleaner-move {state} up {{n}} {{q}})"),
-        format!("ctrl-n:transform({binary} cleaner-move {state} down {{n}} {{q}})"),
+        format!("up:{}", move_command("up")),
+        format!("down:{}", move_command("down")),
+        format!("ctrl-p:{}", move_command("up")),
+        format!("ctrl-n:{}", move_command("down")),
+        format!("ctrl-k:{}", move_command("up")),
+        format!("ctrl-j:{}", move_command("down")),
+        // Enter and a double-click accept a worktree row only.
         format!("enter:transform({binary} cleaner-enter {{4}})"),
+        format!("double-click:transform({binary} cleaner-enter {{4}})"),
         format!("ctrl-a:transform({binary} cleaner-delete-all {state})"),
         format!("tab:transform({binary} picker-tab {state} next)"),
         format!("btab:transform({binary} picker-tab {state} previous)"),
@@ -967,19 +1052,19 @@ pub fn choose(
         // an error.
         let _ = input.write_all(rows.as_bytes());
     }
-    let _ = fs::remove_file(moved_path(state_path));
+    let _ = fs::remove_file(cursor_path(state_path));
     start_checks(
         entries,
         state_path.to_path_buf(),
         socket,
-        rows_command,
+        reload_action,
         stale_days,
     );
     let output = child
         .wait_with_output()
         .map_err(|error| Error::Command(format!("fzf failed: {error}")))?;
     let _ = fs::remove_file(state_path.with_extension("tab"));
-    let _ = fs::remove_file(moved_path(state_path));
+    let _ = fs::remove_file(cursor_path(state_path));
     let _ = fs::remove_file(shown_path(state_path));
     match output.status.code() {
         Some(0) => {}
@@ -1115,6 +1200,26 @@ mod tests {
     }
 
     #[test]
+    fn two_repositories_with_the_same_name_get_two_groups() {
+        let mut other = entry("b", "app", Reason::Open, Some(1));
+        other.main_checkout = PathBuf::from("/other/app");
+        other.path = PathBuf::from("/other/app.b");
+        let entries = vec![entry("a", "app", Reason::Open, Some(1)), other];
+
+        let rows = layout(&entries, true);
+
+        let labels: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Title { label, .. } => Some(label.as_str()),
+                Row::Worktree(_) => None,
+            })
+            .collect();
+        assert_eq!(labels, ["/other/app", "/work/app"]);
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
     fn the_cursor_skips_the_titles() {
         let is_title = [true, false, false, true, false];
 
@@ -1149,7 +1254,12 @@ mod tests {
     }
 
     /// A case of `classify`: clean, days, status of the branch, reason.
-    type Case<'a> = (bool, Option<u64>, Result<&'a BranchStatus, &'a str>, Reason);
+    type Case<'a> = (
+        Option<bool>,
+        Option<u64>,
+        Result<&'a BranchStatus, &'a str>,
+        Reason,
+    );
 
     #[test]
     fn classify_gives_the_reason_of_each_case() {
@@ -1157,21 +1267,30 @@ mod tests {
         let merged = finished(PullRequestState::Merged);
         let closed = finished(PullRequestState::Closed);
         let open = BranchStatus::Open(3);
-        let kept = BranchStatus::Kept(3);
-        let cases: [Case; 9] = [
-            (false, Some(30), Ok(&none), Reason::Changes),
-            (true, Some(30), Err("gh failed"), Reason::Unknown),
-            (true, Some(1), Ok(&open), Reason::Open),
-            (true, Some(1), Ok(&kept), Reason::WorkAfter),
-            (true, Some(1), Ok(&merged), Reason::Merged),
-            (true, Some(1), Ok(&closed), Reason::Closed),
-            (true, Some(7), Ok(&none), Reason::Old),
-            (true, Some(6), Ok(&none), Reason::Recent),
-            (true, None, Ok(&none), Reason::Unknown),
+        let kept = BranchStatus::Kept {
+            number: 3,
+            why: KeptWhy::WorkAfter,
+        };
+        let in_default = BranchStatus::Kept {
+            number: 3,
+            why: KeptWhy::InDefaultBranch,
+        };
+        let cases: [Case; 11] = [
+            (Some(false), Some(30), Ok(&none), Reason::Changes),
+            (None, Some(30), Ok(&none), Reason::Unknown),
+            (Some(true), Some(30), Err("gh failed"), Reason::Unknown),
+            (Some(true), Some(1), Ok(&open), Reason::Open),
+            (Some(true), Some(1), Ok(&kept), Reason::WorkAfter),
+            (Some(true), Some(1), Ok(&in_default), Reason::InDefault),
+            (Some(true), Some(1), Ok(&merged), Reason::Merged),
+            (Some(true), Some(1), Ok(&closed), Reason::Closed),
+            (Some(true), Some(7), Ok(&none), Reason::Old),
+            (Some(true), Some(6), Ok(&none), Reason::Recent),
+            (Some(true), None, Ok(&none), Reason::Unknown),
         ];
         for (is_clean, days, status, expected) in cases {
             let (reason, _, _) = classify(is_clean, days, status, 7);
-            assert_eq!(reason, expected, "{is_clean} {days:?} {status:?}");
+            assert_eq!(reason, expected, "{is_clean:?} {days:?} {status:?}");
         }
     }
 

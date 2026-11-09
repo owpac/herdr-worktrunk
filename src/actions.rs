@@ -428,13 +428,14 @@ fn ask_and_run() -> Result<(), Error> {
 fn delete_all() -> Result<(), Error> {
     let list_path = PathBuf::from(env::var_os(LIST_VARIABLE).unwrap_or_default());
     let old = stale::read_list(&list_path);
+    let _ = std::fs::remove_file(&list_path);
     if old.is_empty() {
         return Ok(());
     }
     let shown: Vec<String> = old
         .iter()
         .take(5)
-        .map(|worktree| format!("- {} ({} days)", worktree.branch, worktree.days))
+        .map(|worktree| format!("- {}", worktree.branch))
         .collect();
     let more = if old.len() > shown.len() {
         format!("\n… and {} more", old.len() - shown.len())
@@ -442,7 +443,7 @@ fn delete_all() -> Result<(), Error> {
         String::new()
     };
     let question = format!(
-        "Delete the {} old worktrees?\n{}{more}\nwt keeps a branch that is not merged.",
+        "Delete the {} worktrees of the group To delete?\n{}{more}\nwt keeps a branch that is not merged.",
         old.len(),
         shown.join("\n")
     );
@@ -507,7 +508,18 @@ fn delete_all() -> Result<(), Error> {
 pub fn cleaner(stale_days: u32) -> Result<(), Error> {
     let folder = popup_folder()?;
     let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
-    let scope = env::var_os(SCOPE_VARIABLE).map(PathBuf::from);
+    // The main checkout of the scope: the return after a question needs a
+    // folder that stays, also if the user deletes the folder of the scope.
+    let scope = env::var_os(SCOPE_VARIABLE)
+        .map(PathBuf::from)
+        .map(|scope| {
+            git::checkout_of(&scope)
+                .map(|checkout| git::canonical(&checkout.main_checkout()))
+                .ok_or_else(|| {
+                    Error::Command(format!("{} is not in a git repository.", scope.display()))
+                })
+        })
+        .transpose()?;
     let given_state = env::var_os(STATE_VARIABLE)
         .map(PathBuf::from)
         .filter(|path| path.is_file());
@@ -525,10 +537,14 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
     if entries.is_empty() {
         let _ = std::fs::remove_file(&state_path);
         if !is_return {
-            ui::show_message(
-                "Clean the worktrees",
-                "No worktree to clean: the repositories of the herdr workspaces have no linked worktree.",
-            );
+            let message = match &scope {
+                Some(scope) => format!(
+                    "No worktree to clean: {} has no linked worktree.",
+                    git::folder_name(scope)
+                ),
+                None => "No worktree to clean: the repositories of the herdr workspaces have no linked worktree.".to_owned(),
+            };
+            ui::show_message("Clean the worktrees", &message);
         }
         return Ok(());
     }
@@ -547,6 +563,7 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
     }
     match cleaner::choose(entries, &state_path, stale_days)? {
         None => {
+            cleaner::stop_checks();
             let _ = std::fs::remove_file(&state_path);
             Ok(())
         }

@@ -119,7 +119,7 @@ With `prune_merged = true` and `stale_days = <days>`, the thread also asks about
 - no change that is not committed,
 - no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the reflog of `HEAD` of the worktree (its creation, a commit, a checkout, a reset). Thus a new worktree on an old commit is not old. A `git status` does not change the activity.
 
-If old worktrees exist, the thread opens the popup cleaner (see below). The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
+If an old worktree exists, and the thread did not ask about it in the last `stale_days` days, the thread opens the popup cleaner (see below). The popup shows all the worktrees: an old worktree that the user kept is also in the group "To delete". 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
 
 ### The popup cleaner
 
@@ -135,7 +135,7 @@ A leftover has no agent, no change that is not committed, and one of these condi
 - A merged or closed pull request contains the commit of its branch, with the same proofs as `prune_merged`. The age does not count.
 - It has no pull request, and no activity for `stale_days` days (or 7 days if `stale_days` is 0). The cleaner ignores the last questions of the daily pass.
 
-The other reasons keep a worktree: an open pull request, a recent activity, changes that are not committed, an agent, work after a finished pull request, or a check that failed (gh, or no remote on GitHub).
+The other reasons keep a worktree: an open pull request, a recent activity, changes that are not committed, an agent, work after a finished pull request, a finished pull request with the commit in the default branch, or a check that failed (git, gh, or no remote on GitHub).
 
 | Key | Result |
 |-----|--------|
@@ -161,7 +161,8 @@ How the checks work:
 1. The popup lists the worktrees with git and herdr only, then shows the list.
 2. 8 threads check the worktrees: `git status`, the last activity, then one call to gh for the pull requests of the branch. A worktree with an agent or with changes needs no call to gh.
 3. After each result, the popup writes its state file, and sends a reload to fzf through the socket of fzf (`--listen`).
-4. The cursor stays on its worktree when the list reloads. After a question, the list comes back with the results of the last checks: these worktrees need no new check.
+4. Before each reload, the popup keeps the id of the row of the cursor. After the reload, the cursor goes back to this row, also after a click.
+5. After a question, the list comes back with the results of the last checks: these worktrees need no new check. A failed check runs again.
 
 Limits:
 

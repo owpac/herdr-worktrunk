@@ -172,9 +172,18 @@ pub fn write_list(path: &Path, old: &[OldWorktree]) -> Result<(), std::io::Error
             )
         })
         .collect();
-    // Write a new file, then rename it: a reader never sees a part of the
-    // list, also if the writer stops.
-    let new_path = path.with_extension("new");
+    write_atomically(path, &text)
+}
+
+/// Write a file in one rename: a reader never sees a part of it, also if
+/// the writer stops. The temporary file has the name of the file and the
+/// process: 2 files or 2 processes never share it.
+pub fn write_atomically(path: &Path, text: &str) -> Result<(), std::io::Error> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let new_path = path.with_file_name(format!(".{name}.{}.new", std::process::id()));
     fs::write(&new_path, text)?;
     fs::rename(&new_path, path)
 }
