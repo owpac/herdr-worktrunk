@@ -506,10 +506,12 @@ pub fn cleaner(stale_days: u32, state_dir: &Path) -> Result<(), Error> {
         .map(PathBuf::from)
         .filter(|path| path.is_file());
     let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
-    let (list_path, old, failures) = match given_list {
+    // A list of the observer, of a daily pass, or of a return after a
+    // deletion can be older than a new pull request: fzf checks it again.
+    let (list_path, old, failures, verify) = match given_list {
         Some(path) => {
             let old = stale::read_list(&path);
-            (path, old, Vec::new())
+            (path, old, Vec::new(), true)
         }
         None => {
             ui::show_progress("Clean the worktrees", "Looking for old worktrees…");
@@ -528,7 +530,7 @@ pub fn cleaner(stale_days: u32, state_dir: &Path) -> Result<(), Error> {
             ));
             stale::write_list(&path, &search.old)
                 .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
-            (path, search.old, search.failures)
+            (path, search.old, search.failures, search.uses_observer)
         }
     };
     // The repositories that the search could not check: the list does not
@@ -549,7 +551,7 @@ pub fn cleaner(stale_days: u32, state_dir: &Path) -> Result<(), Error> {
     }
     let list_text = list_path.to_string_lossy();
     let folder_text = folder.to_string_lossy();
-    match cleaner::choose(&old, &list_path, warning.as_deref())? {
+    match cleaner::choose(&old, &list_path, warning.as_deref(), verify)? {
         None => {
             let _ = std::fs::remove_file(&list_path);
             Ok(())

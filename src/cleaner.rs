@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 
 use crate::git::{self, canonical, LinkedWorktree};
+use crate::github;
 use crate::herdr::{self, Error};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
@@ -70,6 +71,9 @@ pub struct Search {
     /// The repositories that the search could not check (gh not
     /// authenticated, no remote on GitHub...), with the reason.
     pub failures: Vec<String>,
+    /// The list uses the file of the observer for at least one
+    /// repository: a pull request can be younger than this file.
+    pub uses_observer: bool,
 }
 
 /// Find the old worktrees of `scope` (one repository), or of all the
@@ -95,6 +99,11 @@ pub fn find_old_worktrees(
     let is_busy = |path: &Path| busy.contains(&canonical(path));
     // One thread for each repository: gh takes about half a second for
     // each old worktree.
+    let uses_observer = known.is_some_and(|known| {
+        repositories
+            .iter()
+            .any(|repository| known.contains_key(repository))
+    });
     let results: Vec<(PathBuf, Result<Vec<OldWorktree>, Error>)> = thread::scope(|scope| {
         let handles: Vec<_> = repositories
             .into_iter()
@@ -119,7 +128,10 @@ pub fn find_old_worktrees(
             .filter_map(|handle| handle.join().ok())
             .collect()
     });
-    let mut search = Search::default();
+    let mut search = Search {
+        uses_observer,
+        ..Search::default()
+    };
     for (repository, found) in results {
         match found {
             Ok(old) => search.old.extend(old),
@@ -152,6 +164,41 @@ fn old_worktrees_of(
     prune::without_pull_request(repository, old)
 }
 
+/// Return true if the branch of `worktree` has a pull request on GitHub,
+/// or None if gh or the remote fails.
+fn has_pull_request(worktree: &OldWorktree) -> Option<bool> {
+    let origin_url = git::origin_url(&worktree.main_checkout)?;
+    let repository = github::repository_of(&origin_url)?;
+    github::pull_requests(&repository, &worktree.branch)
+        .ok()
+        .map(|pull_requests| !pull_requests.is_empty())
+}
+
+/// fzf event `cleaner-verify`: check the pull requests of the worktrees of
+/// the list, one thread for each, then write the list again without the
+/// worktrees that have one, and print its rows. fzf shows the list at
+/// once, then these rows: a pull request younger than the list leaves the
+/// list a second later. An error of gh keeps the worktree.
+pub fn print_verified_rows(list_path: &Path) {
+    let old = stale::read_list(list_path);
+    let kept: Vec<OldWorktree> = thread::scope(|scope| {
+        let handles: Vec<_> = old
+            .into_iter()
+            .map(|worktree| {
+                scope.spawn(move || (has_pull_request(&worktree) != Some(true)).then_some(worktree))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().ok().flatten())
+            .collect()
+    });
+    let _ = stale::write_list(list_path, &kept);
+    for worktree in &kept {
+        println!("{}", row(worktree));
+    }
+}
+
 /// The line of a worktree in fzf: 3 hidden fields (path, branch, main
 /// checkout), then the shown text.
 fn row(worktree: &OldWorktree) -> String {
@@ -173,11 +220,13 @@ fn row(worktree: &OldWorktree) -> String {
 /// Show the list in fzf, and return the choice of the user. `list_path` is
 /// the file of the list: the preview keeps its tab next to it. `warning`
 /// goes under the header, for example the repositories that the search
-/// could not check.
+/// could not check. With `verify`, fzf checks the pull requests of the
+/// list after it shows it (`cleaner-verify`), and reloads the list.
 pub fn choose(
     old: &[OldWorktree],
     list_path: &Path,
     warning: Option<&str>,
+    verify: bool,
 ) -> Result<Option<Choice>, Error> {
     let executable = env::current_exe()
         .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
@@ -187,7 +236,15 @@ pub fn choose(
         Some(warning) => format!("{HEADER}\n{warning}"),
         None => HEADER.to_owned(),
     };
-    let mut fzf = Command::new("fzf")
+    let mut fzf = Command::new("fzf");
+    if verify {
+        // `load` comes once fzf has read the list: the check runs once,
+        // and reload-sync keeps the list on the screen until it ends.
+        fzf.arg("--bind").arg(format!(
+            "load:unbind(load)+reload-sync({binary} cleaner-verify {cache})"
+        ));
+    }
+    let mut fzf = fzf
         .args([
             "--ansi",
             "--layout",

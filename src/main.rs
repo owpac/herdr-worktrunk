@@ -152,6 +152,10 @@ fn main() -> ExitCode {
             picker::print_preview(Path::new(repository), Path::new(cache), kind, branch, path);
             return ExitCode::SUCCESS;
         }
+        ["cleaner-verify", list] => {
+            cleaner::print_verified_rows(Path::new(list));
+            return ExitCode::SUCCESS;
+        }
         ["picker-tab", cache, direction] => {
             picker::change_tab(Path::new(cache), *direction == "next");
             return ExitCode::SUCCESS;
