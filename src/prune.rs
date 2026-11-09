@@ -29,6 +29,7 @@
 //! the check can only remove a worktree of a finished pull request.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::git::{self, LinkedWorktree};
 use crate::github::{self, PullRequest, PullRequestState};
@@ -158,14 +159,15 @@ pub enum KeptWhy {
 /// Read the pull requests of `branch` (one call to gh, sometimes 2), and
 /// tell the status of its worktree. `repository` is the repository on
 /// GitHub, and `default_branch` the default branch of `origin`, if git
-/// knows it.
+/// knows it. `limit` is the time limit of each call to gh.
 pub fn branch_status(
     main_checkout: &Path,
     repository: &str,
     default_branch: Option<&str>,
     branch: &str,
+    limit: Duration,
 ) -> Result<BranchStatus, Error> {
-    let pull_requests = github::pull_requests(repository, branch)?;
+    let pull_requests = github::pull_requests(repository, branch, limit)?;
     let Some(last) = pull_requests.first() else {
         return Ok(BranchStatus::NoPullRequest);
     };
@@ -189,7 +191,7 @@ pub fn branch_status(
         Some(_) => DefaultBranch::DoesNotContain,
     };
     let finished = finished_pull_request(&local_commit, &pull_requests, place, |head| {
-        github::contains(repository, head, &local_commit)
+        github::contains(repository, head, &local_commit, limit)
     });
     Ok(match finished {
         Some(pull_request) => BranchStatus::Finished {
@@ -231,6 +233,7 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
             &repository,
             default_branch.as_deref(),
             &worktree.branch,
+            github::GH_TIME_LIMIT,
         )? {
             BranchStatus::NoPullRequest => check.without_pull_request.push(worktree),
             BranchStatus::Finished {
@@ -264,7 +267,7 @@ pub fn without_pull_request(
     let repository = github_repository(main_checkout)?;
     let mut kept = Vec::new();
     for worktree in old {
-        if github::pull_requests(&repository, &worktree.branch)?.is_empty() {
+        if github::pull_requests(&repository, &worktree.branch, github::GH_TIME_LIMIT)?.is_empty() {
             kept.push(worktree);
         }
     }

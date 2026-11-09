@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use crate::fzf;
 use crate::git::{self, canonical};
-use crate::github::PullRequestState;
+use crate::github::{self, PullRequestState};
 use crate::herdr::{self, Error};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune::{self, BranchStatus, KeptWhy};
@@ -481,11 +481,14 @@ fn check(entry: &Entry, facts: &RepositoryFacts, stale_days: u32) -> Entry {
     } else {
         match &facts.github {
             Err(error) => Err(error.clone()),
+            // A gh that does not answer gives "not checked" after 15 s: the
+            // worktree stays, and the spinner stops.
             Ok(repository) => prune::branch_status(
                 &entry.main_checkout,
                 repository,
                 facts.default_branch.as_deref(),
                 &entry.branch,
+                github::POPUP_TIME_LIMIT,
             )
             .map_err(|error| error.to_string().replace('\n', " ")),
         }
@@ -1452,6 +1455,79 @@ mod tests {
                 .1
                 .contains("2 days ago (limit: 7 days)")
         );
+    }
+
+    /// Run git in `folder` for a test, without the global config (for
+    /// example a signature with an agent).
+    fn git_in(folder: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(folder)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    #[test]
+    fn a_repository_without_github_keeps_its_worktree_without_gh() {
+        let base = env::temp_dir().join(format!("herdr-worktrunk-check-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let main = base.join("repo");
+        fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let worktree = base.join("repo.old");
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "old",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let entry = Entry::new(
+            worktree.clone(),
+            "old".to_owned(),
+            main.clone(),
+            Reason::Checking,
+        );
+
+        // No remote origin: the check does not call gh, and keeps the
+        // worktree with the reason.
+        let result = check(&entry, &repository_facts(&main), 0);
+
+        assert_eq!(result.reason, Reason::Unknown);
+        assert_eq!(result.detail, "no remote origin");
+        assert!(!result.reason.is_leftover());
+        assert_eq!(checklist(&result, 0)[2].0, Mark::Unknown);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_failed_call_to_gh_never_gives_a_leftover() {
+        for days in [Some(0), Some(400), None] {
+            let (reason, _, detail) =
+                classify(Some(true), days, Err("gh pr: no end after 15 s"), 7);
+
+            assert_eq!(reason, Reason::Unknown);
+            assert!(!reason.is_leftover());
+            assert_eq!(detail, "gh pr: no end after 15 s");
+        }
     }
 
     #[test]
