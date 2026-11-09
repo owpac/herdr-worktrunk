@@ -11,6 +11,7 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 | `herdr-worktrunk.pick` | Opens the worktree picker (fzf) in a popup, with the worktrees and the branches of `wt list`. Type to filter. The worktree opens in its herdr workspace. |
 | `herdr-worktrunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question in a small popup. wt keeps a branch that is not merged. Then the focus goes to the workspace of the main checkout. |
 | `herdr-worktrunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge` (squash, rebase, `pre-merge` hooks, fast-forward), then deletes it, after a question in a small popup. A large popup shows the output of wt. |
+| `herdr-worktrunk.clean` | Opens the list of the old worktrees without pull request, in all the repositories of the herdr workspaces (see [The popup cleaner](#the-popup-cleaner)). |
 
 `herdr-worktrunk.remove` and `herdr-worktrunk.merge` refuse a workspace where an agent works: the removal deletes the folder of the agent. If an action cannot work (for example the picker outside a git repository), a small popup gives the reason, with an OK button.
 
@@ -32,7 +33,7 @@ The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a term
 
 The plugin starts an observer with herdr. Every 2 seconds, the observer reads the state of herdr, and does 2 things:
 
-1. **The pane follows its agent.** If an agent works in another checkout of the same repository than its workspace, the observer moves the pane of the agent to the workspace of this checkout. herdr opens this workspace if necessary. For example, Claude Code enters a worktree (`EnterWorktree`, `/worktrunk:wt-switch-create`): its pane goes to the workspace of the worktree. When it leaves the worktree, its pane comes back.
+1. **The pane follows its agent.** If an agent works in another checkout of the same repository than its workspace, the observer moves the pane of the agent to the workspace of this checkout. herdr opens this workspace if necessary. For example, Claude Code enters a worktree (`EnterWorktree`, `/worktrunk:wt-switch-create`): its pane goes to the workspace of the worktree. When it leaves the worktree, its pane comes back. If the workspace is new (younger than 2 minutes) and has only one shell, the pane of the agent replaces this shell: for example the shell of a `post-start` hook that runs `herdr worktree open`. If the pane is the last pane of the workspace of a main checkout, the observer first opens a shell in this workspace: herdr closes a workspace without pane, and the workspaces of the worktrees then leave the group of the project.
 2. **The workspace of a removed worktree closes.** If `wt remove` or `wt merge` removes a worktree, and no agent works in its workspace, the observer closes the workspace.
 
 Limits:
@@ -50,24 +51,35 @@ The versions up to 2026.11.7 do not read `observer.binary`. After the update fro
 
 The observer reads `config.toml` when it starts. After a change, stop the observer: `pkill -f 'herdr-worktrunk observe --run'`. The next agent that herdr detects starts it again.
 
-### The worktrees of the merged pull requests
+### The worktrees of the finished pull requests
 
-With `prune_merged = true` (see [Configuration](#configuration)), the observer also removes the worktree of each merged pull request. A second thread checks the repositories every 5 minutes. It checks a repository if a herdr workspace shows one of its checkouts.
+With `prune_merged = true` (see [Configuration](#configuration)), the observer also removes the worktree of each finished pull request: merged or closed. A second thread checks the repositories every 5 minutes. It checks a repository if a herdr workspace shows one of its checkouts.
 
-The thread removes the worktree of a branch only if GitHub merged a pull request of this branch, if the default branch does not contain the local commit, and if one of these conditions is true:
+The thread removes the worktree of a branch only if the branch has no open pull request, if the default branch does not contain the local commit, and if one of these conditions is true for a merged or closed pull request of the branch:
 
 - The last commit of the pull request is the local commit of the branch.
 - The pull request contains the local commit. This case covers the button "Update branch" of GitHub: it adds a commit that the local branch does not have.
 
+Thus GitHub keeps each local commit: in the default branch after a merge, and in `refs/pull/<number>/head` after a close. After the removal of a closed pull request, the log gives the command that gets the branch back: `git fetch origin pull/<number>/head:<branch>`.
+
+An agent in a finished worktree (its folder is in the worktree, or its workspace shows the worktree):
+
+- If all these agents are `idle` or `done`, the thread closes their panes, then removes the worktree. The conversation stays on the disk: the log gives the command that resumes it, for example `claude --resume <session>`.
+- If an agent is `working`, `blocked` or `unknown`, or if its workspace has the focus, the thread keeps the worktree, and tries again at the next pass.
+- If the workspace of an agent shows the worktree, but the agent works in another folder, the thread does not close it, and keeps the worktree.
+- The thread closes no agent if the worktree must stay: a new commit on the branch, or a change that is not committed.
+
+The thread ignores a pull request from a fork, also with the same branch name.
+
 The thread keeps:
 
-- a worktree where an agent works: the folder of the agent is in the worktree, or the workspace of the agent shows the worktree,
+- a worktree whose branch has an open pull request,
 - a worktree whose local commit is in the default branch. A new worktree starts there, also on the name of an old branch. `wt step prune` removes this worktree, for example after a merge with a merge commit.
 - the main worktree, a detached worktree and a locked worktree,
 - a worktree with changes that are not committed: `wt remove` refuses it,
 - a branch that got a new commit after the check. Just before the removal, the thread reads the commit of the branch again.
 
-The thread removes the worktree and its branch with `wt remove --force-delete`. GitHub merged the local commit, so the default branch has the work, also after a squash merge. Without `--force-delete`, wt keeps a branch if it does not find its content in the default branch, for example if the default branch later changed the same files. `--force-delete` acts only on the branch: the thread never uses `--force`, which removes the changes that are not committed. GitHub keeps the commits of the pull request (`refs/pull/<number>/head`). Then the observer closes the workspace of the worktree (rule 2).
+The thread removes the worktree and its branch with `wt remove --force-delete`. Without `--force-delete`, wt keeps a branch if it does not find its content in the default branch, for example after a close, or if the default branch later changed the same files. `--force-delete` acts only on the branch: the thread never uses `--force`, which removes the changes that are not committed. GitHub keeps the commits of the pull request (`refs/pull/<number>/head`). Then the observer closes the workspace of the worktree (rule 2).
 
 The thread does not run `git fetch`. A fetch every 5 minutes can ask the ssh agent (for example 1Password) for a key while nobody is at the computer. gh uses the API of GitHub, with its own token.
 
@@ -86,6 +98,43 @@ Limits:
 - The thread never approves the hooks of a project (`--yes`). If a `pre-remove` or `post-remove` hook of the project has no approval, `wt remove` fails, and the log shows the error. Run `wt config approvals add` in the repository.
 - The observer writes each removal and each new error in `observer.log`. An error that stays gives one line. When the thread starts, the log shows `prune_merged: on`.
 
+### The old worktrees without pull request
+
+With `prune_merged = true` and `stale_days = <days>`, the thread also asks about the old worktrees, once a day. An old worktree has:
+
+- no pull request,
+- no agent,
+- no change that is not committed,
+- no activity for `stale_days` days. The activity is the newest of the last commit and the last change of the reflog of `HEAD` of the worktree (its creation, a commit, a checkout, a reset). Thus a new worktree on an old commit is not old. A `git status` does not change the activity.
+
+If old worktrees exist, the thread opens the popup cleaner with them (see below). The thread does not ask again about a worktree for `stale_days` days. 2 files in the state folder keep the dates: `stale-last` (the last pass) and `stale-asked` (the last question for each worktree). To ask again at once, delete these 2 files: the next pass asks.
+
+### The popup cleaner
+
+The action `herdr-worktrunk.clean` opens the list of the old worktrees of **all the repositories of the herdr workspaces**, in fzf. It uses the criteria above, with `stale_days` (or 7 days if `stale_days` is 0), and ignores the last questions.
+
+| Key | Result |
+|-----|--------|
+| `Enter` | Asks to delete the selected worktree, then the list comes back. |
+| `ctrl-a` | Asks to delete all the worktrees of the list. A progress popup, then a summary, shows the result. |
+| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker). |
+| `Esc` | Quits. |
+
+Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner keeps a worktree where an agent works, and closes the workspace of each deleted worktree.
+
+From a shell, `clean` opens the same popup, for one repository or for all of them. `list-stale` prints the old worktrees of one repository without a popup.
+
+```sh
+bin/herdr-worktrunk clean [<folder of a repository>]
+bin/herdr-worktrunk list-stale <folder of the repository>
+```
+
+The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh. At each pass (every 5 minutes), the observer writes the worktrees without pull request of each repository in `no-pull-request.tsv`, in its state folder. The popup reads this file if it is younger than 15 minutes: for these repositories, it does the local checks only, without gh. For the other repositories, it does the local checks first, then calls gh only for the old worktrees, with one thread for each repository. The header of the list gives the repositories that it could not check. A pull request can be younger than this file: thus the popup shows the list at once, then checks the pull requests of the listed worktrees only (one gh call for each, in parallel), and reloads the list without the worktrees that got one.
+
+Limits:
+
+- The daily pass waits 10 minutes at most for a free popup. Then it stops, and tries again the next day.
+
 ## Configuration
 
 `config.toml` in the config folder of the plugin (`herdr plugin config-dir herdr-worktrunk`):
@@ -94,8 +143,12 @@ Limits:
 # Start the observer (default: true).
 observe = true
 
-# The observer removes the worktree of each merged pull request (default: false). Needs gh.
+# The observer removes the worktree of each merged or closed pull request (default: false). Needs gh.
 prune_merged = false
+
+# Once a day, ask about the worktrees without pull request and without change for this number
+# of days (default: 0, off). Needs prune_merged = true.
+stale_days = 0
 
 # What an agent can do without a question at the end of a task in a worktree: "ask" or "auto".
 # The plugin does not read this key: the agents read it (for example the skill worktrees of
@@ -106,7 +159,7 @@ agent_mode = "ask"
 agent_mode = "auto"
 ```
 
-The plugin reads only the top-level keys `observe` and `prune_merged`, and ignores the other keys.
+The plugin reads only the top-level keys `observe`, `prune_merged` and `stale_days`, and ignores the other keys.
 
 ## Requirements
 
@@ -151,6 +204,12 @@ key = "prefix+shift+m"
 type = "plugin_action"
 command = "herdr-worktrunk.merge"
 description = "merge the worktree of the workspace (wt)"
+
+[[keys.command]]
+key = "prefix+shift+c"
+type = "plugin_action"
+command = "herdr-worktrunk.clean"
+description = "clean the old worktrees (wt)"
 ```
 
 ## Development

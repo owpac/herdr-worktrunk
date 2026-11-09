@@ -1,11 +1,19 @@
 //! The git facts that the plugin needs about a folder.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::herdr::Error;
 use crate::process;
+
+/// The canonical path of a folder, or the path itself if the folder does
+/// not exist. git and herdr can give 2 forms of the same folder, for
+/// example `/tmp` and `/private/tmp` on macOS.
+pub fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
 
 /// A git checkout: the main checkout or a linked worktree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +179,47 @@ pub fn branch_commit(main_checkout: &Path, branch: &str) -> Option<String> {
         &["rev-parse", "--verify", "--quiet", &reference],
     )
     .ok()
+}
+
+/// Return true if the worktree `checkout` has no change that is not
+/// committed. With `--no-optional-locks`, git does not write the index:
+/// the check does not change the last activity of the worktree.
+pub fn is_clean(checkout: &Path) -> bool {
+    run_in(checkout, &["--no-optional-locks", "status", "--porcelain"])
+        .is_ok_and(|text| text.is_empty())
+}
+
+/// Return the last activity of the worktree `checkout`, in seconds since
+/// 1970: the newest of the time of its last commit and the modification
+/// time of the reflog of its HEAD (`logs/HEAD` in its git folder).
+///
+/// git writes this reflog when the worktree is created, and at each
+/// commit, checkout, reset or rebase. Thus a new worktree on an old commit
+/// looks new. A `git status` that refreshes the index does not change it,
+/// unlike the git folder. Without a reflog, the git folder gives the time.
+pub fn last_activity(checkout: &Path) -> Option<u64> {
+    let commit_time = run_in(checkout, &["log", "-1", "--format=%ct"])
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok());
+    let folder_time = run_in(checkout, &["rev-parse", "--absolute-git-dir"])
+        .ok()
+        .map(PathBuf::from)
+        .and_then(|git_dir| {
+            modification_secs(&git_dir.join("logs").join("HEAD"))
+                .or_else(|| modification_secs(&git_dir))
+        });
+    commit_time.into_iter().chain(folder_time).max()
+}
+
+/// The modification time of a file, in seconds since the epoch.
+fn modification_secs(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 /// Return true if `commit` is in the history of `branch`.

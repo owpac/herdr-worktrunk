@@ -1,18 +1,23 @@
-//! The worktrees of the merged pull requests (option `prune_merged`).
+//! The worktrees of the finished pull requests (option `prune_merged`).
 //!
-//! A worktree can stay after the merge of its pull request: its agent
-//! stopped before the merge, or `wt switch <branch>` made the worktree
-//! again for a change of the review. The observer finds these worktrees,
-//! and removes them with wt.
+//! A worktree can stay after the merge or the close of its pull request:
+//! its agent stays in it, or `wt switch <branch>` made the worktree again
+//! for a change of the review. The observer finds these worktrees, and
+//! removes them with wt.
 //!
-//! A worktree is merged if GitHub merged a pull request of its branch, if
-//! the default branch does not contain its local commit, and if one of
-//! these conditions is true:
+//! A pull request is finished if GitHub merged it or closed it. A worktree
+//! is finished if its branch has no open pull request, if the default
+//! branch does not contain its local commit, and if one of these
+//! conditions is true for a finished pull request of its branch:
 //!
 //! - The last commit of the pull request is the local commit of the branch.
 //! - The pull request contains the local commit. This case covers the
 //!   button "Update branch" of GitHub: it adds a commit that the local
 //!   branch does not have.
+//!
+//! Thus GitHub keeps each local commit of a finished worktree: in the
+//! default branch after a merge, and in `refs/pull/<number>/head` after a
+//! close.
 //!
 //! A local commit in the default branch is not work of the branch: a new
 //! worktree starts there. Thus a new worktree stays, also on the name of
@@ -21,32 +26,44 @@
 //!
 //! The observer does not fetch `origin`. Thus the local copy of the default
 //! branch of `origin` can be old. An old copy contains fewer commits, so
-//! the check can only remove a worktree of a merged pull request.
+//! the check can only remove a worktree of a finished pull request.
 
 use std::path::{Path, PathBuf};
 
 use crate::git::{self, LinkedWorktree};
-use crate::github;
+use crate::github::{self, PullRequest, PullRequestState};
 use crate::herdr::Error;
+use crate::stale::OldWorktree;
 
-/// A worktree of a merged pull request.
+/// A worktree of a finished pull request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MergedWorktree {
+pub struct FinishedWorktree {
     pub path: PathBuf,
     pub branch: String,
-    /// The local commit of the branch that GitHub merged. If the branch
-    /// gets a new commit, this new commit is not in the pull request: the
-    /// observer then keeps the branch.
+    /// The local commit of the branch that the pull request contains. If
+    /// the branch gets a new commit, this new commit is not in the pull
+    /// request: the observer then keeps the branch.
     pub commit: String,
+    /// The finished pull request that contains the local commit.
+    pub pull_request: PullRequest,
 }
 
-impl MergedWorktree {
-    /// Return true if the branch still has the merged commit.
+impl FinishedWorktree {
+    /// Return true if the branch still has the checked commit.
     /// `current_commit` is the commit of the branch now, or None if the
     /// branch does not exist.
     pub fn is_unchanged(&self, current_commit: Option<&str>) -> bool {
         current_commit == Some(self.commit.as_str())
     }
+}
+
+/// The linked worktrees of a repository, sorted by their pull requests.
+#[derive(Debug, Default)]
+pub struct Check {
+    /// The worktrees of the finished pull requests.
+    pub finished: Vec<FinishedWorktree>,
+    /// The worktrees whose branch has no pull request.
+    pub without_pull_request: Vec<LinkedWorktree>,
 }
 
 /// Where the local commit of a branch is, compared with the default branch
@@ -61,59 +78,67 @@ pub enum DefaultBranch {
     Unknown,
 }
 
-/// Decide if a pull request merged the local commit of a branch.
+/// Return the finished pull request that contains the local commit of a
+/// branch, or None if the worktree must stay.
 ///
 /// - `local_commit`: the commit of the local branch.
-/// - `merged_heads`: the last commit of each merged pull request of the
-///   branch.
+/// - `pull_requests`: the pull requests of the branch, in all the states.
 /// - `default_branch`: where the local commit is. If the default branch is
 ///   not known, only the first condition applies.
 /// - `head_contains`: tells if a pull request head contains the local
 ///   commit (a call to GitHub).
-pub fn is_merged(
+pub fn finished_pull_request<'a>(
     local_commit: &str,
-    merged_heads: &[String],
+    pull_requests: &'a [PullRequest],
     default_branch: DefaultBranch,
     mut head_contains: impl FnMut(&str) -> bool,
-) -> bool {
-    if default_branch == DefaultBranch::Contains {
-        return false;
+) -> Option<&'a PullRequest> {
+    let is_open = pull_requests
+        .iter()
+        .any(|pull_request| pull_request.state == PullRequestState::Open);
+    if is_open || default_branch == DefaultBranch::Contains {
+        return None;
     }
-    if merged_heads.iter().any(|head| head == local_commit) {
-        return true;
+    let mut finished = pull_requests
+        .iter()
+        .filter(|pull_request| pull_request.state != PullRequestState::Open);
+    if let Some(same_commit) = finished
+        .clone()
+        .find(|pull_request| pull_request.head == local_commit)
+    {
+        return Some(same_commit);
     }
     if default_branch == DefaultBranch::Unknown {
-        return false;
+        return None;
     }
-    merged_heads.iter().any(|head| head_contains(head))
+    finished.find(|pull_request| head_contains(&pull_request.head))
 }
 
-/// Return the merged worktrees of the repository of `main_checkout`.
+/// Sort the linked worktrees of the repository of `main_checkout` by their
+/// pull requests.
 ///
-/// `is_busy` tells if an agent works in a worktree: the function skips
-/// these worktrees, and does not ask GitHub about them. If the remote
+/// `skip` tells if the thread must keep a worktree without a question to
+/// GitHub, for example a worktree where an agent works. If the remote
 /// `origin` is not on GitHub, or if git or gh fails, the function returns
 /// an error and no worktree.
-pub fn merged_worktrees(
-    main_checkout: &Path,
-    is_busy: impl Fn(&Path) -> bool,
-) -> Result<Vec<MergedWorktree>, Error> {
+pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Result<Check, Error> {
     let worktrees: Vec<LinkedWorktree> = git::linked_worktrees(main_checkout)?
         .into_iter()
-        .filter(|worktree| !is_busy(&worktree.path))
+        .filter(|worktree| !skip(&worktree.path))
         .collect();
     if worktrees.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Check::default());
     }
     let origin_url = git::origin_url(main_checkout)
         .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
     let repository = github::repository_of(&origin_url)
         .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))?;
     let default_branch = git::default_branch(main_checkout);
-    let mut merged = Vec::new();
+    let mut check = Check::default();
     for worktree in worktrees {
-        let merged_heads = github::merged_heads(&repository, &worktree.branch)?;
-        if merged_heads.is_empty() {
+        let pull_requests = github::pull_requests(&repository, &worktree.branch)?;
+        if pull_requests.is_empty() {
+            check.without_pull_request.push(worktree);
             continue;
         }
         let Some(local_commit) = git::branch_commit(main_checkout, &worktree.branch) else {
@@ -126,122 +151,167 @@ pub fn merged_worktrees(
             }
             Some(_) => DefaultBranch::DoesNotContain,
         };
-        let is_merged = is_merged(&local_commit, &merged_heads, place, |head| {
+        let finished = finished_pull_request(&local_commit, &pull_requests, place, |head| {
             github::contains(&repository, head, &local_commit)
         });
-        if is_merged {
-            merged.push(MergedWorktree {
+        if let Some(pull_request) = finished {
+            check.finished.push(FinishedWorktree {
                 path: worktree.path,
                 branch: worktree.branch,
+                pull_request: pull_request.clone(),
                 commit: local_commit,
             });
         }
     }
-    Ok(merged)
+    Ok(check)
+}
+
+/// Keep the old worktrees whose branch has no pull request on GitHub.
+///
+/// The caller selects the old worktrees with local checks first (agents,
+/// activity, changes): this function then calls gh once for each of them
+/// only. Without old worktrees, it calls nothing, also for a repository
+/// without remote on GitHub.
+pub fn without_pull_request(
+    main_checkout: &Path,
+    old: Vec<OldWorktree>,
+) -> Result<Vec<OldWorktree>, Error> {
+    if old.is_empty() {
+        return Ok(old);
+    }
+    let origin_url = git::origin_url(main_checkout)
+        .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
+    let repository = github::repository_of(&origin_url)
+        .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))?;
+    let mut kept = Vec::new();
+    for worktree in old {
+        if github::pull_requests(&repository, &worktree.branch)?.is_empty() {
+            kept.push(worktree);
+        }
+    }
+    Ok(kept)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn heads(commits: &[&str]) -> Vec<String> {
-        commits.iter().map(|commit| (*commit).to_owned()).collect()
+    fn pull_request(number: u64, state: PullRequestState, head: &str) -> PullRequest {
+        PullRequest {
+            number,
+            state,
+            head: head.to_owned(),
+        }
     }
 
     fn never(_head: &str) -> bool {
         panic!("GitHub must not be asked");
     }
 
-    #[test]
-    fn the_same_commit_as_a_merged_pull_request_is_merged() {
-        let merged = is_merged(
-            "aaa",
-            &heads(&["bbb", "aaa"]),
-            DefaultBranch::DoesNotContain,
-            never,
-        );
+    const MERGED: PullRequestState = PullRequestState::Merged;
+    const CLOSED: PullRequestState = PullRequestState::Closed;
+    const OPEN: PullRequestState = PullRequestState::Open;
 
-        assert!(merged);
+    #[test]
+    fn a_merged_pull_request_with_the_local_commit_is_finished() {
+        let pull_requests = [
+            pull_request(1, MERGED, "bbb"),
+            pull_request(2, MERGED, "aaa"),
+        ];
+
+        let finished =
+            finished_pull_request("aaa", &pull_requests, DefaultBranch::DoesNotContain, never);
+
+        assert_eq!(finished.map(|pull_request| pull_request.number), Some(2));
     }
 
     #[test]
-    fn the_same_commit_is_merged_if_the_default_branch_is_not_known() {
-        assert!(is_merged(
+    fn a_closed_pull_request_that_contains_the_local_commit_is_finished() {
+        let pull_requests = [pull_request(3, CLOSED, "bbb")];
+
+        let finished = finished_pull_request(
             "aaa",
-            &heads(&["aaa"]),
-            DefaultBranch::Unknown,
-            never
-        ));
-    }
-
-    #[test]
-    fn a_new_worktree_on_the_name_of_a_merged_branch_stays() {
-        // The pull request was merged with a fast-forward: the default
-        // branch contains its head, and the new worktree starts there.
-        let merged = is_merged("aaa", &heads(&["aaa"]), DefaultBranch::Contains, never);
-
-        assert!(!merged);
-    }
-
-    #[test]
-    fn a_pull_request_that_contains_the_local_commit_is_merged() {
-        let merged = is_merged(
-            "aaa",
-            &heads(&["bbb"]),
+            &pull_requests,
             DefaultBranch::DoesNotContain,
             |head| head == "bbb",
         );
 
-        assert!(merged);
-    }
-
-    #[test]
-    fn a_pull_request_that_does_not_contain_the_local_commit_is_not_merged() {
-        let merged = is_merged(
-            "aaa",
-            &heads(&["bbb"]),
-            DefaultBranch::DoesNotContain,
-            |_| false,
+        assert_eq!(
+            finished.map(|pull_request| pull_request.state),
+            Some(CLOSED)
         );
-
-        assert!(!merged);
     }
 
     #[test]
-    fn github_is_not_asked_if_the_default_branch_is_not_known() {
-        assert!(!is_merged(
-            "aaa",
-            &heads(&["bbb"]),
-            DefaultBranch::Unknown,
-            never
-        ));
+    fn an_open_pull_request_keeps_the_worktree() {
+        let pull_requests = [pull_request(1, MERGED, "aaa"), pull_request(2, OPEN, "ccc")];
+
+        let finished =
+            finished_pull_request("aaa", &pull_requests, DefaultBranch::DoesNotContain, never);
+
+        assert_eq!(finished, None);
     }
 
-    fn merged_worktree() -> MergedWorktree {
-        MergedWorktree {
+    #[test]
+    fn a_local_commit_in_the_default_branch_keeps_the_worktree() {
+        // A new worktree on the name of a branch that a fast-forward merged.
+        let pull_requests = [pull_request(1, MERGED, "aaa")];
+
+        let finished = finished_pull_request("aaa", &pull_requests, DefaultBranch::Contains, never);
+
+        assert_eq!(finished, None);
+    }
+
+    #[test]
+    fn a_pull_request_that_does_not_contain_the_local_commit_keeps_the_worktree() {
+        let pull_requests = [pull_request(1, CLOSED, "bbb")];
+
+        let finished =
+            finished_pull_request("aaa", &pull_requests, DefaultBranch::DoesNotContain, |_| {
+                false
+            });
+
+        assert_eq!(finished, None);
+    }
+
+    #[test]
+    fn an_unknown_default_branch_accepts_only_the_same_commit() {
+        let same = [pull_request(1, MERGED, "aaa")];
+        let other = [pull_request(2, MERGED, "bbb")];
+
+        assert!(finished_pull_request("aaa", &same, DefaultBranch::Unknown, never).is_some());
+        assert!(finished_pull_request("aaa", &other, DefaultBranch::Unknown, never).is_none());
+    }
+
+    #[test]
+    fn a_branch_without_pull_request_is_not_finished() {
+        assert_eq!(
+            finished_pull_request("aaa", &[], DefaultBranch::DoesNotContain, never),
+            None
+        );
+    }
+
+    fn finished_worktree() -> FinishedWorktree {
+        FinishedWorktree {
             path: PathBuf::from("/work/repo.feature"),
             branch: "feature".to_owned(),
             commit: "aaa".to_owned(),
+            pull_request: pull_request(1, MERGED, "aaa"),
         }
     }
 
     #[test]
-    fn a_branch_with_the_merged_commit_is_unchanged() {
-        assert!(merged_worktree().is_unchanged(Some("aaa")));
+    fn a_branch_with_the_checked_commit_is_unchanged() {
+        assert!(finished_worktree().is_unchanged(Some("aaa")));
     }
 
     #[test]
     fn a_branch_with_a_new_commit_is_changed() {
-        assert!(!merged_worktree().is_unchanged(Some("bbb")));
+        assert!(!finished_worktree().is_unchanged(Some("bbb")));
     }
 
     #[test]
     fn a_deleted_branch_is_changed() {
-        assert!(!merged_worktree().is_unchanged(None));
-    }
-
-    #[test]
-    fn a_branch_without_merged_pull_request_is_not_merged() {
-        assert!(!is_merged("aaa", &[], DefaultBranch::DoesNotContain, never));
+        assert!(!finished_worktree().is_unchanged(None));
     }
 }

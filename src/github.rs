@@ -1,8 +1,10 @@
-//! The calls to GitHub, with the gh CLI. Only the removal of the merged
+//! The calls to GitHub, with the gh CLI. Only the removal of the finished
 //! worktrees (`prune_merged`) uses them.
 
 use std::process::Command;
 use std::time::Duration;
+
+use serde::Deserialize;
 
 use crate::herdr::Error;
 use crate::process;
@@ -68,9 +70,28 @@ fn run(arguments: &[&str]) -> Result<String, Error> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Return the last commit of each merged pull request of `branch`. The
-/// list is empty if the branch has no merged pull request.
-pub fn merged_heads(repository: &str, branch: &str) -> Result<Vec<String>, Error> {
+/// The state of a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PullRequestState {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// A pull request of a branch.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub state: PullRequestState,
+    /// The last commit of the pull request.
+    #[serde(rename = "headRefOid")]
+    pub head: String,
+}
+
+/// Return the pull requests of `branch` of the repository itself, in all
+/// the states. The list is empty if the branch has no pull request.
+pub fn pull_requests(repository: &str, branch: &str) -> Result<Vec<PullRequest>, Error> {
     let text = run(&[
         "pr",
         "list",
@@ -79,17 +100,31 @@ pub fn merged_heads(repository: &str, branch: &str) -> Result<Vec<String>, Error
         "--head",
         branch,
         "--state",
-        "merged",
+        "all",
+        "--limit",
+        "50",
         "--json",
-        "headRefOid",
-        "--jq",
-        ".[].headRefOid",
+        "number,state,headRefOid,isCrossRepository",
     ])?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
+    parse_pull_requests(&text)
+}
+
+/// Read the JSON of `gh pr list`. `--head` gives also the pull requests of
+/// a fork with a branch of the same name: the function ignores them.
+fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
+    #[derive(Deserialize)]
+    struct Listed {
+        #[serde(flatten)]
+        pull_request: PullRequest,
+        #[serde(rename = "isCrossRepository", default)]
+        is_cross_repository: bool,
+    }
+    let listed: Vec<Listed> = serde_json::from_str(text)
+        .map_err(|error| Error::Command(format!("gh pr list: invalid JSON: {error}")))?;
+    Ok(listed
+        .into_iter()
+        .filter(|listed| !listed.is_cross_repository)
+        .map(|listed| listed.pull_request)
         .collect())
 }
 
@@ -107,6 +142,29 @@ pub fn contains(repository: &str, head: &str, commit: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_json_of_gh_gives_the_pull_requests() {
+        let text = r#"[{"headRefOid":"3541f65","number":4,"state":"MERGED","isCrossRepository":false},
+            {"headRefOid":"aaa","number":7,"state":"OPEN","isCrossRepository":false},
+            {"headRefOid":"fff","number":8,"state":"OPEN","isCrossRepository":true},
+            {"headRefOid":"bbb","number":9,"state":"CLOSED","isCrossRepository":false}]"#;
+
+        let pull_requests = parse_pull_requests(text).unwrap();
+
+        assert_eq!(
+            pull_requests
+                .iter()
+                .map(|pull_request| (pull_request.number, pull_request.state))
+                .collect::<Vec<_>>(),
+            [
+                (4, PullRequestState::Merged),
+                (7, PullRequestState::Open),
+                (9, PullRequestState::Closed)
+            ]
+        );
+        assert_eq!(pull_requests[0].head, "3541f65");
+    }
 
     #[test]
     fn the_forms_of_a_github_url_give_the_repository() {

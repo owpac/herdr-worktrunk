@@ -40,13 +40,28 @@ impl std::error::Error for Error {}
 pub struct Pane {
     pub pane_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub tab_id: String,
     /// The kind of the agent in the pane (claude, codex...), if any.
     pub agent: Option<String>,
+    /// The state of the agent: idle, working, blocked, done or unknown.
+    #[serde(default)]
+    pub agent_status: Option<String>,
+    /// The session of the agent, to resume its conversation.
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
     pub cwd: Option<PathBuf>,
     /// The folder of the foreground process: the agent, else the shell.
     pub foreground_cwd: Option<PathBuf>,
     #[serde(default)]
     pub focused: bool,
+}
+
+/// The session of an agent, as herdr gives it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AgentSession {
+    /// The session ID of the agent.
+    pub value: String,
 }
 
 impl Pane {
@@ -233,16 +248,35 @@ pub fn workspace_has_agent(workspace_id: &str) -> Result<bool, Error> {
 }
 
 /// Return the workspace that herdr opened for the checkout `checkout`.
+/// The paths are compared in their canonical form.
 pub fn workspace_of_checkout(checkout: &Path) -> Result<Option<String>, Error> {
     let checkout_text = checkout.to_string_lossy();
     let result = run(&["worktree", "list", "--cwd", &checkout_text])?;
+    let wanted = crate::git::canonical(checkout);
     let worktrees = result["worktrees"].as_array().cloned().unwrap_or_default();
     let workspace_id = worktrees
         .iter()
-        .find(|worktree| worktree["path"].as_str() == Some(checkout_text.as_ref()))
+        .find(|worktree| {
+            worktree["path"]
+                .as_str()
+                .is_some_and(|path| crate::git::canonical(Path::new(path)) == wanted)
+        })
         .and_then(|worktree| worktree["open_workspace_id"].as_str())
         .map(str::to_owned);
     Ok(workspace_id)
+}
+
+/// Return true if the folder of an agent is in `checkout`, in any
+/// workspace: a deletion of the checkout removes its folder.
+pub fn agent_in_checkout(checkout: &Path) -> Result<bool, Error> {
+    let snapshot = snapshot()?;
+    let checkout = crate::git::canonical(checkout);
+    Ok(snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.agent.is_some())
+        .filter_map(Pane::folder)
+        .any(|folder| crate::git::canonical(folder).starts_with(&checkout)))
 }
 
 /// Open (or find) the herdr workspace of `checkout`.
@@ -268,6 +302,42 @@ pub fn open_checkout(
         tab_id: string_field(&result, "/tab/tab_id")?,
         root_pane_id: string_field(&result, "/root_pane/pane_id")?,
     })
+}
+
+/// Open a new tab with a shell in `folder`, in an existing workspace,
+/// without the focus.
+pub fn open_shell_tab(workspace_id: &str, folder: &Path) -> Result<(), Error> {
+    let folder_text = folder.to_string_lossy();
+    run(&[
+        "tab",
+        "create",
+        "--workspace",
+        workspace_id,
+        "--cwd",
+        &folder_text,
+        "--no-focus",
+    ])?;
+    Ok(())
+}
+
+/// Return true if the shell of `pane_id` waits at its prompt: no command
+/// runs in it. The shell is then the foreground process group of the
+/// terminal.
+pub fn shell_is_idle(pane_id: &str) -> Result<bool, Error> {
+    let result = run(&["pane", "process-info", "--pane", pane_id])?;
+    Ok(is_idle_shell(&result["process_info"]))
+}
+
+/// Read the process info of a pane: the foreground process group is the
+/// shell. Without the 2 values, the shell is not idle.
+fn is_idle_shell(process_info: &serde_json::Value) -> bool {
+    match (
+        process_info["foreground_process_group_id"].as_u64(),
+        process_info["shell_pid"].as_u64(),
+    ) {
+        (Some(group), Some(shell)) => group == shell,
+        _ => false,
+    }
 }
 
 /// Move a pane to a new tab of an existing workspace.
@@ -356,6 +426,16 @@ pub fn notify(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shell_is_idle_only_if_it_is_the_foreground_group() {
+        let idle = serde_json::json!({"foreground_process_group_id": 45127, "shell_pid": 45127});
+        let busy = serde_json::json!({"foreground_process_group_id": 45402, "shell_pid": 45127});
+
+        assert!(is_idle_shell(&idle));
+        assert!(!is_idle_shell(&busy));
+        assert!(!is_idle_shell(&serde_json::json!({})));
+    }
 
     #[test]
     fn error_of_reads_the_json_error_of_herdr() {

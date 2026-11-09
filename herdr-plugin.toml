@@ -14,7 +14,7 @@ command = ["sh", "scripts/install.sh"]
 
 # The observer: it moves the pane of an agent to the workspace of its worktree, and closes the
 # workspace of a removed worktree. With `prune_merged = true`, it also removes the worktree of
-# each merged pull request. `observe = false` in config.toml stops it. config.toml is also read by
+# each merged or closed pull request. `observe = false` in config.toml stops it. config.toml is also read by
 # the agents (agent_mode): see the README.
 # `observe` starts the observer in the background and returns. herdr runs [[startup]] when the
 # server starts, but not when the plugin is installed or linked: the event pane.agent_detected
@@ -49,6 +49,13 @@ description = "Merge the worktree of the focused workspace into the default bran
 contexts = ["global"]
 command = ["bin/herdr-worktrunk", "open", "merger"]
 
+[[actions]]
+id = "clean"
+title = "Worktree: clean the old worktrees"
+description = "List the worktrees without pull request and without change for some days, in all the repositories of the workspaces: Enter deletes one, ctrl-a deletes all"
+contexts = ["global"]
+command = ["bin/herdr-worktrunk", "open", "cleaner"]
+
 # herdr starts a plugin pane in the folder of the workspace (--cwd). As for an action, herdr finds
 # bin/herdr-worktrunk in the plugin root.
 [[panes]]
@@ -58,6 +65,16 @@ placement = "popup"
 width = "90%"
 height = "80%"
 command = ["bin/herdr-worktrunk", "pick"]
+
+# The list of the old worktrees without pull request: the action clean, or the daily pass of the
+# observer (stale_days). A deletion goes through the popup confirm, then the list comes back.
+[[panes]]
+id = "cleaner"
+title = "Worktrunk: clean"
+placement = "popup"
+width = "90%"
+height = "80%"
+command = ["bin/herdr-worktrunk", "cleaner"]
 
 # The question before a deletion or a merge. herdr shows one popup at a time: the picker closes,
 # this popup asks, then the picker comes back.

@@ -70,14 +70,16 @@ pub fn remove_quietly(main_checkout: &Path, checkout: &Path) -> Result<(), Error
     remove_without_terminal(main_checkout, checkout, &[])
 }
 
-/// Remove the worktree `checkout` of a merged pull request, and its
+/// Remove the worktree `checkout` of a finished pull request, and its
 /// branch, without output on the terminal.
 ///
-/// GitHub merged the local commit of the branch, so the default branch
-/// has its work. git does not always see it after a squash merge:
-/// `--force-delete` deletes the branch in this case too. wt refuses a
-/// worktree with changes that are not committed.
-pub fn remove_merged(main_checkout: &Path, checkout: &Path) -> Result<(), Error> {
+/// The pull request contains the local commit of the branch, so GitHub
+/// keeps its work: in the default branch after a merge, in
+/// `refs/pull/<number>/head` after a close. git does not see the work in
+/// the default branch after a squash merge or a close: `--force-delete`
+/// deletes the branch in these cases too. wt refuses a worktree with
+/// changes that are not committed.
+pub fn remove_finished(main_checkout: &Path, checkout: &Path) -> Result<(), Error> {
     remove_without_terminal(main_checkout, checkout, &["--force-delete"])
 }
 
