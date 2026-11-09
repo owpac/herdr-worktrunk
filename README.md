@@ -129,7 +129,7 @@ bin/herdr-worktrunk clean [<folder of a repository>]
 bin/herdr-worktrunk list-stale <folder of the repository>
 ```
 
-The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh. It does the local checks first, then calls gh only for the old worktrees, with one thread for each repository. The header of the list gives the repositories that it could not check.
+The cleaner checks only the repositories with a remote `origin` on GitHub: the criterion "no pull request" needs gh. At each pass (every 5 minutes), the observer writes the worktrees without pull request of each repository in `no-pull-request.tsv`, in its state folder. The popup reads this file if it is younger than 15 minutes: for these repositories, it does the local checks only, without gh. For the other repositories, it does the local checks first, then calls gh only for the old worktrees, with one thread for each repository. The header of the list gives the repositories that it could not check. A pull request that is younger than the file does not remove its worktree from the list: the deletion keeps its branch.
 
 Limits:
 

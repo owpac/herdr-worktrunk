@@ -500,7 +500,7 @@ fn delete_all() -> Result<(), Error> {
 /// after a question). Else the popup looks for the old worktrees of
 /// `TRUNK_CLEANER_SCOPE`, or of all the repositories of the herdr
 /// workspaces.
-pub fn cleaner(stale_days: u32) -> Result<(), Error> {
+pub fn cleaner(stale_days: u32, state_dir: &Path) -> Result<(), Error> {
     let folder = popup_folder()?;
     let given_list = env::var_os(LIST_VARIABLE)
         .map(PathBuf::from)
@@ -514,7 +514,14 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
         None => {
             ui::show_progress("Clean the worktrees", "Looking for old worktrees…");
             let scope = env::var_os(SCOPE_VARIABLE).map(PathBuf::from);
-            let search = cleaner::find_old_worktrees(scope.as_deref(), stale_days)?;
+            // The worktrees without pull request of the last pass of the
+            // observer: no call to GitHub for these repositories.
+            let known = stale::read_no_pull_request(
+                state_dir,
+                stale::now(),
+                stale::NO_PULL_REQUEST_MAX_AGE,
+            );
+            let search = cleaner::find_old_worktrees(scope.as_deref(), stale_days, known.as_ref())?;
             let path = env::temp_dir().join(format!(
                 "herdr-worktrunk-cleaner-{}.tsv",
                 std::process::id()

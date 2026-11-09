@@ -6,7 +6,7 @@
 //! workspaces. The daily pass of the observer (`stale_days`) opens it with
 //! its own list.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
-use crate::git::{self, canonical};
+use crate::git::{self, canonical, LinkedWorktree};
 use crate::herdr::{self, Error};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
@@ -74,7 +74,15 @@ pub struct Search {
 
 /// Find the old worktrees of `scope` (one repository), or of all the
 /// repositories of the herdr workspaces.
-pub fn find_old_worktrees(scope: Option<&Path>, stale_days: u32) -> Result<Search, Error> {
+///
+/// `known` gives the worktrees without pull request that the observer
+/// found at its last pass (`no-pull-request.tsv`). For these
+/// repositories, the search does the local checks only, without GitHub.
+pub fn find_old_worktrees(
+    scope: Option<&Path>,
+    stale_days: u32,
+    known: Option<&HashMap<PathBuf, Vec<LinkedWorktree>>>,
+) -> Result<Search, Error> {
     let (mut repositories, busy) = herdr_repositories()?;
     if let Some(scope) = scope {
         let main = git::checkout_of(scope)
@@ -92,7 +100,16 @@ pub fn find_old_worktrees(scope: Option<&Path>, stale_days: u32) -> Result<Searc
             .into_iter()
             .map(|repository| {
                 scope.spawn(move || {
-                    let found = old_worktrees_of(&repository, is_busy, stale_days);
+                    let found = match known.and_then(|known| known.get(&repository)) {
+                        Some(worktrees) => Ok(stale::select_old(
+                            &repository,
+                            worktrees.clone(),
+                            is_busy,
+                            None,
+                            stale_days,
+                        )),
+                        None => old_worktrees_of(&repository, is_busy, stale_days),
+                    };
                     (repository, found)
                 })
             })
@@ -117,7 +134,9 @@ pub fn find_old_worktrees(scope: Option<&Path>, stale_days: u32) -> Result<Searc
             }
         }
     }
-    search.old.sort_by_key(|worktree| std::cmp::Reverse(worktree.days));
+    search
+        .old
+        .sort_by_key(|worktree| std::cmp::Reverse(worktree.days));
     Ok(search)
 }
 

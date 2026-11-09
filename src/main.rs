@@ -45,6 +45,14 @@ fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
     folder
 }
 
+/// The state folder of the plugin: the observer writes its files there.
+fn state_dir() -> PathBuf {
+    herdr_folder(
+        "HERDR_PLUGIN_STATE_DIR",
+        &[".local", "state", "herdr", "plugins", herdr::PLUGIN_ID],
+    )
+}
+
 /// The config of the plugin, from the config folder that herdr gives.
 fn load_config() -> config::Config {
     let config_dir = herdr_folder(
@@ -68,10 +76,7 @@ fn observe(is_observer: bool) -> Result<(), Error> {
     if !config.observe {
         return Ok(());
     }
-    let state_dir = herdr_folder(
-        "HERDR_PLUGIN_STATE_DIR",
-        &[".local", "state", "herdr", "plugins", herdr::PLUGIN_ID],
-    );
+    let state_dir = state_dir();
     if is_observer {
         observer::run(&state_dir, config.prune_merged, config.stale_days)
     } else {
@@ -189,7 +194,10 @@ fn main() -> ExitCode {
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
-        ["cleaner"] => (actions::cleaner(stale_days_or_default()), Some("cleaner")),
+        ["cleaner"] => (
+            actions::cleaner(stale_days_or_default(), &state_dir()),
+            Some("cleaner"),
+        ),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
