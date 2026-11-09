@@ -283,6 +283,23 @@ fn refuse_if_agent(workspace_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// The reason to keep a worktree: an agent works in its folder, from any
+/// workspace, or in its workspace. None if no agent uses it.
+fn agent_reason(
+    checkout: &Path,
+    workspace_id: Option<&str>,
+) -> Result<Option<&'static str>, Error> {
+    if herdr::agent_in_checkout(checkout)? {
+        return Ok(Some("an agent works in its folder"));
+    }
+    if let Some(workspace_id) = workspace_id {
+        if herdr::workspace_has_agent(workspace_id)? {
+            return Ok(Some("an agent works in its workspace"));
+        }
+    }
+    Ok(None)
+}
+
 /// Popup confirm: ask before a deletion or a merge, then do it. If the
 /// picker opened this popup, the picker comes back after.
 pub fn confirm() -> Result<(), Error> {
@@ -361,6 +378,12 @@ fn ask_and_run() -> Result<(), Error> {
     if let Some(workspace_id) = &workspace_id {
         refuse_if_agent(workspace_id)?;
     }
+    if herdr::agent_in_checkout(&checkout.root)? {
+        return Err(Error::Command(
+            "An agent works in the folder of this worktree. Stop the agent first: the deletion removes its folder."
+                .to_owned(),
+        ));
+    }
     let (branch, folder_name) = describe(&checkout);
     if operation == MERGE {
         let question = format!(
@@ -429,10 +452,23 @@ fn delete_all() -> Result<(), Error> {
             "Clean the worktrees",
             &format!("Deleting the worktree of {}…", worktree.branch),
         );
-        let workspace_id = herdr::workspace_of_checkout(&worktree.path)?;
-        if let Some(workspace_id) = &workspace_id {
-            if herdr::workspace_has_agent(workspace_id)? {
-                kept.push(format!("{}: an agent works in it", worktree.branch));
+        // An error keeps this worktree, and the loop goes on: the summary
+        // tells what happened to each worktree.
+        let workspace_id = match herdr::workspace_of_checkout(&worktree.path) {
+            Ok(workspace_id) => workspace_id,
+            Err(error) => {
+                kept.push(format!("{}: herdr failed: {error}", worktree.branch));
+                continue;
+            }
+        };
+        match agent_reason(&worktree.path, workspace_id.as_deref()) {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                kept.push(format!("{}: {reason}", worktree.branch));
+                continue;
+            }
+            Err(error) => {
+                kept.push(format!("{}: herdr failed: {error}", worktree.branch));
                 continue;
             }
         }
@@ -470,39 +506,43 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
         .map(PathBuf::from)
         .filter(|path| path.is_file());
     let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
-    let (list_path, old) = match given_list {
+    let (list_path, old, failures) = match given_list {
         Some(path) => {
             let old = stale::read_list(&path);
-            (path, old)
+            (path, old, Vec::new())
         }
         None => {
             ui::show_progress("Clean the worktrees", "Looking for old worktrees…");
             let scope = env::var_os(SCOPE_VARIABLE).map(PathBuf::from);
-            let old = cleaner::find_old_worktrees(scope.as_deref(), stale_days)?;
+            let search = cleaner::find_old_worktrees(scope.as_deref(), stale_days)?;
             let path = env::temp_dir().join(format!(
                 "herdr-worktrunk-cleaner-{}.tsv",
                 std::process::id()
             ));
-            stale::write_list(&path, &old)
+            stale::write_list(&path, &search.old)
                 .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
-            (path, old)
+            (path, search.old, search.failures)
         }
     };
+    // The repositories that the search could not check: the list does not
+    // show their worktrees.
+    let warning = (!failures.is_empty()).then(|| format!("Not checked: {}", failures.join(" · ")));
     if old.is_empty() {
         let _ = std::fs::remove_file(&list_path);
         if !is_return {
-            ui::show_message(
-                "Clean the worktrees",
-                &format!(
-                    "No old worktree to clean: no worktree without pull request and without change for {stale_days} days."
-                ),
+            let mut message = format!(
+                "No old worktree to clean: no worktree without pull request and without change for {stale_days} days."
             );
+            if let Some(warning) = &warning {
+                message.push_str(&format!("\n{warning}"));
+            }
+            ui::show_message("Clean the worktrees", &message);
         }
         return Ok(());
     }
     let list_text = list_path.to_string_lossy();
     let folder_text = folder.to_string_lossy();
-    match cleaner::choose(&old, &list_path)? {
+    match cleaner::choose(&old, &list_path, warning.as_deref())? {
         None => {
             let _ = std::fs::remove_file(&list_path);
             Ok(())

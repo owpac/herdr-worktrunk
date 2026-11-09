@@ -114,23 +114,15 @@ fn stale_days_or_default() -> u32 {
 /// ignores the last questions.
 fn list_stale(folder: &Path) -> Result<(), Error> {
     let main_checkout = main_checkout_of(folder)?;
-    let stale_days = match load_config().stale_days {
-        0 => DEFAULT_STALE_DAYS,
-        days => days,
-    };
-    let now = stale::now();
-    for worktree in prune::check_worktrees(&main_checkout, |_| false)?.without_pull_request {
-        let Some(activity) = git::last_activity(&worktree.path) else {
-            continue;
-        };
-        if stale::is_stale(activity, now, stale_days) && git::is_clean(&worktree.path) {
-            println!(
-                "{} ({}, no change for {} days)",
-                worktree.path.display(),
-                worktree.branch,
-                now.saturating_sub(activity) / stale::DAY
-            );
-        }
+    let stale_days = stale_days_or_default();
+    let worktrees = prune::check_worktrees(&main_checkout, |_| false)?.without_pull_request;
+    for worktree in stale::select_old(&main_checkout, worktrees, |_| false, None, stale_days) {
+        println!(
+            "{} ({}, no change for {} days)",
+            worktree.path.display(),
+            worktree.branch,
+            worktree.days
+        );
     }
     Ok(())
 }

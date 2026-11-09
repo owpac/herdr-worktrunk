@@ -161,6 +161,9 @@ struct Observer {
     /// The time when the observer first saw each workspace that appeared
     /// after its start.
     first_seen: HashMap<String, Instant>,
+    /// The workspaces that the observer saw, also those whose checkout
+    /// it could not read.
+    seen: HashSet<String>,
     /// The observer read its first snapshot.
     is_started: bool,
 }
@@ -222,6 +225,29 @@ fn fresh_shell(age: Option<Duration>, workspace_id: &str, panes: &[Pane]) -> Opt
     })
 }
 
+/// Record in `panes` that `pane_id` is now in `workspace_id`.
+fn set_workspace(panes: &mut [Pane], pane_id: &str, workspace_id: &str) {
+    for pane in panes.iter_mut().filter(|pane| pane.pane_id == pane_id) {
+        pane.workspace_id = workspace_id.to_owned();
+    }
+}
+
+/// The shell that the observer opened in `workspace_id`, for the copy of
+/// the panes of a snapshot. Its ID is not a herdr ID: no change uses it.
+fn opened_shell(workspace_id: &str, folder: &Path) -> Pane {
+    Pane {
+        pane_id: format!("opened-shell-{workspace_id}"),
+        workspace_id: workspace_id.to_owned(),
+        tab_id: String::new(),
+        agent: None,
+        agent_status: None,
+        agent_session: None,
+        cwd: Some(folder.to_path_buf()),
+        foreground_cwd: None,
+        focused: false,
+    }
+}
+
 /// What the thread of the merged pull requests reads from the observer.
 /// The observer writes it at each snapshot. The paths are not canonical:
 /// the thread makes them canonical, so the loop of the snapshots stays
@@ -248,6 +274,9 @@ struct ViewAgent {
     workspace_root: Option<PathBuf>,
     /// The workspace of the agent has the focus.
     is_workspace_focused: bool,
+    /// The workspace of the agent shows a main checkout. If the pane of
+    /// the agent is its last pane, a close empties it, and herdr closes it.
+    is_in_main_workspace: bool,
 }
 
 impl ViewAgent {
@@ -255,7 +284,7 @@ impl ViewAgent {
     fn works_in(&self, checkout: &Path) -> bool {
         self.folder_root
             .as_deref()
-            .is_some_and(|root| canonical(root) == canonical(checkout))
+            .is_some_and(|root| git::canonical(root) == git::canonical(checkout))
     }
 
     /// Return true if the folder or the workspace of the agent is in
@@ -265,7 +294,7 @@ impl ViewAgent {
             || self
                 .workspace_root
                 .as_deref()
-                .is_some_and(|root| canonical(root) == canonical(checkout))
+                .is_some_and(|root| git::canonical(root) == git::canonical(checkout))
     }
 }
 
@@ -289,8 +318,9 @@ enum AgentDecision {
     /// worktree: close their panes, then remove the worktree. The
     /// conversations stay on the disk.
     CloseThenRemove,
-    /// An agent works, waits for an answer, has the focus, or works in
-    /// another folder: keep the worktree until the next pass.
+    /// An agent works, waits for an answer, has the focus, works in
+    /// another folder, or stays in the workspace of a main checkout: keep
+    /// the worktree until the next pass.
     Wait,
 }
 
@@ -306,6 +336,7 @@ fn agent_decision(agents: &[ViewAgent], checkout: &Path) -> AgentDecision {
     let may_close = |agent: &ViewAgent| {
         matches!(agent.status.as_deref(), Some("idle" | "done"))
             && !agent.is_workspace_focused
+            && !agent.is_in_main_workspace
             && agent.works_in(checkout)
     };
     if agents.iter().all(may_close) {
@@ -330,13 +361,6 @@ fn lock(view: &Mutex<PruneView>) -> MutexGuard<'_, PruneView> {
     view.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The canonical path of a folder, or the path itself if the folder does
-/// not exist. git and herdr can give 2 forms of the same folder, for
-/// example `/tmp` and `/private/tmp` on macOS.
-fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 /// The agents for the view: each agent with the checkout of its folder
 /// and the checkout of its workspace.
 fn view_agents(
@@ -356,6 +380,9 @@ fn view_agents(
                 .get(&pane.workspace_id)
                 .and_then(|first| first.root.clone()),
             is_workspace_focused: focused_workspaces.contains(&pane.workspace_id),
+            is_in_main_workspace: workspaces
+                .get(&pane.workspace_id)
+                .is_some_and(|first| first.root.is_some() && !first.is_linked_worktree),
         })
         .collect()
 }
@@ -393,15 +420,18 @@ impl Observer {
             .collect();
         self.workspaces.retain(|id, _| live.contains(id.as_str()));
         self.first_seen.retain(|id, _| live.contains(id.as_str()));
+        self.seen.retain(|id| live.contains(id.as_str()));
         for workspace in &snapshot.workspaces {
-            if self.workspaces.contains_key(&workspace.workspace_id) {
-                continue;
-            }
             // The workspaces of the first snapshot are not new: the user
-            // can use their shells.
-            if self.is_started {
+            // can use their shells. A workspace whose checkout could not be
+            // read keeps its first date.
+            let is_new = self.seen.insert(workspace.workspace_id.clone());
+            if is_new && self.is_started {
                 self.first_seen
                     .insert(workspace.workspace_id.clone(), Instant::now());
+            }
+            if self.workspaces.contains_key(&workspace.workspace_id) {
+                continue;
             }
             let first = match herdr::workspace_checkout(&workspace.workspace_id) {
                 Ok(Some(checkout)) => FirstCheckout {
@@ -479,8 +509,11 @@ impl Observer {
         }
         let (steps, differences) = plan(&agent_panes, &known, &self.differences);
         self.differences = differences;
+        // The changes of this snapshot update this copy: a second move in
+        // the same snapshot sees the first one.
+        let mut panes = snapshot.panes.clone();
         for step in steps {
-            if let Err(error) = self.apply(&step, &agent_panes, snapshot) {
+            if let Err(error) = self.apply(&step, &agent_panes, &mut panes) {
                 self.log.write(&format!("{step:?}: {error}"));
             }
         }
@@ -491,7 +524,7 @@ impl Observer {
         &mut self,
         step: &Step,
         agent_panes: &[AgentPane],
-        snapshot: &Snapshot,
+        panes: &mut Vec<Pane>,
     ) -> Result<(), Error> {
         match step {
             Step::CloseWorkspace { workspace_id } => {
@@ -511,7 +544,7 @@ impl Observer {
                     .find(|pane| &pane.pane_id == pane_id)
                     .map(|pane| pane.workspace_id.clone())
                     .unwrap_or_default();
-                self.move_pane(pane_id, &source_workspace, checkout, *focus, snapshot)?;
+                self.move_pane(pane_id, &source_workspace, checkout, *focus, panes)?;
                 self.differences.remove(pane_id);
                 Ok(())
             }
@@ -525,18 +558,22 @@ impl Observer {
     /// `fresh_shell`). Else, herdr opens the workspace, and the pane
     /// replaces its first shell. herdr closes the old workspace if the
     /// pane was its last pane.
+    ///
+    /// `panes` is the copy of the panes of the snapshot: each change of
+    /// this function updates it.
     fn move_pane(
         &mut self,
         pane_id: &str,
         source_workspace: &str,
         checkout: &Checkout,
         focus: bool,
-        snapshot: &Snapshot,
+        panes: &mut Vec<Pane>,
     ) -> Result<(), Error> {
         let source_first = self.workspaces.get(source_workspace);
-        if empties_main_workspace(source_first, source_workspace, pane_id, &snapshot.panes) {
+        if empties_main_workspace(source_first, source_workspace, pane_id, panes) {
             if let Some(root) = source_first.and_then(|first| first.root.clone()) {
                 herdr::open_shell_tab(source_workspace, &root)?;
+                panes.push(opened_shell(source_workspace, &root));
                 self.log.write(&format!(
                     "opened a shell in the workspace {source_workspace}: it keeps the group of its project"
                 ));
@@ -551,15 +588,20 @@ impl Observer {
             .map(|(id, _)| id.clone());
         if let Some(workspace_id) = existing {
             let age = self.first_seen.get(&workspace_id).map(Instant::elapsed);
-            if let Some(shell) = fresh_shell(age, &workspace_id, &snapshot.panes) {
+            let shell = fresh_shell(age, &workspace_id, panes)
+                .filter(|shell| herdr::shell_is_idle(&shell.pane_id).unwrap_or(false));
+            if let Some(shell) = shell {
                 herdr::move_pane_next_to(pane_id, &shell.tab_id, &shell.pane_id, focus)?;
+                set_workspace(panes, pane_id, &workspace_id);
                 herdr::close_pane(&shell.pane_id)?;
+                panes.retain(|pane| pane.pane_id != shell.pane_id);
                 self.log.write(&format!(
                     "moved {pane_id} to the workspace {workspace_id}, in place of its new shell"
                 ));
                 return Ok(());
             }
             herdr::move_pane_to_new_tab(pane_id, &workspace_id, focus)?;
+            set_workspace(panes, pane_id, &workspace_id);
             self.log
                 .write(&format!("moved {pane_id} to the workspace {workspace_id}"));
             return Ok(());
@@ -577,6 +619,7 @@ impl Observer {
         } else {
             herdr::move_pane_to_new_tab(pane_id, &opened.workspace_id, focus)?;
         }
+        set_workspace(panes, pane_id, &opened.workspace_id);
         self.remember(&opened.workspace_id, checkout);
         self.log.write(&format!(
             "moved {pane_id} to the workspace {} of {}",
@@ -688,7 +731,7 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
         let repositories: Vec<PathBuf> = lock(view).repositories.iter().cloned().collect();
         let repositories: HashSet<PathBuf> = repositories
             .iter()
-            .map(|repository| canonical(repository))
+            .map(|repository| git::canonical(repository))
             .collect();
         let is_stale_pass = settings.stale_days > 0
             && stale::is_pass_due(stale::read_last_pass(&settings.state_dir), stale::now());
@@ -961,7 +1004,7 @@ pub fn start(state_dir: &Path) -> Result<(), Error> {
     let lock = open_lock(state_dir)?;
     let executable = env::current_exe()
         .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
-    let written = write_wanted_binary(state_dir, &canonical(&executable));
+    let written = write_wanted_binary(state_dir, &git::canonical(&executable));
     if lock.try_lock().is_err() {
         // An observer runs: only the file can give it this binary.
         return written;
@@ -983,6 +1026,26 @@ pub fn start(state_dir: &Path) -> Result<(), Error> {
 /// The modification time of a file, or None if the file does not exist.
 fn modification_time(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok()?.modified().ok()
+}
+
+/// The time without change after which a rebuilt binary is complete. A
+/// copy or a link can write the binary for a moment: an `exec` of a
+/// partial file stops the observer.
+const REBUILD_SETTLE_TIME: Duration = Duration::from_secs(2);
+
+/// Return true if the binary changed since `start_time`, and did not
+/// change for `REBUILD_SETTLE_TIME` before `now`.
+fn is_settled_rebuild(
+    time: Option<SystemTime>,
+    start_time: Option<SystemTime>,
+    now: SystemTime,
+) -> bool {
+    time.is_some_and(|time| {
+        Some(time) != start_time
+            && now
+                .duration_since(time)
+                .is_ok_and(|age| age >= REBUILD_SETTLE_TIME)
+    })
 }
 
 /// What the observer knows about its binary, to run a new binary.
@@ -1014,10 +1077,13 @@ impl BinaryWatch {
     /// observer.
     fn binary_to_run(&self, state_dir: &Path) -> Option<PathBuf> {
         let wanted = read_wanted_binary(state_dir)
-            .map(|path| canonical(&path))
+            .map(|path| git::canonical(&path))
             .filter(|path| path.is_file() && self.refused.as_ref() != Some(path));
-        let is_rebuilt =
-            modification_time(&self.current).is_some_and(|time| Some(time) != self.time);
+        let is_rebuilt = is_settled_rebuild(
+            modification_time(&self.current),
+            self.time,
+            SystemTime::now(),
+        );
         binary_to_run(&self.current, wanted.as_deref(), is_rebuilt)
     }
 
@@ -1052,6 +1118,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
         differences: HashSet::new(),
         prune_view: prune_view.clone(),
         first_seen: HashMap::new(),
+        seen: HashSet::new(),
         is_started: false,
     };
     observer.log.write("observer started");
@@ -1067,7 +1134,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
         start_prune_thread(view, log, settings);
     }
     let mut binary_watch = match env::current_exe() {
-        Ok(binary) => Some(BinaryWatch::new(canonical(&binary))),
+        Ok(binary) => Some(BinaryWatch::new(git::canonical(&binary))),
         Err(error) => {
             observer
                 .log
@@ -1280,6 +1347,7 @@ mod tests {
             folder_root: Some(PathBuf::from(FEATURE)),
             workspace_root: Some(PathBuf::from(FEATURE)),
             is_workspace_focused,
+            is_in_main_workspace: false,
         }
     }
 
@@ -1306,6 +1374,72 @@ mod tests {
 
             assert_eq!(decide(&agents), AgentDecision::Wait, "{status}");
         }
+    }
+
+    #[test]
+    fn an_idle_agent_in_a_main_workspace_keeps_the_worktree() {
+        let agent = ViewAgent {
+            is_in_main_workspace: true,
+            ..view_agent("idle", false)
+        };
+
+        assert_eq!(decide(&[agent]), AgentDecision::Wait);
+    }
+
+    #[test]
+    fn a_rebuilt_binary_runs_only_after_2_seconds_without_change() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let rebuilt = start + Duration::from_secs(50);
+
+        assert!(!is_settled_rebuild(
+            Some(start),
+            Some(start),
+            rebuilt + Duration::from_secs(9)
+        ));
+        assert!(!is_settled_rebuild(
+            Some(rebuilt),
+            Some(start),
+            rebuilt + Duration::from_secs(1)
+        ));
+        assert!(is_settled_rebuild(
+            Some(rebuilt),
+            Some(start),
+            rebuilt + Duration::from_secs(2)
+        ));
+        assert!(!is_settled_rebuild(None, Some(start), rebuilt));
+    }
+
+    #[test]
+    fn a_second_move_sees_the_first_one() {
+        let first = FirstCheckout {
+            root: Some(PathBuf::from("/work/repo")),
+            common_dir: None,
+            is_linked_worktree: false,
+        };
+        let mut panes = vec![
+            pane("w1:p1", "w1", Some("claude")),
+            pane("w1:p2", "w1", Some("claude")),
+        ];
+
+        assert!(!empties_main_workspace(Some(&first), "w1", "w1:p1", &panes));
+        set_workspace(&mut panes, "w1:p1", "w2");
+        assert!(empties_main_workspace(Some(&first), "w1", "w1:p2", &panes));
+        panes.push(opened_shell("w1", Path::new("/work/repo")));
+        assert!(!empties_main_workspace(Some(&first), "w1", "w1:p2", &panes));
+    }
+
+    #[test]
+    fn a_workspace_that_got_an_agent_has_no_fresh_shell() {
+        let mut panes = vec![
+            pane("w2:p1", "w2", None),
+            pane("w1:p1", "w1", Some("claude")),
+        ];
+        assert!(fresh_shell(YOUNG, "w2", &panes).is_some());
+
+        set_workspace(&mut panes, "w1:p1", "w2");
+        panes.retain(|pane| pane.pane_id != "w2:p1");
+
+        assert_eq!(fresh_shell(YOUNG, "w2", &panes), None);
     }
 
     #[test]
@@ -1494,9 +1628,9 @@ mod tests {
     #[test]
     fn a_refused_binary_is_not_tried_again() {
         let folder = test_folder("refused");
-        let current = canonical(&folder).join("current");
-        let new = canonical(&folder).join("new");
-        let newer = canonical(&folder).join("newer");
+        let current = git::canonical(&folder).join("current");
+        let new = git::canonical(&folder).join("new");
+        let newer = git::canonical(&folder).join("newer");
         for binary in [&current, &new, &newer] {
             fs::write(binary, "").unwrap();
         }
@@ -1515,15 +1649,17 @@ mod tests {
     #[test]
     fn a_rebuilt_binary_that_exec_refused_waits_for_the_next_rebuild() {
         let folder = test_folder("rebuilt");
-        let current = canonical(&folder).join("current");
+        let current = git::canonical(&folder).join("current");
         fs::write(&current, "").unwrap();
         let mut watch = BinaryWatch::new(current.clone());
-        let later = SystemTime::now() + Duration::from_secs(60);
+        // A rebuild one minute ago: another time than at the start, and
+        // no change for more than REBUILD_SETTLE_TIME.
+        let rebuilt = SystemTime::now() - Duration::from_secs(60);
         File::options()
             .write(true)
             .open(&current)
             .unwrap()
-            .set_modified(later)
+            .set_modified(rebuilt)
             .unwrap();
         assert_eq!(watch.binary_to_run(&folder), Some(current.clone()));
 

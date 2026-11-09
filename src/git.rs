@@ -8,6 +8,13 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::herdr::Error;
 use crate::process;
 
+/// The canonical path of a folder, or the path itself if the folder does
+/// not exist. git and herdr can give 2 forms of the same folder, for
+/// example `/tmp` and `/private/tmp` on macOS.
+pub fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// A git checkout: the main checkout or a linked worktree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkout {

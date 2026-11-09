@@ -117,11 +117,6 @@ pub struct OldWorktree {
     pub days: u64,
 }
 
-/// The canonical path of a folder, or the path itself.
-fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 /// Select the old worktrees among the worktrees without pull request of
 /// the repository of `main_checkout`: no agent (`is_busy`), no activity
 /// for `stale_days` days, and no change that is not committed.
@@ -143,7 +138,7 @@ pub fn select_old(
             if is_busy(&worktree.path) {
                 return None;
             }
-            let path = canonical(&worktree.path);
+            let path = crate::git::canonical(&worktree.path);
             if asked.is_some_and(|asked| !may_ask(asked, &path, now, stale_days)) {
                 return None;
             }

@@ -32,9 +32,9 @@ use crate::git;
 use crate::herdr::Error;
 
 /// fzf exits with 130 when the user cancels.
-const FZF_CANCEL_EXIT_CODE: i32 = 130;
+pub(crate) const FZF_CANCEL_EXIT_CODE: i32 = 130;
 /// fzf exits with 1 when no row matches.
-const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
+pub(crate) const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
 const HEADER: &str =
     "Enter: open or create · ⌫ on an empty filter: delete · Tab: preview · Esc: cancel";
 /// The first line that fzf prints when `⌫` asks for a deletion.
@@ -163,7 +163,7 @@ pub fn rows_for_query(cached_lines: &[String], query: &str) -> Vec<String> {
 }
 
 /// Put `text` in single quotes for the shell that runs the fzf commands.
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
@@ -221,7 +221,7 @@ fn read_tab(cache: &Path) -> usize {
 }
 
 /// The label of the preview: the tabs, with the current tab in brackets.
-fn preview_label(current: usize) -> String {
+pub(crate) fn preview_label(current: usize) -> String {
     let tabs: Vec<String> = PREVIEW_TABS
         .iter()
         .enumerate()

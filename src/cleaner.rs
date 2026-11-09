@@ -13,13 +13,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::git;
+use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
+use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
 use crate::stale::{self, OldWorktree};
 
-const FZF_CANCEL_EXIT_CODE: i32 = 130;
-const FZF_NO_MATCH_EXIT_CODE: i32 = 1;
 const DELETE_ALL_REQUEST: &str = "delete-all";
 const HEADER: &str = "Enter: delete · ctrl-a: delete all · Tab: preview · Esc: quit";
 
@@ -28,11 +27,6 @@ const HEADER: &str = "Enter: delete · ctrl-a: delete all · Tab: preview · Esc
 pub enum Choice {
     Delete(OldWorktree),
     DeleteAll,
-}
-
-/// The canonical path of a folder, or the path itself.
-fn canonical(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The main checkouts of the repositories of the herdr workspaces, and
@@ -68,13 +62,18 @@ fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
     Ok((repositories, busy))
 }
 
+/// The result of a search of the old worktrees.
+#[derive(Debug, Default)]
+pub struct Search {
+    pub old: Vec<OldWorktree>,
+    /// The repositories that the search could not check (gh not
+    /// authenticated, no remote on GitHub...), with the reason.
+    pub failures: Vec<String>,
+}
+
 /// Find the old worktrees of `scope` (one repository), or of all the
-/// repositories of the herdr workspaces. A repository without remote on
-/// GitHub gives no worktree.
-pub fn find_old_worktrees(
-    scope: Option<&Path>,
-    stale_days: u32,
-) -> Result<Vec<OldWorktree>, Error> {
+/// repositories of the herdr workspaces.
+pub fn find_old_worktrees(scope: Option<&Path>, stale_days: u32) -> Result<Search, Error> {
     let (mut repositories, busy) = herdr_repositories()?;
     if let Some(scope) = scope {
         let main = git::checkout_of(scope)
@@ -85,12 +84,22 @@ pub fn find_old_worktrees(
         repositories = vec![main];
     }
     let is_busy = |path: &Path| busy.contains(&canonical(path));
-    let mut old = Vec::new();
+    let mut search = Search::default();
     for repository in repositories {
-        let Ok(check) = prune::check_worktrees(&repository, is_busy) else {
-            continue;
+        let check = match prune::check_worktrees(&repository, is_busy) {
+            Ok(check) => check,
+            Err(error) => {
+                let name = repository
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                search
+                    .failures
+                    .push(format!("{name}: {}", error.to_string().replace('\n', " ")));
+                continue;
+            }
         };
-        old.extend(stale::select_old(
+        search.old.extend(stale::select_old(
             &repository,
             check.without_pull_request,
             is_busy,
@@ -98,7 +107,7 @@ pub fn find_old_worktrees(
             stale_days,
         ));
     }
-    Ok(old)
+    Ok(search)
 }
 
 /// The line of a worktree in fzf: 3 hidden fields (path, branch, main
@@ -119,17 +128,23 @@ fn row(worktree: &OldWorktree) -> String {
     )
 }
 
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
 /// Show the list in fzf, and return the choice of the user. `list_path` is
-/// the file of the list: the preview keeps its tab next to it.
-pub fn choose(old: &[OldWorktree], list_path: &Path) -> Result<Option<Choice>, Error> {
+/// the file of the list: the preview keeps its tab next to it. `warning`
+/// goes under the header, for example the repositories that the search
+/// could not check.
+pub fn choose(
+    old: &[OldWorktree],
+    list_path: &Path,
+    warning: Option<&str>,
+) -> Result<Option<Choice>, Error> {
     let executable = env::current_exe()
         .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
     let binary = shell_quote(&executable.to_string_lossy());
     let cache = shell_quote(&list_path.to_string_lossy());
+    let header = match warning {
+        Some(warning) => format!("{HEADER}\n{warning}"),
+        None => HEADER.to_owned(),
+    };
     let mut fzf = Command::new("fzf")
         .args([
             "--ansi",
@@ -143,11 +158,11 @@ pub fn choose(old: &[OldWorktree], list_path: &Path) -> Result<Option<Choice>, E
             "--prompt",
             "clean> ",
             "--header",
-            HEADER,
+            &header,
             "--preview-window",
             "right,50%",
             "--preview-label",
-            " [diff]  log   changes  ",
+            &picker::preview_label(0),
         ])
         .arg("--preview")
         .arg(format!(
