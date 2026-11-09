@@ -179,7 +179,11 @@ pub fn write_list(path: &Path, old: &[OldWorktree]) -> Result<(), std::io::Error
             )
         })
         .collect();
-    fs::write(path, text)
+    // Write a new file, then rename it: a reader never sees a part of the
+    // list, also if the writer stops.
+    let new_path = path.with_extension("new");
+    fs::write(&new_path, text)?;
+    fs::rename(&new_path, path)
 }
 
 /// Read a list of old worktrees, without the worktrees that do not exist

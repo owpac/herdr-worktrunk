@@ -21,6 +21,7 @@ mod picker;
 mod process;
 mod prune;
 mod stale;
+mod style;
 mod ui;
 mod wt;
 
@@ -55,11 +56,7 @@ fn state_dir() -> PathBuf {
 
 /// The config of the plugin, from the config folder that herdr gives.
 fn load_config() -> config::Config {
-    let config_dir = herdr_folder(
-        "HERDR_PLUGIN_CONFIG_DIR",
-        &[".config", "herdr", "plugins", "config", herdr::PLUGIN_ID],
-    );
-    config::load(&config_dir)
+    config::current()
 }
 
 /// The main checkout of the repository of `folder`, or an error for the
@@ -154,6 +151,10 @@ fn main() -> ExitCode {
         }
         ["cleaner-verify", list] => {
             cleaner::print_verified_rows(Path::new(list));
+            return ExitCode::SUCCESS;
+        }
+        ["cleaner-rows", list] => {
+            cleaner::print_list_rows(Path::new(list));
             return ExitCode::SUCCESS;
         }
         ["picker-tab", cache, direction] => {

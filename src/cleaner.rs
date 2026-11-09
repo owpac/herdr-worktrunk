@@ -5,11 +5,13 @@
 //! The action clean opens it for all the repositories of the herdr
 //! workspaces. The daily pass of the observer (`stale_days`) opens it with
 //! its own list.
+//!
+//! The style comes from the module `style`, as for the picker.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -17,12 +19,20 @@ use std::thread;
 use crate::git::{self, canonical, LinkedWorktree};
 use crate::github;
 use crate::herdr::{self, Error};
-use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
+use crate::picker::{shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
 use crate::stale::{self, OldWorktree};
+use crate::style::{self, part, DIM, MUTED, REPOSITORY, RULE};
 
 const DELETE_ALL_REQUEST: &str = "delete-all";
-const HEADER: &str = "Enter: delete · ctrl-a: delete all · Tab: preview · Esc: quit";
+const GHOST: &str = "old worktree — type to filter";
+const HINTS: [(&str, &str); 5] = [
+    ("↑↓", "move"),
+    ("⏎", "delete"),
+    ("^a", "delete all"),
+    ("⇥", "preview"),
+    ("esc", "close"),
+];
 
 /// What the user chose in the list.
 #[derive(Debug, PartialEq, Eq)]
@@ -136,10 +146,7 @@ pub fn find_old_worktrees(
         match found {
             Ok(old) => search.old.extend(old),
             Err(error) => {
-                let name = repository
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                let name = git::folder_name(&repository);
                 search
                     .failures
                     .push(format!("{name}: {}", error.to_string().replace('\n', " ")));
@@ -174,6 +181,12 @@ fn has_pull_request(worktree: &OldWorktree) -> Option<bool> {
         .map(|pull_requests| !pull_requests.is_empty())
 }
 
+/// The file that tells that the pull requests of the list need a check:
+/// `choose` writes it, and `cleaner-verify` removes it after the check.
+fn verify_path(list_path: &Path) -> PathBuf {
+    list_path.with_extension("verify")
+}
+
 /// fzf event `cleaner-verify`: check the pull requests of the worktrees of
 /// the list, one thread for each, then write the list again without the
 /// worktrees that have one, and print its rows. fzf shows the list at
@@ -193,35 +206,76 @@ pub fn print_verified_rows(list_path: &Path) {
             .filter_map(|handle| handle.join().ok().flatten())
             .collect()
     });
-    let _ = stale::write_list(list_path, &kept);
-    for worktree in &kept {
-        println!("{}", row(worktree));
+    if stale::write_list(list_path, &kept).is_ok() {
+        let _ = fs::remove_file(verify_path(list_path));
+    }
+    print_rows(&kept);
+}
+
+/// fzf event `cleaner-rows`: print the rows of the list again, with the
+/// new width of the popup. A resize stops a running `cleaner-verify`: if
+/// the check is not done, do it again.
+pub fn print_list_rows(list_path: &Path) {
+    if verify_path(list_path).exists() {
+        print_verified_rows(list_path);
+    } else {
+        print_rows(&stale::read_list(list_path));
+    }
+}
+
+fn print_rows(old: &[OldWorktree]) {
+    let width = style::row_width(style::fzf_columns());
+    let mut stdout = io::stdout().lock();
+    for worktree in old {
+        // fzf closes the pipe when a new reload starts: stop without error.
+        if writeln!(stdout, "{}", row(worktree, width)).is_err() {
+            return;
+        }
     }
 }
 
 /// The line of a worktree in fzf: 3 hidden fields (path, branch, main
-/// checkout), then the shown text.
-fn row(worktree: &OldWorktree) -> String {
-    let repository = worktree
-        .main_checkout
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+/// checkout), then the shown text in `width` columns: the branch and its
+/// repository on the left, the folder and the days without activity on
+/// the right.
+fn row(worktree: &OldWorktree, width: usize) -> String {
+    let left = [
+        part(DIM, "○ "),
+        part("", worktree.branch.clone()),
+        part(RULE, " — "),
+        part(REPOSITORY, git::folder_name(&worktree.main_checkout)),
+    ];
+    let right = [
+        part(MUTED, git::folder_name(&worktree.path)),
+        part(MUTED, format!("{}d", worktree.days)),
+    ];
     format!(
-        "{}\t{}\t{}\t{repository:<24} {:<40} {} days",
+        "{}\t{}\t{}\t{}",
         worktree.path.display(),
         worktree.branch,
         worktree.main_checkout.display(),
-        worktree.branch,
-        worktree.days
+        style::row(&left, &right, width)
     )
+}
+
+/// The scope of the list, on the right of the prompt: its repository, or
+/// the number of its repositories.
+fn scope_of(old: &[OldWorktree]) -> String {
+    let repositories: HashSet<&Path> = old
+        .iter()
+        .map(|worktree| worktree.main_checkout.as_path())
+        .collect();
+    match repositories.iter().next() {
+        Some(repository) if repositories.len() == 1 => git::folder_name(repository),
+        _ => format!("{} repositories", repositories.len()),
+    }
 }
 
 /// Show the list in fzf, and return the choice of the user. `list_path` is
 /// the file of the list: the preview keeps its tab next to it. `warning`
-/// goes under the header, for example the repositories that the search
-/// could not check. With `verify`, fzf checks the pull requests of the
-/// list after it shows it (`cleaner-verify`), and reloads the list.
+/// goes in the header, for example the repositories that the search could
+/// not check. With `verify`, fzf checks the pull requests of the list
+/// after it shows it (`cleaner-verify`), and reloads the list.
 pub fn choose(
     old: &[OldWorktree],
     list_path: &Path,
@@ -232,12 +286,16 @@ pub fn choose(
         .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
     let binary = shell_quote(&executable.to_string_lossy());
     let cache = shell_quote(&list_path.to_string_lossy());
-    let header = match warning {
-        Some(warning) => format!("{HEADER}\n{warning}"),
-        None => HEADER.to_owned(),
-    };
+    let columns = style::terminal_columns();
     let mut fzf = Command::new("fzf");
+    fzf.env(style::COLUMNS_VARIABLE, columns.to_string());
+    if let Some(warning) = warning {
+        fzf.arg("--header").arg(warning);
+    }
     if verify {
+        // A resize can stop the check: `cleaner-rows` does it again while
+        // this file exists.
+        let _ = fs::write(verify_path(list_path), "");
         // `load` comes once fzf has read the list: the check runs once,
         // and reload-sync keeps the list on the screen until it ends.
         fzf.arg("--bind").arg(format!(
@@ -245,24 +303,7 @@ pub fn choose(
         ));
     }
     let mut fzf = fzf
-        .args([
-            "--ansi",
-            "--layout",
-            "reverse",
-            "--no-sort",
-            "--delimiter",
-            "\t",
-            "--with-nth",
-            "4..",
-            "--prompt",
-            "clean> ",
-            "--header",
-            &header,
-            "--preview-window",
-            "right,50%",
-            "--preview-label",
-            &picker::preview_label(0),
-        ])
+        .args(style::fzf_arguments(GHOST, &scope_of(old), &HINTS))
         .arg("--preview")
         .arg(format!(
             "{binary} picker-preview {{3}} {cache} worktree {{2}} {{1}}"
@@ -275,12 +316,18 @@ pub fn choose(
         ))
         .arg("--bind")
         .arg(format!("ctrl-a:print({DELETE_ALL_REQUEST})+accept"))
+        .arg("--bind")
+        .arg(format!("resize:reload({binary} cleaner-rows {cache})"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|error| Error::Command(format!("cannot run fzf: {error}")))?;
     if let Some(mut input) = fzf.stdin.take() {
-        let rows: String = old.iter().map(|worktree| row(worktree) + "\n").collect();
+        let width = style::row_width(columns);
+        let rows: String = old
+            .iter()
+            .map(|worktree| row(worktree, width) + "\n")
+            .collect();
         // fzf closes its input when the user quits: a failed write is not
         // an error.
         let _ = input.write_all(rows.as_bytes());
@@ -289,10 +336,11 @@ pub fn choose(
         .wait_with_output()
         .map_err(|error| Error::Command(format!("fzf failed: {error}")))?;
     let _ = fs::remove_file(list_path.with_extension("tab"));
+    let _ = fs::remove_file(verify_path(list_path));
     match output.status.code() {
         Some(0) => {}
         Some(FZF_CANCEL_EXIT_CODE) | Some(FZF_NO_MATCH_EXIT_CODE) => return Ok(None),
-        _ => return Err(Error::Command("fzf failed.".to_owned())),
+        _ => return Err(Error::Command(style::FZF_FAILED.to_owned())),
     }
     Ok(parse_choice(&String::from_utf8_lossy(&output.stdout), old))
 }
@@ -324,16 +372,40 @@ mod tests {
     }
 
     #[test]
-    fn a_row_hides_3_fields_and_shows_the_repository_the_branch_and_the_days() {
-        let line = row(&old()[0]);
+    fn a_row_hides_3_fields_and_shows_the_branch_the_repository_and_the_days() {
+        let line = row(&old()[0], 60);
         let fields: Vec<&str> = line.split('\t').collect();
 
         assert_eq!(
             &fields[..3],
             ["/work/repo.old", "feature/old", "/work/repo"]
         );
-        assert!(fields[3].starts_with("repo "));
-        assert!(fields[3].ends_with("12 days"));
+        let text = style::visible(fields[3]);
+        assert!(text.starts_with("○ feature/old — repo "), "{text}");
+        assert!(text.ends_with("repo.old · 12d"), "{text}");
+    }
+
+    #[test]
+    fn a_narrow_row_keeps_the_days_and_drops_the_folder() {
+        let mut worktree = old().remove(0);
+        worktree.path = PathBuf::from("/work/repo.a-very-long-branch-name-for-a-feature");
+
+        let line = row(&worktree, 40);
+        let text = style::visible(line.split('\t').nth(3).unwrap());
+
+        assert!(text.ends_with("12d"), "{text}");
+        assert!(!text.contains("a-very-long"), "{text}");
+    }
+
+    #[test]
+    fn the_scope_is_the_repository_or_the_count_of_repositories() {
+        let mut list = old();
+        assert_eq!(scope_of(&list), "repo");
+
+        let mut other = list[0].clone();
+        other.main_checkout = PathBuf::from("/work/other");
+        list.push(other);
+        assert_eq!(scope_of(&list), "2 repositories");
     }
 
     #[test]
@@ -342,7 +414,7 @@ mod tests {
 
         assert_eq!(parse_choice("delete-all\n", &old), Some(Choice::DeleteAll));
         assert_eq!(
-            parse_choice(&format!("{}\n", row(&old[0])), &old),
+            parse_choice(&format!("{}\n", row(&old[0], 60)), &old),
             Some(Choice::Delete(old[0].clone()))
         );
         assert_eq!(parse_choice("", &old), None);

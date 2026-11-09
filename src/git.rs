@@ -15,6 +15,13 @@ pub fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The name of the last folder of `path`, or "" for the root.
+pub fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// A git checkout: the main checkout or a linked worktree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkout {

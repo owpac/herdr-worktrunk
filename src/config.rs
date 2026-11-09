@@ -4,10 +4,37 @@
 //! The agents also read this file (the skill worktrees of the agent
 //! plugin herdr): `agent_mode` and the `[repositories."<path>"]` tables
 //! are for them. The plugin reads only the top-level keys `observe`,
-//! `prune_merged` and `stale_days`.
+//! `prune_merged`, `stale_days` and `popup_size`.
 
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::herdr::PLUGIN_ID;
+
+/// The size of the large popups: the picker, the cleaner and the merger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PopupSize {
+    /// The size of the popup of herdr-bar: 74 % × 62 % of the window.
+    #[default]
+    Default,
+    /// 90 % × 80 % of the window.
+    Big,
+}
+
+/// The popups that have 2 sizes: the manifest gives each one a second
+/// pane, `<name>-big`.
+const SIZED_POPUPS: [&str; 3] = ["picker", "cleaner", "merger"];
+
+impl PopupSize {
+    /// The pane of the manifest for the popup `entrypoint` in this size.
+    pub fn entrypoint(self, entrypoint: &str) -> String {
+        match self {
+            PopupSize::Big if SIZED_POPUPS.contains(&entrypoint) => format!("{entrypoint}-big"),
+            _ => entrypoint.to_owned(),
+        }
+    }
+}
 
 /// The options of the plugin.
 #[derive(Debug, PartialEq, Eq)]
@@ -21,6 +48,8 @@ pub struct Config {
     /// request and without change for this number of days (default: 0,
     /// off). It needs `prune_merged`.
     pub stale_days: u32,
+    /// The size of the large popups (default: the size of herdr-bar).
+    pub popup_size: PopupSize,
 }
 
 impl Default for Config {
@@ -29,8 +58,25 @@ impl Default for Config {
             observe: true,
             prune_merged: false,
             stale_days: 0,
+            popup_size: PopupSize::Default,
         }
     }
+}
+
+/// The config folder of the plugin: the folder that herdr gives, else the
+/// default folder of herdr.
+pub fn config_dir() -> PathBuf {
+    if let Some(folder) = env::var_os("HERDR_PLUGIN_CONFIG_DIR") {
+        return PathBuf::from(folder);
+    }
+    let mut folder = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    folder.extend([".config", "herdr", "plugins", "config", PLUGIN_ID]);
+    folder
+}
+
+/// The config of the plugin, from its config folder.
+pub fn current() -> Config {
+    load(&config_dir())
 }
 
 /// Read the config of the plugin. A missing file gives the defaults.
@@ -58,6 +104,12 @@ fn parse(text: &str) -> Config {
             "observe" => config.observe = value != "false",
             "prune_merged" => config.prune_merged = value == "true",
             "stale_days" => config.stale_days = value.parse().unwrap_or(0),
+            "popup_size" => {
+                config.popup_size = match value.trim_matches('"') {
+                    "big" => PopupSize::Big,
+                    _ => PopupSize::Default,
+                }
+            }
             _ => {}
         }
     }
@@ -94,6 +146,20 @@ mod tests {
         assert_eq!(parse("stale_days = 7 # a week\n").stale_days, 7);
         assert_eq!(parse("stale_days = \"x\"\n").stale_days, 0);
         assert_eq!(Config::default().stale_days, 0);
+    }
+
+    #[test]
+    fn popup_size_big_gives_the_big_panes() {
+        let config = parse("popup_size = \"big\" # 90 % x 80 %\n");
+
+        assert_eq!(config.popup_size, PopupSize::Big);
+        assert_eq!(config.popup_size.entrypoint("picker"), "picker-big");
+        assert_eq!(config.popup_size.entrypoint("confirm"), "confirm");
+        assert_eq!(PopupSize::Default.entrypoint("cleaner"), "cleaner");
+        assert_eq!(
+            parse("popup_size = \"huge\"\n").popup_size,
+            PopupSize::Default
+        );
     }
 
     #[test]
