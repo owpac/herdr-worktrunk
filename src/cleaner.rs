@@ -2,8 +2,10 @@
 //! herdr workspaces, in fzf. The list shows at once. Threads check each
 //! worktree in the background (local criteria, then the forge), and its row
 //! shows a spinner until its check ends. The leftovers go to the group
-//! "To delete" at the top. The other worktrees stay in a group for each
-//! project, with the reason that keeps them.
+//! "To delete" at the top. The worktrees where an idle agent waits without
+//! a proof of the end go to the group "Waiting": resume or close these
+//! agents. The other worktrees stay in a group for each project, with the
+//! reason that keeps them.
 //!
 //! The module `leftover` gives the layers of the checks and the verdict.
 //!
@@ -76,6 +78,8 @@ static CHECKS_STOPPED: AtomicBool = AtomicBool::new(false);
 const LIST_THREADS: usize = 4;
 /// The id of the title of the group "To delete".
 const TO_DELETE_ID: &str = "group:to-delete";
+/// The id of the title of the group "Waiting".
+const WAITING_ID: &str = "group:waiting";
 const TITLE_KIND: &str = "title";
 const WORKTREE_KIND: &str = "worktree";
 
@@ -96,7 +100,7 @@ fn glyph(reason: Reason) -> (&'static str, &'static str) {
         | Reason::CommitInDefaultBranch => (GREEN, "✓"),
         Reason::Changes => (YELLOW, "●"),
         Reason::Agent => (ACCENT, "◐"),
-        Reason::IdleAgent => (DIM, "◐"),
+        Reason::IdleAgent => (YELLOW, "◐"),
         Reason::Unknown => (DIM, "?"),
     }
 }
@@ -653,6 +657,30 @@ fn post_with_retries(socket: &Path, action: &str) {
     }
 }
 
+/// The kind of a group of the list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    /// The leftovers.
+    ToDelete,
+    /// An idle agent waits in each worktree, without a proof of the end.
+    Waiting,
+    /// The other worktrees of a project.
+    Project,
+}
+
+impl Group {
+    /// The group of a worktree with this verdict.
+    fn of(reason: Reason) -> Group {
+        if reason.is_leftover() {
+            Group::ToDelete
+        } else if reason == Reason::IdleAgent {
+            Group::Waiting
+        } else {
+            Group::Project
+        }
+    }
+}
+
 /// A row of the list: the title of a group, or a worktree.
 #[derive(Debug, PartialEq, Eq)]
 enum Row<'a> {
@@ -660,33 +688,40 @@ enum Row<'a> {
         id: String,
         label: String,
         count: usize,
-        is_to_delete: bool,
+        group: Group,
     },
     Worktree(&'a Entry),
 }
 
-/// The rows in their order: the group "To delete" (the oldest first),
-/// then one group for each project (by name, the worktrees by branch).
-/// Without `with_titles` (a filter), the rows have no title.
+/// The rows in their order: the group "To delete" (the oldest first), the
+/// group "Waiting" (the oldest first), then one group for each project (by
+/// name, the worktrees by branch). Without `with_titles` (a filter), the
+/// rows have no title.
 fn layout(entries: &[Entry], with_titles: bool) -> Vec<Row<'_>> {
-    let mut leftovers: Vec<&Entry> = entries
-        .iter()
-        .filter(|entry| entry.reason.is_leftover())
-        .collect();
-    leftovers.sort_by(|a, b| {
-        b.facts
-            .days
-            .cmp(&a.facts.days)
-            .then_with(|| a.branch.cmp(&b.branch))
-    });
+    let mut leftovers: Vec<&Entry> = Vec::new();
+    let mut waiting: Vec<&Entry> = Vec::new();
     // One group for each repository, sorted by name, then by path.
     let mut projects: BTreeMap<(String, &Path), Vec<&Entry>> = BTreeMap::new();
-    for entry in entries.iter().filter(|entry| !entry.reason.is_leftover()) {
-        let name = git::folder_name(&entry.main_checkout);
-        projects
-            .entry((name, entry.main_checkout.as_path()))
-            .or_default()
-            .push(entry);
+    for entry in entries {
+        match Group::of(entry.reason) {
+            Group::ToDelete => leftovers.push(entry),
+            Group::Waiting => waiting.push(entry),
+            Group::Project => {
+                let name = git::folder_name(&entry.main_checkout);
+                projects
+                    .entry((name, entry.main_checkout.as_path()))
+                    .or_default()
+                    .push(entry);
+            }
+        }
+    }
+    for members in [&mut leftovers, &mut waiting] {
+        members.sort_by(|a, b| {
+            b.facts
+                .days
+                .cmp(&a.facts.days)
+                .then_with(|| a.branch.cmp(&b.branch))
+        });
     }
     let mut name_count: HashMap<&str, usize> = HashMap::new();
     for (name, _) in projects.keys() {
@@ -704,16 +739,22 @@ fn layout(entries: &[Entry], with_titles: bool) -> Vec<Row<'_>> {
         })
         .collect();
     let mut rows = Vec::new();
-    if !leftovers.is_empty() {
+    for (id, label, group, members) in [
+        (TO_DELETE_ID, "To delete", Group::ToDelete, leftovers),
+        (WAITING_ID, "Waiting", Group::Waiting, waiting),
+    ] {
+        if members.is_empty() {
+            continue;
+        }
         if with_titles {
             rows.push(Row::Title {
-                id: TO_DELETE_ID.to_owned(),
-                label: "To delete".to_owned(),
-                count: leftovers.len(),
-                is_to_delete: true,
+                id: id.to_owned(),
+                label: label.to_owned(),
+                count: members.len(),
+                group,
             });
         }
-        rows.extend(leftovers.into_iter().map(Row::Worktree));
+        rows.extend(members.into_iter().map(Row::Worktree));
     }
     for (((_, main_checkout), mut group), label) in projects.into_iter().zip(labels) {
         group.sort_by(|a, b| a.branch.cmp(&b.branch));
@@ -722,7 +763,7 @@ fn layout(entries: &[Entry], with_titles: bool) -> Vec<Row<'_>> {
                 id: format!("group:{}", main_checkout.display()),
                 label,
                 count: group.len(),
-                is_to_delete: false,
+                group: Group::Project,
             });
         }
         rows.extend(group.into_iter().map(Row::Worktree));
@@ -739,9 +780,13 @@ fn line(row: &Row, width: usize) -> String {
             id,
             label,
             count,
-            is_to_delete,
+            group,
         } => {
-            let color = if *is_to_delete { RED } else { REPOSITORY };
+            let color = match group {
+                Group::ToDelete => RED,
+                Group::Waiting => YELLOW,
+                Group::Project => REPOSITORY,
+            };
             let text = format!("{BOLD}{color}{label}{RESET}{RULE} · {RESET}{DIM}{count}{RESET}");
             (
                 [
@@ -761,10 +806,10 @@ fn line(row: &Row, width: usize) -> String {
                 1
             };
             // Only the glyph changes from one frame to the next.
-            let reason_color = if entry.reason.is_leftover() {
-                RED
-            } else {
-                MUTED
+            let reason_color = match Group::of(entry.reason) {
+                Group::ToDelete => RED,
+                Group::Waiting => YELLOW,
+                Group::Project => MUTED,
             };
             let reason_text = entry.reason_text();
             let mut right = vec![part(MUTED, git::folder_name(&entry.path))];
@@ -935,6 +980,10 @@ fn print_checklist(entry: &Entry, stale_days: u32) {
             "{BOLD}{RED}To delete{RESET}{RULE} · {RESET}{MUTED}{}{RESET}",
             entry.reason_text()
         ),
+        Reason::IdleAgent => format!(
+            "{BOLD}{YELLOW}Waiting{RESET}{RULE} · {RESET}{MUTED}{}{RESET}",
+            entry.reason_text()
+        ),
         _ => format!(
             "{BOLD}{GREEN}Kept{RESET}{RULE} · {RESET}{MUTED}{}{RESET}",
             entry.reason_text()
@@ -986,11 +1035,24 @@ pub fn print_preview(
         }
         return;
     }
-    let members = entries.iter().filter(|entry| {
-        if id == TO_DELETE_ID {
-            entry.reason.is_leftover()
-        } else {
-            !entry.reason.is_leftover() && format!("group:{}", entry.main_checkout.display()) == id
+    if id == WAITING_ID {
+        // Short lines: the preview does not wrap.
+        for text in [
+            "An idle agent waits in each worktree,",
+            "without a proof of the end of its work.",
+            "Resume it in its workspace, or close it.",
+            "The cleaner does not delete these worktrees.",
+        ] {
+            println!("{MUTED}{text}{RESET}");
+        }
+        println!();
+    }
+    let members = entries.iter().filter(|entry| match id {
+        TO_DELETE_ID => Group::of(entry.reason) == Group::ToDelete,
+        WAITING_ID => Group::of(entry.reason) == Group::Waiting,
+        _ => {
+            Group::of(entry.reason) == Group::Project
+                && format!("group:{}", entry.main_checkout.display()) == id
         }
     });
     for entry in members {
@@ -1216,6 +1278,42 @@ mod tests {
                 "group:/work/zeta",
                 "b-open"
             ]
+        );
+    }
+
+    #[test]
+    fn the_idle_forks_without_proof_wait_in_their_own_group() {
+        let mut entries = entries();
+        entries.push(entry("e-fork", "zeta", Reason::IdleAgent, Some(9)));
+        entries.push(entry("f-fork", "alpha", Reason::IdleAgent, Some(20)));
+
+        let rows = layout(&entries, true);
+
+        assert_eq!(
+            ids(&rows),
+            [
+                "group:to-delete",
+                "d-merged",
+                "a-old",
+                "group:waiting",
+                "f-fork",
+                "e-fork",
+                "group:/work/alpha",
+                "c-check",
+                "group:/work/zeta",
+                "b-open"
+            ]
+        );
+        // ctrl-a never chooses a worktree of the group Waiting, also when
+        // the filter shows it.
+        let visible = "/work/zeta.e-fork\n/work/alpha.f-fork\n/work/zeta.d-merged\n";
+        assert_eq!(
+            delete_all_answer(&entries, visible),
+            DeleteAllAnswer::Delete(vec![PathBuf::from("/work/zeta.d-merged")])
+        );
+        assert_eq!(
+            delete_all_answer(&entries[4..], "/work/zeta.e-fork\n"),
+            DeleteAllAnswer::Header("The group To delete is empty.")
         );
     }
 

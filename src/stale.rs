@@ -1,11 +1,13 @@
 //! The old worktrees without pull request (option `stale_days`).
 //!
 //! Once a day, the thread of the merged pull requests looks for the
-//! linked worktrees with no pull request, no agent, no change that is not
-//! committed, and no activity for `stale_days` days. It opens the popup
-//! cleaner of the plugin with these worktrees: the user deletes some or
-//! all of them, or quits. The thread does not ask again about a worktree
-//! for `stale_days` days. The action clean opens the same popup at once.
+//! linked worktrees with no pull request, no agent that works, no change
+//! that is not committed, and no activity for `stale_days` days. It opens
+//! the popup cleaner of the plugin with these worktrees: the user deletes
+//! some or all of them, or quits. A worktree where an idle agent waits
+//! goes to the group "Waiting" of the cleaner: the user resumes or closes
+//! the agent. The thread does not ask again about a worktree for
+//! `stale_days` days. The action clean opens the same popup at once.
 //!
 //! 2 files in the state folder keep the dates, so a restart of the
 //! observer does not ask again:
