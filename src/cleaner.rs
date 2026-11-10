@@ -37,6 +37,7 @@ use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
+use crate::prune;
 use crate::stale::{self, OldWorktree, DAY};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
@@ -300,6 +301,9 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
 struct RepositoryFacts {
     /// The forge, or the reason why the checks cannot ask a forge.
     forge: Result<forge::RepositoryForge, String>,
+    /// The backend of the forge, for all the worktrees of the repository:
+    /// it keeps what it reads, for example the open pull requests of Gitea.
+    backend: Result<Box<dyn forge::Backend>, String>,
     default_branch: Option<String>,
     /// The name of the default branch (`main`), for the texts.
     main_name: Option<String>,
@@ -335,8 +339,12 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         });
     // wt knows the forge, also a self-hosted one in its config.
     let forge = forge::resolve(main_checkout, listed.as_ref());
+    let backend = forge
+        .clone()
+        .and_then(|forge| forge::backend(&forge, forge::POPUP_TIME_LIMIT));
     RepositoryFacts {
         forge,
+        backend,
         default_branch,
         main_name,
         integrations,
@@ -374,19 +382,21 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
     facts.pull_requests = match facts.changes {
         Changes::Some => PullRequests::NotNeeded("the changes keep the worktree".to_owned()),
         Changes::Failed => PullRequests::NotNeeded("git status failed".to_owned()),
-        _ => match &repository.forge {
+        _ => match &repository.backend {
             // A repository without a remote has no pull request.
             Err(error) if error == forge::NO_REMOTE => PullRequests::NotNeeded(error.clone()),
             Err(error) => PullRequests::Failed(error.clone()),
             // A forge that does not answer gives "no answer" after 15 s:
             // the worktree stays, and the spinner stops.
-            Ok(forge) => PullRequests::from_status(forge::branch_status(
-                forge,
-                &entry.main_checkout,
-                repository.default_branch.as_deref(),
-                &entry.branch,
-                forge::POPUP_TIME_LIMIT,
-            )),
+            Ok(backend) => PullRequests::from_status(
+                prune::branch_status(
+                    &entry.main_checkout,
+                    backend.as_ref(),
+                    repository.default_branch.as_deref(),
+                    &entry.branch,
+                )
+                .map_err(|error| error.to_string().replace('\n', " ")),
+            ),
         },
     };
     result.reason = leftover::verdict(&result.facts, stale_days);

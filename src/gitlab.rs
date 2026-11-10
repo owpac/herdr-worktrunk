@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::forge::encode_url_part as encode;
 use crate::forge::{Backend, PullRequest, PullRequestState};
 use crate::herdr::Error;
 use crate::process;
@@ -60,11 +61,7 @@ impl GitLab {
 }
 
 impl Backend for GitLab {
-    fn pull_requests(
-        &self,
-        branch: &str,
-        _default_branch: Option<&str>,
-    ) -> Result<Vec<PullRequest>, Error> {
+    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
         let endpoint = format!(
             "{}/merge_requests?source_branch={}&state=all&per_page={PAGE_SIZE}",
             self.project_endpoint(),
@@ -143,20 +140,6 @@ fn merge_base_is(text: &str, commit: &str) -> bool {
     serde_json::from_str::<MergeBase>(text).is_ok_and(|base| base.id == commit)
 }
 
-/// Encode a value for a path segment or a query of a URL: each byte
-/// outside the unreserved characters of RFC 3986 becomes `%XX`.
-fn encode(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,15 +201,6 @@ mod tests {
             commit
         ));
         assert!(!merge_base_is("", commit));
-    }
-
-    #[test]
-    fn encode_keeps_only_the_unreserved_characters() {
-        assert_eq!(encode("group/sub/app"), "group%2Fsub%2Fapp");
-        assert_eq!(encode("feat/forge-layers"), "feat%2Fforge-layers");
-        assert_eq!(encode("v1.2_x~y"), "v1.2_x~y");
-        assert_eq!(encode("a+b c&d=e#f"), "a%2Bb%20c%26d%3De%23f");
-        assert_eq!(encode("é"), "%C3%A9");
     }
 
     fn gitlab() -> GitLab {

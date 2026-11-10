@@ -121,13 +121,6 @@ pub fn finished_pull_request<'a>(
     finished.find(|pull_request| head_contains(&pull_request.head))
 }
 
-/// The name of a branch of `origin`: `origin/main` gives `main`.
-fn branch_name(remote_branch: &str) -> &str {
-    remote_branch
-        .strip_prefix("origin/")
-        .unwrap_or(remote_branch)
-}
-
 /// The backend of the forge of `main_checkout`, for the observer.
 fn repository_backend(main_checkout: &Path) -> Result<Box<dyn Backend>, Error> {
     forge::of_repository(main_checkout)
@@ -176,7 +169,7 @@ pub fn branch_status(
     default_branch: Option<&str>,
     branch: &str,
 ) -> Result<BranchStatus, Error> {
-    let pull_requests = backend.pull_requests(branch, default_branch.map(branch_name))?;
+    let pull_requests = backend.pull_requests(branch)?;
     let Some(last) = pull_requests.first() else {
         return Ok(BranchStatus::NoPullRequest);
     };
@@ -275,13 +268,9 @@ pub fn without_pull_request(
         return Ok(old);
     }
     let backend = repository_backend(main_checkout)?;
-    let default_branch = git::default_branch(main_checkout);
     let mut kept = Vec::new();
     for worktree in old {
-        if backend
-            .pull_requests(&worktree.branch, default_branch.as_deref().map(branch_name))?
-            .is_empty()
-        {
+        if backend.pull_requests(&worktree.branch)?.is_empty() {
             kept.push(worktree);
         }
     }
@@ -407,11 +396,7 @@ mod tests {
     }
 
     impl Backend for FakeForge {
-        fn pull_requests(
-            &self,
-            _branch: &str,
-            _default_branch: Option<&str>,
-        ) -> Result<Vec<PullRequest>, Error> {
+        fn pull_requests(&self, _branch: &str) -> Result<Vec<PullRequest>, Error> {
             Ok(self.pull_requests.clone())
         }
 

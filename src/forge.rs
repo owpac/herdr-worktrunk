@@ -24,7 +24,6 @@ use crate::github::GitHub;
 use crate::gitlab::GitLab;
 use crate::herdr::Error;
 use crate::process;
-use crate::prune::{self, BranchStatus};
 use crate::wt;
 
 /// The URL schemes of a remote. A remote without scheme has the form
@@ -56,17 +55,12 @@ pub struct PullRequest {
     pub head: String,
 }
 
-/// The calls to one forge, for one repository.
-pub trait Backend {
+/// The calls to one forge, for one repository. The threads of the cleaner
+/// share one backend for each repository.
+pub trait Backend: Send + Sync {
     /// The pull requests of `branch` in the repository itself, in all the
     /// states, the newest first. A pull request from a fork does not count.
-    /// `default_branch` is the name of the default branch (`main`), if git
-    /// knows it: a backend can need it.
-    fn pull_requests(
-        &self,
-        branch: &str,
-        default_branch: Option<&str>,
-    ) -> Result<Vec<PullRequest>, Error>;
+    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error>;
 
     /// Return true if the commit `head` contains the commit `commit`, as
     /// the forge sees them. False if the forge does not know `commit`.
@@ -374,19 +368,19 @@ pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backe
     }
 }
 
-/// The status of the pull requests of `branch`, from the backend of the
-/// provider. An error tells why the forge gave no answer: no backend, the
-/// CLI failed, a time limit.
-pub fn branch_status(
-    forge: &RepositoryForge,
-    main_checkout: &Path,
-    default_branch: Option<&str>,
-    branch: &str,
-    limit: Duration,
-) -> Result<BranchStatus, String> {
-    let backend = backend(forge, limit)?;
-    prune::branch_status(main_checkout, backend.as_ref(), default_branch, branch)
-        .map_err(|error| error.to_string().replace('\n', " "))
+/// Encode a value for a path segment or a query of a URL: each byte
+/// outside the unreserved characters of RFC 3986 becomes `%XX`. The braces
+/// get encoded too: tea replaces `{owner}`, `{repo}` and `{branch}`.
+pub fn encode_url_part(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -545,15 +539,20 @@ mod tests {
             repository: Some("team/app".to_owned()),
         };
 
-        let status = branch_status(
-            &forge,
-            Path::new("/work/app"),
-            None,
-            "feat",
-            Duration::from_secs(1),
+        assert_eq!(
+            backend(&forge, Duration::from_secs(1)).err(),
+            Some("no backend for Azure DevOps yet".to_owned())
         );
+    }
 
-        assert_eq!(status, Err("no backend for Azure DevOps yet".to_owned()));
+    #[test]
+    fn encode_url_part_keeps_only_the_unreserved_characters() {
+        assert_eq!(encode_url_part("group/sub/app"), "group%2Fsub%2Fapp");
+        assert_eq!(encode_url_part("feat/forge-layers"), "feat%2Fforge-layers");
+        assert_eq!(encode_url_part("v1.2_x~y"), "v1.2_x~y");
+        assert_eq!(encode_url_part("a+b c&d=e#f"), "a%2Bb%20c%26d%3De%23f");
+        assert_eq!(encode_url_part("é"), "%C3%A9");
+        assert_eq!(encode_url_part("feat/{branch}"), "feat%2F%7Bbranch%7D");
     }
 
     #[test]

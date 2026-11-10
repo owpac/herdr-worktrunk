@@ -62,30 +62,26 @@ fn read_in_thread(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8
 /// output. `label` names the command in the errors, for example
 /// `gh pr list`. A missing program gives "<program> is not installed".
 pub fn run_cli(command: &mut Command, label: &str, limit: Duration) -> Result<String, Error> {
-    let output = run_cli_output(command, label, limit)?;
+    let output = cli_output(command, label, limit)?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Command(format!("{label}: {}", details.trim())));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Like `run_cli`, but return the whole output: the standard error can
-/// carry information, for example the HTTP status of `tea api -i`.
-pub fn run_cli_output(
-    command: &mut Command,
-    label: &str,
-    limit: Duration,
-) -> Result<Output, Error> {
+/// Like `run_cli`, but return the whole output, also after an error code:
+/// the standard error can carry information, for example the HTTP status
+/// of `tea api -i`.
+pub fn cli_output(command: &mut Command, label: &str, limit: Duration) -> Result<Output, Error> {
     let program = command.get_program().to_string_lossy().into_owned();
-    let output = output_with_limit(command, limit).map_err(|error| {
+    output_with_limit(command, limit).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             Error::Command(format!("{program} is not installed"))
         } else {
             Error::Command(format!("{label}: {error}"))
         }
-    })?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Command(format!("{label}: {}", details.trim())));
-    }
-    Ok(output)
+    })
 }
 
 #[cfg(test)]
