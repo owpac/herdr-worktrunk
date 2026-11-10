@@ -351,12 +351,8 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
     // A branch that was never pushed has no pull request, but only if the
     // forge gives no answer: a push without -u, or to another name, can
     // leave no remote branch here.
-    let forge_is_silent = matches!(
-        facts.pull_requests,
-        PullRequests::Failed(_) | PullRequests::NotChecked | PullRequests::NotNeeded(_)
-    );
     let has_no_pull_request = matches!(facts.pull_requests, PullRequests::None)
-        || (matches!(facts.push, Push::Never) && forge_is_silent);
+        || (matches!(facts.push, Push::Never) && forge_is_silent(&facts.pull_requests));
     if has_no_pull_request {
         return match facts.days {
             Some(days) if days >= u64::from(stale_days) => Reason::Old,
@@ -511,6 +507,15 @@ impl Mark {
     }
 }
 
+/// Return true if the forge gave no answer about the pull requests: then
+/// only the push state of git can tell that a branch has no pull request.
+fn forge_is_silent(pull_requests: &PullRequests) -> bool {
+    matches!(
+        pull_requests,
+        PullRequests::Failed(_) | PullRequests::NotChecked | PullRequests::NotNeeded(_)
+    )
+}
+
 /// A line of the tab `checks`: the result, the layer, the fact, and the
 /// source of the fact.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -589,10 +594,18 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
         Integration::NotChecked => waiting("Merged", "wt"),
     };
     let push = match &facts.push {
-        Push::Never => line(
+        Push::Never if forge_is_silent(&facts.pull_requests) => line(
             Mark::Pass,
             "Push",
             "never pushed: no pull request is possible",
+            "git",
+        ),
+        // A push without -u, or a branch from the ref of a pull request,
+        // has no remote branch here: the forge decides.
+        Push::Never => line(
+            Mark::Info,
+            "Push",
+            "no remote branch here: the forge decides",
             "git",
         ),
         Push::Pushed(remote) => line(Mark::Info, "Push", format!("pushed to {remote}"), "git"),
@@ -1075,6 +1088,38 @@ mod tests {
         let text = serde_json::to_string(&facts).unwrap();
 
         assert_eq!(serde_json::from_str::<Facts>(&text).unwrap(), facts);
+    }
+
+    #[test]
+    fn the_push_layer_does_not_deny_a_pull_request_of_the_forge() {
+        let never_pushed = |pull_requests| Facts {
+            push: Push::Never,
+            pull_requests,
+            ..facts()
+        };
+        let push_line = |facts: &Facts| {
+            let shown = lines(facts, Reason::Recent, 7);
+            let line = &shown[3];
+            (line.mark, line.text.clone())
+        };
+
+        assert_eq!(
+            push_line(&never_pushed(PullRequests::Failed("gh failed".to_owned()))),
+            (
+                Mark::Pass,
+                "never pushed: no pull request is possible".to_owned()
+            )
+        );
+        assert_eq!(
+            push_line(&never_pushed(PullRequests::Finished {
+                number: 4,
+                merged: true
+            })),
+            (
+                Mark::Info,
+                "no remote branch here: the forge decides".to_owned()
+            )
+        );
     }
 
     #[test]
