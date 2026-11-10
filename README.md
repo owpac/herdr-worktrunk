@@ -260,14 +260,6 @@ popup_size = "default"
 # The cleaner fetches origin before its checks (default: false). The fetch can ask the ssh agent
 # for a key.
 fetch_before_check = false
-
-# What an agent can do without a question at the end of a task in a worktree: "ask" or "auto".
-# The plugin does not read this key: the agents read it (for example the skill worktrees of
-# owpac/prompts).
-agent_mode = "ask"
-
-[repositories."~/.dotfiles"]
-agent_mode = "auto"
 ```
 
 The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`, `popup_size` and `fetch_before_check`.
