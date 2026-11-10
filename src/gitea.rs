@@ -35,7 +35,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::forge::{
-    self, encode_url_part as encode, Backend, Provider, PullRequest, PullRequestState,
+    self, encode_url_part as encode, Backend, ForgeError, Provider, PullRequest, PullRequestState,
+    RepositoryForge,
 };
 use crate::herdr::Error;
 use crate::process;
@@ -82,6 +83,21 @@ struct Response {
 }
 
 impl Gitea {
+    /// The backend of `forge`: Gitea or Forgejo, with an owner and a name.
+    pub fn from_forge(forge: &RepositoryForge, limit: Duration) -> Result<Gitea, ForgeError> {
+        let (flavor, public_host) = if forge.provider == Provider::Gitea {
+            (Flavor::Gitea, "gitea.com")
+        } else {
+            (Flavor::Forgejo, "codeberg.org")
+        };
+        Ok(Gitea::new(
+            forge::api_host(forge, public_host)?,
+            forge::owner_and_name(forge)?.to_owned(),
+            flavor,
+            limit,
+        ))
+    }
+
     pub fn new(host: String, repository: String, flavor: Flavor, limit: Duration) -> Gitea {
         Gitea {
             host,

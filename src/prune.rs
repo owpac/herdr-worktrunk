@@ -129,7 +129,7 @@ pub fn finished_pull_request<'a>(
 fn repository_backend(main_checkout: &Path) -> Result<Box<dyn Backend>, Error> {
     forge::of_repository(main_checkout)
         .and_then(|forge| forge::backend(&forge, forge::BACKGROUND_TIME_LIMIT))
-        .map_err(Error::Command)
+        .map_err(|error| Error::Command(error.to_string()))
 }
 
 /// The pull requests of a branch, as the observer and the cleaner see

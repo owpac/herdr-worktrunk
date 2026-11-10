@@ -11,6 +11,7 @@
 //! except the leftovers that git proves.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -22,7 +23,7 @@ use serde_json::Value;
 
 use crate::azure::{self, AzureDevOps};
 use crate::git;
-use crate::gitea::{Flavor, Gitea};
+use crate::gitea::Gitea;
 use crate::github::GitHub;
 use crate::gitlab::GitLab;
 use crate::herdr::Error;
@@ -238,10 +239,44 @@ pub struct RepositoryForge {
     pub provider: Provider,
     /// The host of the forge, after the ssh aliases.
     pub host: String,
-    /// The repository on the forge: `owner/name`. On Azure DevOps:
-    /// `organization/project/repository`, decoded (a project name can have
-    /// spaces, but no `/`).
-    pub repository: Option<String>,
+    pub repository: Option<Repository>,
+}
+
+/// The repository on the forge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Repository {
+    /// The path of the repository: `owner/name`, or `group/subgroup/name`
+    /// on GitLab.
+    Path(String),
+    /// A repository of Azure DevOps: its organization, its project and its
+    /// name.
+    Azure(azure::Location),
+}
+
+/// Why the plugin cannot ask the forge of a repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForgeError {
+    /// No remote `origin`: the branches can have no pull request.
+    NoRemote,
+    /// The plugin cannot read the remote `origin`.
+    UnreadableRemote(String),
+    /// The provider has no backend.
+    NoBackend(Provider),
+    /// The forge has no backend for this host or this repository.
+    Unsupported(String),
+}
+
+impl fmt::Display for ForgeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ForgeError::NoRemote => write!(formatter, "no remote origin"),
+            ForgeError::UnreadableRemote(url) => write!(formatter, "cannot read the remote {url}"),
+            ForgeError::NoBackend(provider) => {
+                write!(formatter, "no backend for {} yet", provider.name())
+            }
+            ForgeError::Unsupported(why) => write!(formatter, "{why}"),
+        }
+    }
 }
 
 /// The forge that `wt list --format json` gives in `repo.forge`.
@@ -260,7 +295,7 @@ pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
         (Some(owner), Some(name))
             if !owner.is_empty() && !name.is_empty() && provider != Provider::AzureDevOps =>
         {
-            Some(format!("{owner}/{name}"))
+            Some(Repository::Path(format!("{owner}/{name}")))
         }
         _ => None,
     };
@@ -273,9 +308,9 @@ pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
 
 /// The forge of the remote `origin`, without wt: the provider from the
 /// name of the host. An error tells why the checks cannot ask a forge.
-pub fn from_origin(main_checkout: &Path) -> Result<RepositoryForge, String> {
-    let url = git::origin_url(main_checkout).ok_or_else(|| NO_REMOTE.to_owned())?;
-    from_remote(&url).ok_or_else(|| format!("cannot read the remote {url}"))
+pub fn from_origin(main_checkout: &Path) -> Result<RepositoryForge, ForgeError> {
+    let url = git::origin_url(main_checkout).ok_or(ForgeError::NoRemote)?;
+    from_remote(&url).ok_or(ForgeError::UnreadableRemote(url))
 }
 
 /// The forge of a remote URL, from the name of its host. None for a local
@@ -298,24 +333,23 @@ fn from_remote(url: &str) -> Option<RepositoryForge> {
     Some(RepositoryForge {
         provider: Provider::from_host(host),
         host: host.to_owned(),
-        repository: has_owner_and_name.then(|| path.to_owned()),
+        repository: has_owner_and_name.then(|| Repository::Path(path.to_owned())),
     })
 }
-
-/// The error of a repository without a remote `origin`: its branches can
-/// have no pull request.
-pub const NO_REMOTE: &str = "no remote origin";
 
 /// The forge of a repository: from the JSON of `wt list` first, with the
 /// forge config of the user (`forge.platform` for a self-hosted host),
 /// else from the host of `origin`. The cleaner and the observer use this
 /// order.
-pub fn resolve(main_checkout: &Path, listed: Option<&Value>) -> Result<RepositoryForge, String> {
+pub fn resolve(
+    main_checkout: &Path,
+    listed: Option<&Value>,
+) -> Result<RepositoryForge, ForgeError> {
     match listed.and_then(from_worktrunk) {
         // The remote of Azure DevOps gives its 3 parts. wt can give the
         // provider of a host with another name (Azure DevOps Server).
         Some(forge) if forge.provider == Provider::AzureDevOps => {
-            let url = git::origin_url(main_checkout).ok_or_else(|| NO_REMOTE.to_owned())?;
+            let url = git::origin_url(main_checkout).ok_or(ForgeError::NoRemote)?;
             Ok(azure_forge(&url).unwrap_or(forge))
         }
         Some(forge) => Ok(forge),
@@ -327,7 +361,7 @@ pub fn resolve(main_checkout: &Path, listed: Option<&Value>) -> Result<Repositor
 /// project and its repository. None if the path has another form.
 fn azure_forge(url: &str) -> Option<RepositoryForge> {
     let (host, path) = split_remote(url)?;
-    let (organization, project, repository) = azure::parse_remote_path(host, path)?;
+    let location = azure::parse_remote_path(host, path)?;
     // The API of `ssh.dev.azure.com` is on `dev.azure.com`.
     let host = if host.eq_ignore_ascii_case("ssh.dev.azure.com") {
         "dev.azure.com"
@@ -337,14 +371,14 @@ fn azure_forge(url: &str) -> Option<RepositoryForge> {
     Some(RepositoryForge {
         provider: Provider::AzureDevOps,
         host: host.to_owned(),
-        repository: Some(format!("{organization}/{project}/{repository}")),
+        repository: Some(Repository::Azure(location)),
     })
 }
 
 /// The forge of a repository, for the observer: as `resolve`, with one
 /// call to wt for each repository in one hour at most.
-pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
-    type Known = HashMap<PathBuf, (Instant, Result<RepositoryForge, String>)>;
+pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, ForgeError> {
+    type Known = HashMap<PathBuf, (Instant, Result<RepositoryForge, ForgeError>)>;
     static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
     let known = KNOWN.get_or_init(Mutex::default);
     if let Some((time, forge)) = lock(known).get(main_checkout) {
@@ -389,9 +423,12 @@ fn host_from_ssh(host: &str) -> String {
 /// The host of the API of a forge: the host of the remote, or the host
 /// behind its ssh alias. The public host of the provider needs no call to
 /// ssh.
-fn api_host(forge: &RepositoryForge, public_host: &str) -> Result<String, String> {
+pub fn api_host(forge: &RepositoryForge, public_host: &str) -> Result<String, ForgeError> {
     if forge.host.is_empty() {
-        return Err(format!("no host for {}", forge.provider.name()));
+        return Err(ForgeError::Unsupported(format!(
+            "no host for {}",
+            forge.provider.name()
+        )));
     }
     Ok(if forge.host == public_host {
         forge.host.clone()
@@ -400,71 +437,41 @@ fn api_host(forge: &RepositoryForge, public_host: &str) -> Result<String, String
     })
 }
 
+/// The path of the repository of `forge`: `owner/name`, or
+/// `group/subgroup/name`.
+pub fn repository_path(forge: &RepositoryForge) -> Result<&str, ForgeError> {
+    match &forge.repository {
+        Some(Repository::Path(path)) => Ok(path),
+        _ => Err(ForgeError::Unsupported(format!(
+            "no path for the repository on {}",
+            forge.provider.name()
+        ))),
+    }
+}
+
+/// The path of the repository of `forge` as `owner/name`: GitHub, Gitea and
+/// Forgejo have no subgroups.
+pub fn owner_and_name(forge: &RepositoryForge) -> Result<&str, ForgeError> {
+    let path = repository_path(forge)?;
+    if path.matches('/').count() != 1 {
+        return Err(ForgeError::Unsupported(format!(
+            "no owner and name for the repository on {}: {path}",
+            forge.provider.name()
+        )));
+    }
+    Ok(path)
+}
+
 /// The backend of the provider of `forge`. An error tells why the plugin
 /// cannot ask the forge: no backend, no repository.
-pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backend>, String> {
-    let provider = forge.provider.name();
-    let repository = || {
-        forge
-            .repository
-            .clone()
-            .ok_or_else(|| format!("no path for the repository on {provider}"))
-    };
-    match forge.provider {
-        Provider::GitHub => {
-            let host = api_host(forge, "github.com")?;
-            if host != "github.com" {
-                return Err(format!("GitHub on {host} has no backend yet"));
-            }
-            let repository = repository()?;
-            if repository.matches('/').count() != 1 {
-                return Err(format!(
-                    "no owner and name for the repository on GitHub: {repository}"
-                ));
-            }
-            Ok(Box::new(GitHub::new(repository, limit)))
-        }
-        Provider::GitLab => Ok(Box::new(GitLab::new(
-            api_host(forge, "gitlab.com")?,
-            repository()?,
-            limit,
-        ))),
-        Provider::AzureDevOps => {
-            let repository = repository()?;
-            let parts: Vec<&str> = repository.split('/').collect();
-            let [organization, project, name] = parts.as_slice() else {
-                return Err(format!(
-                    "no organization, project and name on Azure DevOps: {repository}"
-                ));
-            };
-            Ok(Box::new(AzureDevOps::new(
-                azure::organization_url(&forge.host, organization),
-                (*project).to_owned(),
-                (*name).to_owned(),
-                limit,
-            )))
-        }
-        Provider::Gitea | Provider::Forgejo => {
-            let (flavor, public_host) = if forge.provider == Provider::Gitea {
-                (Flavor::Gitea, "gitea.com")
-            } else {
-                (Flavor::Forgejo, "codeberg.org")
-            };
-            let repository = repository()?;
-            if repository.matches('/').count() != 1 {
-                return Err(format!(
-                    "no owner and name for the repository on {provider}: {repository}"
-                ));
-            }
-            Ok(Box::new(Gitea::new(
-                api_host(forge, public_host)?,
-                repository,
-                flavor,
-                limit,
-            )))
-        }
-        _ => Err(format!("no backend for {provider} yet")),
-    }
+pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backend>, ForgeError> {
+    Ok(match forge.provider {
+        Provider::GitHub => Box::new(GitHub::from_forge(forge, limit)?),
+        Provider::GitLab => Box::new(GitLab::from_forge(forge, limit)?),
+        Provider::Gitea | Provider::Forgejo => Box::new(Gitea::from_forge(forge, limit)?),
+        Provider::AzureDevOps => Box::new(AzureDevOps::from_forge(forge, limit)?),
+        Provider::Unknown => return Err(ForgeError::NoBackend(forge.provider)),
+    })
 }
 
 /// Encode a value for a path segment or a query of a URL: each byte
@@ -577,7 +584,7 @@ mod tests {
                 Some(RepositoryForge {
                     provider: Provider::GitHub,
                     host: "github.com".to_owned(),
-                    repository: Some("owpac/herdr-worktrunk".to_owned()),
+                    repository: Some(Repository::Path("owpac/herdr-worktrunk".to_owned())),
                 }),
                 "{url}"
             );
@@ -585,7 +592,7 @@ mod tests {
         // A numeric owner is not a port.
         assert_eq!(
             from_remote("git@github.com:1234/repo.git").and_then(|forge| forge.repository),
-            Some("1234/repo".to_owned())
+            Some(Repository::Path("1234/repo".to_owned()))
         );
     }
 
@@ -596,7 +603,7 @@ mod tests {
             Some(RepositoryForge {
                 provider: Provider::GitLab,
                 host: "gitlab.com".to_owned(),
-                repository: Some("group/sub/app".to_owned()),
+                repository: Some(Repository::Path("group/sub/app".to_owned())),
             })
         );
     }
@@ -627,7 +634,7 @@ mod tests {
             Some(RepositoryForge {
                 provider: Provider::Forgejo,
                 host: "codeberg.org".to_owned(),
-                repository: Some("forgejo/forgejo".to_owned()),
+                repository: Some(Repository::Path("forgejo/forgejo".to_owned())),
             })
         );
     }
@@ -642,7 +649,7 @@ mod tests {
             Some(RepositoryForge {
                 provider: Provider::GitLab,
                 host: "git.company.example".to_owned(),
-                repository: Some("team/app".to_owned()),
+                repository: Some(Repository::Path("team/app".to_owned())),
             })
         );
         assert_eq!(from_worktrunk(&serde_json::json!({ "repo": {} })), None);
@@ -653,11 +660,13 @@ mod tests {
         let forge = RepositoryForge {
             provider: Provider::Unknown,
             host: "git.company.example".to_owned(),
-            repository: Some("team/app".to_owned()),
+            repository: Some(Repository::Path("team/app".to_owned())),
         };
 
         assert_eq!(
-            backend(&forge, Duration::from_secs(1)).err(),
+            backend(&forge, Duration::from_secs(1))
+                .err()
+                .map(|error| error.to_string()),
             Some("no backend for an unknown forge yet".to_owned())
         );
     }
@@ -677,7 +686,11 @@ mod tests {
         let expected = RepositoryForge {
             provider: Provider::AzureDevOps,
             host: "dev.azure.com".to_owned(),
-            repository: Some("myorg/My Project/my repo".to_owned()),
+            repository: Some(Repository::Azure(azure::Location {
+                organization: "myorg".to_owned(),
+                project: "My Project".to_owned(),
+                name: "my repo".to_owned(),
+            })),
         };
 
         assert_eq!(
@@ -691,11 +704,13 @@ mod tests {
         let limit = Duration::from_secs(1);
         assert!(backend(&expected, limit).is_ok());
         let without_project = RepositoryForge {
-            repository: Some("myorg/my-repo".to_owned()),
+            repository: Some(Repository::Path("myorg/my-repo".to_owned())),
             ..expected
         };
         assert_eq!(
-            backend(&without_project, limit).err(),
+            backend(&without_project, limit)
+                .err()
+                .map(|error| error.to_string()),
             Some("no organization, project and name on Azure DevOps: myorg/my-repo".to_owned())
         );
     }
@@ -733,7 +748,11 @@ mod tests {
             Ok(RepositoryForge {
                 provider: Provider::AzureDevOps,
                 host: "myorg.visualstudio.com".to_owned(),
-                repository: Some("myorg/My Project/my repo".to_owned()),
+                repository: Some(Repository::Azure(azure::Location {
+                    organization: "myorg".to_owned(),
+                    project: "My Project".to_owned(),
+                    name: "my repo".to_owned(),
+                })),
             })
         );
     }
@@ -751,33 +770,39 @@ mod tests {
         let forge = |provider, host: &str| RepositoryForge {
             provider,
             host: host.to_owned(),
-            repository: Some("group/sub/app".to_owned()),
+            repository: Some(Repository::Path("group/sub/app".to_owned())),
         };
         let limit = Duration::from_secs(1);
 
         let github = RepositoryForge {
-            repository: Some("owner/name".to_owned()),
+            repository: Some(Repository::Path("owner/name".to_owned())),
             ..forge(Provider::GitHub, "github.com")
         };
         assert!(backend(&github, limit).is_ok());
         assert!(backend(&forge(Provider::GitLab, "gitlab.com"), limit).is_ok());
         let codeberg = RepositoryForge {
-            repository: Some("forgejo/forgejo".to_owned()),
+            repository: Some(Repository::Path("forgejo/forgejo".to_owned())),
             ..forge(Provider::Forgejo, "codeberg.org")
         };
         assert!(backend(&codeberg, limit).is_ok());
         // Gitea has no subgroups.
         assert_eq!(
-            backend(&forge(Provider::Gitea, "gitea.com"), limit).err(),
+            backend(&forge(Provider::Gitea, "gitea.com"), limit)
+                .err()
+                .map(|error| error.to_string()),
             Some("no owner and name for the repository on Gitea: group/sub/app".to_owned())
         );
         assert_eq!(
-            backend(&forge(Provider::GitLab, ""), limit).err(),
+            backend(&forge(Provider::GitLab, ""), limit)
+                .err()
+                .map(|error| error.to_string()),
             Some("no host for GitLab".to_owned())
         );
         // GitHub has no subgroups.
         assert_eq!(
-            backend(&forge(Provider::GitHub, "github.com"), limit).err(),
+            backend(&forge(Provider::GitHub, "github.com"), limit)
+                .err()
+                .map(|error| error.to_string()),
             Some("no owner and name for the repository on GitHub: group/sub/app".to_owned())
         );
         let without_path = RepositoryForge {
@@ -785,7 +810,9 @@ mod tests {
             ..forge(Provider::GitLab, "gitlab.com")
         };
         assert_eq!(
-            backend(&without_path, limit).err(),
+            backend(&without_path, limit)
+                .err()
+                .map(|error| error.to_string()),
             Some("no path for the repository on GitLab".to_owned())
         );
     }

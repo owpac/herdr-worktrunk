@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::{self, Backend, Provider, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{
+    self, Backend, ForgeError, Provider, PullRequest, PullRequestState, RepositoryForge, PAGE_SIZE,
+};
 use crate::herdr::Error;
 use crate::process;
 
@@ -21,6 +23,17 @@ pub struct GitHub {
 impl GitHub {
     pub fn new(repository: String, limit: Duration) -> GitHub {
         GitHub { repository, limit }
+    }
+
+    /// The backend of `forge`: github.com only, with an owner and a name.
+    pub fn from_forge(forge: &RepositoryForge, limit: Duration) -> Result<GitHub, ForgeError> {
+        let host = forge::api_host(forge, "github.com")?;
+        if host != "github.com" {
+            return Err(ForgeError::Unsupported(format!(
+                "GitHub on {host} has no backend yet"
+            )));
+        }
+        Ok(GitHub::new(forge::owner_and_name(forge)?.to_owned(), limit))
     }
 }
 

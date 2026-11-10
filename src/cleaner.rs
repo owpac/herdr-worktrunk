@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::forge;
+use crate::forge::{self, ForgeError};
 use crate::fzf;
 use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
@@ -303,10 +303,10 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
 /// each tool for all its branches.
 struct RepositoryFacts {
     /// The forge, or the reason why the checks cannot ask a forge.
-    forge: Result<forge::RepositoryForge, String>,
+    forge: Result<forge::RepositoryForge, ForgeError>,
     /// The backend of the forge, for all the worktrees of the repository:
     /// it keeps what it reads, for example the open pull requests of Gitea.
-    backend: Result<Box<dyn forge::Backend>, String>,
+    backend: Result<Box<dyn forge::Backend>, ForgeError>,
     /// The default branch of `origin`: `origin/main`.
     origin_default_branch: Option<String>,
     /// The name of the default branch (`main`), for the texts.
@@ -386,8 +386,8 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
         Changes::Failed => PullRequests::NotNeeded("git status failed".to_owned()),
         _ => match &repository.backend {
             // A repository without a remote has no pull request.
-            Err(error) if error == forge::NO_REMOTE => PullRequests::NotNeeded(error.clone()),
-            Err(error) => PullRequests::Failed(error.clone()),
+            Err(error @ ForgeError::NoRemote) => PullRequests::NotNeeded(error.to_string()),
+            Err(error) => PullRequests::Failed(error.to_string()),
             // A forge that does not answer gives "no answer" after
             // forge::POPUP_TIME_LIMIT:
             // the worktree stays, and the spinner stops.

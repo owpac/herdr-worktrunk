@@ -16,7 +16,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::forge::encode_url_part as encode;
-use crate::forge::{self, Backend, Provider, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{
+    self, Backend, ForgeError, Provider, PullRequest, PullRequestState, RepositoryForge, PAGE_SIZE,
+};
 use crate::herdr::Error;
 use crate::process;
 
@@ -31,6 +33,16 @@ pub struct GitLab {
 }
 
 impl GitLab {
+    /// The backend of `forge`: its host of the API, and the path of the
+    /// project.
+    pub fn from_forge(forge: &RepositoryForge, limit: Duration) -> Result<GitLab, ForgeError> {
+        Ok(GitLab::new(
+            forge::api_host(forge, "gitlab.com")?,
+            forge::repository_path(forge)?.to_owned(),
+            limit,
+        ))
+    }
+
     pub fn new(host: String, project: String, limit: Duration) -> GitLab {
         GitLab {
             host,
