@@ -39,6 +39,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::forge::Provider;
 use crate::git;
 use crate::herdr::Snapshot;
 use crate::prune::{BranchStatus, KeptWhy};
@@ -226,7 +227,7 @@ impl PullRequests {
             Ok(BranchStatus::Open(number)) => PullRequests::Open(number),
             Ok(BranchStatus::Finished { pull_request, .. }) => PullRequests::Finished {
                 number: pull_request.number,
-                merged: pull_request.state == crate::github::PullRequestState::Merged,
+                merged: pull_request.state == crate::forge::PullRequestState::Merged,
             },
             Ok(BranchStatus::Kept { number, why }) => match why {
                 KeptWhy::WorkAfter => PullRequests::WorkAfter(number),
@@ -272,6 +273,40 @@ impl Facts {
         self.default_branch
             .as_deref()
             .unwrap_or("the default branch")
+    }
+
+    /// Return true if the pull requests come from GitLab, which has merge
+    /// requests.
+    fn is_gitlab(&self) -> bool {
+        self.forge == Provider::GitLab.name()
+    }
+
+    /// The number of a pull request as the forge writes it: `!3` on
+    /// GitLab (`#3` is an issue there), `#3` elsewhere.
+    fn number_text(&self, number: u64) -> String {
+        if self.is_gitlab() {
+            format!("!{number}")
+        } else {
+            format!("#{number}")
+        }
+    }
+
+    /// The short name of a pull request: `MR` on GitLab, `PR` elsewhere.
+    fn short_name(&self) -> &'static str {
+        if self.is_gitlab() {
+            "MR"
+        } else {
+            "PR"
+        }
+    }
+
+    /// The name of a pull request, for the questions.
+    fn long_name(&self) -> &'static str {
+        if self.is_gitlab() {
+            "merge request"
+        } else {
+            "pull request"
+        }
     }
 }
 
@@ -351,12 +386,8 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
     // A branch that was never pushed has no pull request, but only if the
     // forge gives no answer: a push without -u, or to another name, can
     // leave no remote branch here.
-    let forge_is_silent = matches!(
-        facts.pull_requests,
-        PullRequests::Failed(_) | PullRequests::NotChecked | PullRequests::NotNeeded(_)
-    );
     let has_no_pull_request = matches!(facts.pull_requests, PullRequests::None)
-        || (matches!(facts.push, Push::Never) && forge_is_silent);
+        || (matches!(facts.push, Push::Never) && forge_is_silent(&facts.pull_requests));
     if has_no_pull_request {
         return match facts.days {
             Some(days) if days >= u64::from(stale_days) => Reason::Old,
@@ -421,13 +452,14 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
     let number = facts
         .pull_requests
         .number()
-        .map(|number| format!("#{number}"))
+        .map(|number| facts.number_text(number))
         .unwrap_or_default();
+    let short = facts.short_name();
     let never_pushed = matches!(facts.push, Push::Never);
     let text = match reason {
         Reason::Checking => "checking…".to_owned(),
-        Reason::Merged => format!("PR {number} merged"),
-        Reason::Closed => format!("PR {number} closed"),
+        Reason::Merged => format!("{short} {number} merged"),
+        Reason::Closed => format!("{short} {number} closed"),
         Reason::Integrated => match &facts.integration {
             Integration::Integrated(how) => {
                 format!("merged: {}", integration_words(how, facts.main()))
@@ -435,18 +467,18 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
             _ => format!("merged into {}", facts.main()),
         },
         Reason::Old if never_pushed => "never pushed, no recent activity".to_owned(),
-        Reason::Old => "no PR, no recent activity".to_owned(),
-        Reason::Open => format!("PR {number} open"),
+        Reason::Old => format!("no {short}, no recent activity"),
+        Reason::Open => format!("{short} {number} open"),
         Reason::Recent if matches!(facts.integration, Integration::Integrated(_)) => {
             "merged, activity today".to_owned()
         }
         Reason::Recent if never_pushed => "never pushed, recent activity".to_owned(),
-        Reason::Recent => "no PR, recent activity".to_owned(),
+        Reason::Recent => format!("no {short}, recent activity"),
         Reason::Changes => "changes not committed".to_owned(),
         Reason::Agent => "an agent works here".to_owned(),
         Reason::IdleAgent => "an idle agent, no proof of the end".to_owned(),
-        Reason::WorkAfter => format!("work after PR {number}"),
-        Reason::InDefault => format!("PR {number} finished, commit in the default branch"),
+        Reason::WorkAfter => format!("work after {short} {number}"),
+        Reason::InDefault => format!("{short} {number} finished, commit in the default branch"),
         Reason::Unknown => format!("not checked: {}", unknown_detail(facts)),
     };
     if reason.is_leftover() && facts.agent == Agents::Idle {
@@ -461,15 +493,16 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
     let number = facts
         .pull_requests
         .number()
-        .map(|number| format!("#{number}"))
+        .map(|number| facts.number_text(number))
         .unwrap_or_default();
+    let name = facts.long_name();
     let days = facts.days.unwrap_or(0);
     match reason {
-        Reason::Merged => format!("Its pull request {number} is merged."),
-        Reason::Closed => format!("Its pull request {number} is closed."),
+        Reason::Merged => format!("Its {name} {number} is merged."),
+        Reason::Closed => format!("Its {name} {number} is closed."),
         Reason::Integrated => format!("{} contains its content.", facts.main()),
-        Reason::Old => format!("No pull request, and no change for {days} days."),
-        Reason::Open => format!("Careful: its pull request {number} is open."),
+        Reason::Old => format!("No {name}, and no change for {days} days."),
+        Reason::Open => format!("Careful: its {name} {number} is open."),
         Reason::Recent => format!("No proof that it is finished, and a change {days} days ago."),
         Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
         Reason::Agent => "Careful: an agent works in it.".to_owned(),
@@ -477,9 +510,9 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
             "Careful: an idle agent is in it, and no proof shows the end of its work.".to_owned()
         }
         Reason::WorkAfter => format!("Careful: the branch has work after {number}."),
-        Reason::InDefault => format!(
-            "Its pull request {number} is finished, and the default branch contains its commit."
-        ),
+        Reason::InDefault => {
+            format!("Its {name} {number} is finished, and the default branch contains its commit.")
+        }
         Reason::Checking | Reason::Unknown => "The cleaner did not check it.".to_owned(),
     }
 }
@@ -509,6 +542,15 @@ impl Mark {
             Mark::Unknown => (YELLOW, "?"),
         }
     }
+}
+
+/// Return true if the forge gave no answer about the pull requests: then
+/// only the push state of git can tell that a branch has no pull request.
+fn forge_is_silent(pull_requests: &PullRequests) -> bool {
+    matches!(
+        pull_requests,
+        PullRequests::Failed(_) | PullRequests::NotChecked | PullRequests::NotNeeded(_)
+    )
 }
 
 /// A line of the tab `checks`: the result, the layer, the fact, and the
@@ -589,10 +631,18 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
         Integration::NotChecked => waiting("Merged", "wt"),
     };
     let push = match &facts.push {
-        Push::Never => line(
+        Push::Never if forge_is_silent(&facts.pull_requests) => line(
             Mark::Pass,
             "Push",
             "never pushed: no pull request is possible",
+            "git",
+        ),
+        // A push without -u, or a branch from the ref of a pull request,
+        // has no remote branch here: the forge decides.
+        Push::Never => line(
+            Mark::Info,
+            "Push",
+            "no remote branch here: the forge decides",
             "git",
         ),
         Push::Pushed(remote) => line(Mark::Info, "Push", format!("pushed to {remote}"), "git"),
@@ -615,7 +665,8 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
             Mark::Pass,
             "Pull requests",
             format!(
-                "#{number} {}, with the last commit",
+                "{} {}, with the last commit",
+                facts.number_text(*number),
                 if *merged { "merged" } else { "closed" }
             ),
             &forge,
@@ -623,25 +674,34 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
         PullRequests::Open(number) => line(
             Mark::Fail,
             "Pull requests",
-            format!("#{number} open"),
+            format!("{} open", facts.number_text(*number)),
             &forge,
         ),
         PullRequests::WorkAfter(number) => line(
             Mark::Fail,
             "Pull requests",
-            format!("#{number} finished, but the branch has commits after it"),
+            format!(
+                "{} finished, but the branch has commits after it",
+                facts.number_text(*number)
+            ),
             &forge,
         ),
         PullRequests::InDefault(number) => line(
             Mark::Info,
             "Pull requests",
-            format!("#{number} finished, the default branch has the commit"),
+            format!(
+                "{} finished, the default branch has the commit",
+                facts.number_text(*number)
+            ),
             &forge,
         ),
         PullRequests::NoLocalCommit(number) => line(
             Mark::Unknown,
             "Pull requests",
-            format!("#{number} finished, but no local commit"),
+            format!(
+                "{} finished, but no local commit",
+                facts.number_text(*number)
+            ),
             &forge,
         ),
         PullRequests::NotNeeded(why) => line(
@@ -1075,6 +1135,71 @@ mod tests {
         let text = serde_json::to_string(&facts).unwrap();
 
         assert_eq!(serde_json::from_str::<Facts>(&text).unwrap(), facts);
+    }
+
+    #[test]
+    fn gitlab_gets_the_words_of_its_merge_requests() {
+        let gitlab = |pull_requests| Facts {
+            pull_requests,
+            forge: "GitLab".to_owned(),
+            ..facts()
+        };
+        let merged = gitlab(PullRequests::Finished {
+            number: 12,
+            merged: true,
+        });
+
+        assert_eq!(reason_text(Reason::Merged, &merged), "MR !12 merged");
+        assert_eq!(
+            question(Reason::Merged, &merged),
+            "Its merge request !12 is merged."
+        );
+        assert_eq!(
+            lines(&merged, Reason::Merged, 7)[4].text,
+            "!12 merged, with the last commit"
+        );
+        assert_eq!(
+            reason_text(Reason::Old, &gitlab(PullRequests::None)),
+            "no MR, no recent activity"
+        );
+        // GitHub keeps its words.
+        let github = Facts {
+            forge: "GitHub".to_owned(),
+            ..merged
+        };
+        assert_eq!(reason_text(Reason::Merged, &github), "PR #12 merged");
+    }
+
+    #[test]
+    fn the_push_layer_does_not_deny_a_pull_request_of_the_forge() {
+        let never_pushed = |pull_requests| Facts {
+            push: Push::Never,
+            pull_requests,
+            ..facts()
+        };
+        let push_line = |facts: &Facts| {
+            let shown = lines(facts, Reason::Recent, 7);
+            let line = &shown[3];
+            (line.mark, line.text.clone())
+        };
+
+        assert_eq!(
+            push_line(&never_pushed(PullRequests::Failed("gh failed".to_owned()))),
+            (
+                Mark::Pass,
+                "never pushed: no pull request is possible".to_owned()
+            )
+        );
+        assert_eq!(
+            push_line(&never_pushed(PullRequests::Finished {
+                number: 4,
+                merged: true
+            })),
+            (
+                Mark::Info,
+                "no remote branch here: the forge decides".to_owned()
+            )
+        );
     }
 
     #[test]

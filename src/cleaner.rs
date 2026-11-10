@@ -30,20 +30,18 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::forge;
 use crate::fzf;
 use crate::git::{self, canonical};
-use crate::github;
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
-use crate::process;
 use crate::stale::{self, OldWorktree, DAY};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
+use crate::wt;
 
 const DELETE_ALL_REQUEST: &str = "delete-all";
 const GHOST: &str = "worktree — type to filter";
@@ -67,13 +65,11 @@ const FRAME_INTERVAL: &str = "0.1";
 const RELOAD_INTERVAL: Duration = Duration::from_millis(100);
 /// The attempts to reach the socket of fzf, one for each reload interval.
 const SOCKET_ATTEMPTS: u32 = 30;
-/// The checks that run at the same time: each one calls gh.
+/// The checks that run at the same time: each one calls the forge.
 const WORKERS: usize = 8;
 /// Set when the popup closes without a choice: the checks stop writing
 /// the state file, so the plugin can remove it.
 static CHECKS_STOPPED: AtomicBool = AtomicBool::new(false);
-/// The time limit of the call to wt for the facts of a repository.
-const WT_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// The threads that list the checkouts of the workspaces.
 const LIST_THREADS: usize = 4;
 /// The id of the title of the group "To delete".
@@ -326,7 +322,7 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         (Some(branches), Some(remotes)) => leftover::parse_pushes(&branches, &remotes),
         _ => HashMap::new(),
     };
-    let listed = wt_list(main_checkout);
+    let listed = wt::list_json(main_checkout);
     let integrations = listed.as_ref().map(leftover::parse_integrations);
     let default_branch = git::default_branch(main_checkout);
     let main_name = listed
@@ -338,10 +334,7 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
                 .map(|branch| branch.trim_start_matches("origin/").to_owned())
         });
     // wt knows the forge, also a self-hosted one in its config.
-    let forge = match listed.as_ref().and_then(forge::from_worktrunk) {
-        Some(forge) => Ok(forge),
-        None => forge::from_origin(main_checkout),
-    };
+    let forge = forge::resolve(main_checkout, listed.as_ref());
     RepositoryFacts {
         forge,
         default_branch,
@@ -349,28 +342,6 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         integrations,
         pushes,
     }
-}
-
-/// The JSON of `wt list` for the worktrees of a repository: the
-/// integration of each branch, and the forge. None if wt fails or takes
-/// more than 30 s. The config of the user must not change the JSON: schema
-/// 2, and no `--full` (no network, no summary by an LLM).
-fn wt_list(main_checkout: &Path) -> Option<Value> {
-    let mut command = Command::new("wt");
-    command.arg("-C").arg(main_checkout).args([
-        "--config-set",
-        "list.json-schema=2",
-        "--config-set",
-        "list.full=false",
-        "list",
-        "--format",
-        "json",
-    ]);
-    let output = process::output_with_limit(&mut command, WT_TIME_LIMIT).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Check one worktree, layer by layer, then give the verdict.
@@ -414,7 +385,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
                 &entry.main_checkout,
                 repository.default_branch.as_deref(),
                 &entry.branch,
-                github::POPUP_TIME_LIMIT,
+                forge::POPUP_TIME_LIMIT,
             )),
         },
     };
@@ -1120,6 +1091,7 @@ fn parse_choice(text: &str, entries: &[Entry]) -> Option<Choice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, test_folder};
 
     fn entry(branch: &str, project: &str, reason: Reason, days: Option<u64>) -> Entry {
         Entry {
@@ -1339,37 +1311,6 @@ mod tests {
             Some(Choice::Delete(Box::new(entries[0].clone())))
         );
         assert_eq!(parse_choice("", &entries), None);
-    }
-
-    /// Run git in `folder` for a test, without the global config (for
-    /// example a signature with an agent).
-    fn git_in(folder: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(folder)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(arguments)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {arguments:?}");
-    }
-
-    /// A new empty folder for a test.
-    fn test_folder(name: &str) -> PathBuf {
-        let base = env::temp_dir().join(format!("herdr-worktrunk-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        base
     }
 
     #[test]

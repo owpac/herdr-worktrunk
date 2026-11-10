@@ -6,72 +6,66 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::forge::{Backend, PullRequest, PullRequestState};
 use crate::herdr::Error;
 use crate::process;
 
-/// The time limit of a gh command of the observer, in the background.
-pub const GH_TIME_LIMIT: Duration = Duration::from_secs(60);
-/// The time limit of a gh command of a popup: the user waits for it.
-pub const POPUP_TIME_LIMIT: Duration = Duration::from_secs(15);
+/// The backend of a repository on github.com.
+pub struct GitHub {
+    /// The repository: `owner/name`.
+    repository: String,
+    /// The time limit of each call to gh.
+    limit: Duration,
+}
 
-/// Return the GitHub repository (`owner/name`) of a remote URL, or None if
-/// the host of the remote is not `github.com`. An ssh alias of the host
-/// (`Host` in `~/.ssh/config`) gives None.
-pub fn repository_of(url: &str) -> Option<String> {
-    let (host, path) = crate::forge::split_remote(url)?;
-    if host != "github.com" {
-        return None;
+impl GitHub {
+    pub fn new(repository: String, limit: Duration) -> GitHub {
+        GitHub { repository, limit }
     }
-    let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, name) = path.split_once('/')?;
-    if owner.is_empty() || name.is_empty() || name.contains('/') {
-        return None;
+}
+
+impl Backend for GitHub {
+    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+        pull_requests(&self.repository, branch, self.limit)
     }
-    Some(path.to_owned())
+
+    fn contains(&self, head: &str, commit: &str) -> bool {
+        contains(&self.repository, head, commit, self.limit)
+    }
+
+    /// GitHub keeps the commits of a closed pull request in
+    /// `refs/pull/<number>/head`, without a time limit.
+    fn recover_command(&self, pull_request: &PullRequest, _commit: &str, branch: &str) -> String {
+        format!(
+            "git fetch origin pull/{}/head:{branch}",
+            pull_request.number
+        )
+    }
+
+    fn reference(&self, number: u64) -> String {
+        format!("pull request #{number}")
+    }
 }
 
 /// Run gh without a terminal, and return its output.
 fn run(arguments: &[&str], limit: Duration) -> Result<String, Error> {
-    let label = arguments
-        .iter()
-        .take(2)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let label = format!(
+        "gh {}",
+        arguments
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let mut command = Command::new("gh");
     command.args(arguments).env("GH_PROMPT_DISABLED", "1");
-    let output = process::output_with_limit(&mut command, limit)
-        .map_err(|error| Error::Command(format!("gh {label}: {error}")))?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Command(format!("gh {label}: {}", details.trim())));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// The state of a pull request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum PullRequestState {
-    Open,
-    Merged,
-    Closed,
-}
-
-/// A pull request of a branch.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-pub struct PullRequest {
-    pub number: u64,
-    pub state: PullRequestState,
-    /// The last commit of the pull request.
-    #[serde(rename = "headRefOid")]
-    pub head: String,
+    process::run_cli(&mut command, &label, limit)
 }
 
 /// Return the pull requests of `branch` of the repository itself, in all
 /// the states. The list is empty if the branch has no pull request.
-pub fn pull_requests(
+fn pull_requests(
     repository: &str,
     branch: &str,
     limit: Duration,
@@ -100,9 +94,18 @@ pub fn pull_requests(
 /// a fork with a branch of the same name: the function ignores them.
 fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
     #[derive(Deserialize)]
+    #[serde(rename_all = "UPPERCASE")]
+    enum State {
+        Open,
+        Merged,
+        Closed,
+    }
+    #[derive(Deserialize)]
     struct Listed {
-        #[serde(flatten)]
-        pull_request: PullRequest,
+        number: u64,
+        state: State,
+        #[serde(rename = "headRefOid")]
+        head: String,
         #[serde(rename = "isCrossRepository", default)]
         is_cross_repository: bool,
     }
@@ -111,7 +114,15 @@ fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
     Ok(listed
         .into_iter()
         .filter(|listed| !listed.is_cross_repository)
-        .map(|listed| listed.pull_request)
+        .map(|listed| PullRequest {
+            number: listed.number,
+            state: match listed.state {
+                State::Open => PullRequestState::Open,
+                State::Merged => PullRequestState::Merged,
+                State::Closed => PullRequestState::Closed,
+            },
+            head: listed.head,
+        })
         .collect())
 }
 
@@ -121,7 +132,7 @@ fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
 /// GitHub compares `commit...head`: the status `ahead` tells that `head`
 /// contains `commit`. If GitHub does not know `commit` (it is not
 /// pushed), the call fails and the function returns false.
-pub fn contains(repository: &str, head: &str, commit: &str, limit: Duration) -> bool {
+fn contains(repository: &str, head: &str, commit: &str, limit: Duration) -> bool {
     let endpoint = format!("repos/{repository}/compare/{commit}...{head}");
     run(&["api", &endpoint, "--jq", ".status"], limit).is_ok_and(|status| status.trim() == "ahead")
 }
@@ -151,46 +162,5 @@ mod tests {
             ]
         );
         assert_eq!(pull_requests[0].head, "3541f65");
-    }
-
-    #[test]
-    fn the_forms_of_a_github_url_give_the_repository() {
-        for url in [
-            "git@github.com:owpac/herdr-worktrunk.git",
-            "github.com:owpac/herdr-worktrunk",
-            "ssh://git@github.com/owpac/herdr-worktrunk.git",
-            "ssh://git@github.com:22/owpac/herdr-worktrunk.git",
-            "https://github.com/owpac/herdr-worktrunk",
-            "https://user@github.com/owpac/herdr-worktrunk.git/",
-            "git://github.com/owpac/herdr-worktrunk.git",
-        ] {
-            assert_eq!(
-                repository_of(url).as_deref(),
-                Some("owpac/herdr-worktrunk"),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_numeric_owner_is_not_a_port() {
-        assert_eq!(
-            repository_of("git@github.com:1234/repo.git").as_deref(),
-            Some("1234/repo")
-        );
-    }
-
-    #[test]
-    fn a_remote_outside_github_has_no_repository() {
-        for url in [
-            "git@gitlab.com:owpac/prompts.git",
-            "git@github-work:owpac/prompts.git",
-            "https://github.example.com/owpac/prompts",
-            "/work/bare-repo.git",
-            "file:///work/bare-repo.git",
-            "https://github.com/owpac",
-        ] {
-            assert_eq!(repository_of(url), None, "{url}");
-        }
     }
 }

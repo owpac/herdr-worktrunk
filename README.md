@@ -107,7 +107,7 @@ The agents follow the rules of the observer:
 | Forge | Merged, push | Pull requests |
 |-------|-------------------|---------------|
 | GitHub | yes | yes, with `gh` |
-| GitLab | yes | planned (`glab`) |
+| GitLab | yes | yes, with `glab` |
 | Gitea, Forgejo, Codeberg | yes | planned |
 | Azure DevOps | yes | planned (`az`) |
 | Other forges | yes | no |
@@ -118,6 +118,8 @@ The forge comes from the host of `origin`: a host with github, gitlab, gitea, fo
 [projects."git.company.example/*"]
 forge.platform = "gitlab"
 ```
+
+An ssh alias of a host (`Host gitlab-work` in `~/.ssh/config`) gives the real host with `ssh -G`. The CLI of the forge keeps the login of each host: `gh auth login`, or `glab auth login --hostname <host>`. A public project on gitlab.com needs no login. Tested with glab 1.128.
 
 ### How the checks run
 
@@ -159,13 +161,16 @@ The plugin starts an observer with herdr. Every 2 seconds, it reads the state of
 
 1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell.
 2. **The workspace of a removed worktree closes**, if no agent works in it.
-3. **The worktrees of the finished pull requests go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces on GitHub.
+3. **The worktrees of the finished pull requests go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces on GitHub and GitLab.
 4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days.
 
 <details>
 <summary>The rules of <code>prune_merged</code></summary>
 
-The thread removes the worktree of a branch only if the branch has no open pull request, if the default branch does not contain the local commit, and if a merged or closed pull request contains the local commit (its last commit, or a later commit after "Update branch" on GitHub). GitHub keeps each local commit: in the default branch after a merge, and in `refs/pull/<number>/head` after a close. After the removal of a closed pull request, the log gives the command that gets the branch back: `git fetch origin pull/<number>/head:<branch>`.
+The thread removes the worktree of a branch only if the branch has no open pull request, if the default branch does not contain the local commit, and if a merged or closed pull request contains the local commit (its last commit, or a later commit after "Update branch" on GitHub). The forge keeps each local commit: in the default branch after a merge, and with the pull request after a close. After the removal of a closed pull request, the log gives the command that gets the branch back:
+
+- GitHub: `git fetch origin pull/<number>/head:<branch>`.
+- GitLab: `git fetch origin <commit>:refs/heads/<branch>`. GitLab deletes the ref of a merge request 14 days after its close, but keeps its commits.
 
 The agents of a finished worktree:
 
@@ -174,7 +179,7 @@ The agents of a finished worktree:
 
 The thread keeps a worktree with an open pull request, with its local commit in the default branch (`wt step prune` removes it), with changes that are not committed, or with a new commit after the check. It also keeps the main worktree, a detached worktree and a locked worktree, and ignores a pull request from a fork.
 
-The thread removes the worktree and its branch with `wt remove --force-delete`, never with `--force`. It runs no `git fetch`: gh uses the API of GitHub. `list-merged` prints the worktrees that the thread removes, without a removal:
+The thread removes the worktree and its branch with `wt remove --force-delete`, never with `--force`. It runs no `git fetch`: gh and glab use the API of the forge. `list-merged` prints the worktrees that the thread removes, without a removal:
 
 ```sh
 bin/herdr-worktrunk list-merged <folder of the repository>
@@ -188,7 +193,7 @@ bin/herdr-worktrunk list-merged <folder of the repository>
 - The observer watches only the agents. A shell that changes its folder does not move.
 - A pane moves only if the observer sees the same difference in 2 snapshots in a row. A moved pane gets a new pane ID: address an agent with its herdr name.
 - A workspace where an agent works stays open after the removal of its worktree. Close it with the herdr key `close_workspace`.
-- `prune_merged` checks only a remote `origin` on `github.com`, and only when herdr runs. It stops a `gh` command after 1 minute, and a `git` command after 30 seconds.
+- `prune_merged` checks only a remote `origin` on a forge with a backend (see [The forges](#the-forges)), and only when herdr runs. It stops a command of the forge after 1 minute, and a `git` command after 30 seconds.
 - The observer never approves the hooks of a project (`--yes`). If a hook has no approval, run `wt config approvals add` in the repository.
 - The observer writes each removal and each new error in `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
 
@@ -216,7 +221,7 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 observe = true
 
 # The observer removes the worktree of each merged or closed pull request (default: false).
-# Needs gh.
+# Needs gh (GitHub) or glab (GitLab).
 prune_merged = false
 
 # Once a day, open the cleaner if a worktree has no pull request and no change for this number
@@ -248,6 +253,7 @@ The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`
 - worktrunk (`wt`) and git on the `PATH` of the herdr server.
 - [fzf](https://github.com/junegunn/fzf) 0.73 or later (tested with 0.74): the popups use its events `every` and `load`, its server `--listen`, and its options `--footer`, `--ghost` and `--gutter`.
 - For the pull requests on GitHub: [gh](https://cli.github.com) with a login (`gh auth login`).
+- For the merge requests on GitLab: [glab](https://gitlab.com/gitlab-org/cli) with a login (`glab auth login`). A public project on gitlab.com needs no login. Tested with glab 1.128.
 
 ## Installation
 

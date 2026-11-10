@@ -7,6 +7,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::herdr::Error;
+
 /// The time between 2 checks of the end of the command.
 const WAIT_STEP: Duration = Duration::from_millis(50);
 
@@ -56,6 +58,25 @@ fn read_in_thread(pipe: Option<impl Read + Send + 'static>) -> JoinHandle<Vec<u8
     })
 }
 
+/// Run the CLI of a forge without a terminal, and return its standard
+/// output. `label` names the command in the errors, for example
+/// `gh pr list`. A missing program gives "<program> is not installed".
+pub fn run_cli(command: &mut Command, label: &str, limit: Duration) -> Result<String, Error> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    let output = output_with_limit(command, limit).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            Error::Command(format!("{program} is not installed"))
+        } else {
+            Error::Command(format!("{label}: {error}"))
+        }
+    })?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Command(format!("{label}: {}", details.trim())));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +102,34 @@ mod tests {
 
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod run_cli_tests {
+    use super::*;
+
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn run_cli_gives_the_output_or_a_clear_error() {
+        assert_eq!(
+            run_cli(Command::new("echo").arg("hello"), "echo", LIMIT).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(
+            run_cli(&mut Command::new("herdr-worktrunk-no-such-cli"), "x", LIMIT)
+                .unwrap_err()
+                .to_string(),
+            "herdr-worktrunk-no-such-cli is not installed"
+        );
+        let failed = run_cli(
+            Command::new("sh").args(["-c", "echo oops >&2; exit 1"]),
+            "sh -c",
+            LIMIT,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(failed, "sh -c: oops");
     }
 }

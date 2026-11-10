@@ -31,8 +31,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::actions;
+use crate::forge::PullRequestState;
 use crate::git::{self, Checkout, LinkedWorktree};
-use crate::github::PullRequestState;
 use crate::herdr::{self, Error, Pane, Snapshot};
 use crate::prune::{self, FinishedWorktree};
 use crate::stale::{self, OldWorktree};
@@ -773,7 +773,7 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
 /// pull request, for the daily question, or None if the check failed.
 ///
 /// A worktree where an agent must stay (see `agent_decision`) costs no
-/// call to GitHub.
+/// call to the forge.
 fn prune_repository(
     main_checkout: &Path,
     view: &Mutex<PruneView>,
@@ -806,7 +806,7 @@ fn prune_repository(
 /// Remove one finished worktree and its branch.
 ///
 /// The thread reads the view and the commit of the branch just before the
-/// removal: during the calls to GitHub, an agent can enter the worktree,
+/// removal: during the calls to the forge, an agent can enter the worktree,
 /// or a commit can change the branch. If idle agents work in the worktree,
 /// the thread first closes their panes. Then the observer closes the
 /// workspace of the removed worktree (rule 2).
@@ -849,15 +849,14 @@ fn finish_worktree(
         return Ok(());
     }
     wt::remove_finished(main_checkout, &worktree.path)?;
-    let number = worktree.pull_request.number;
     let message = match worktree.pull_request.state {
         PullRequestState::Closed => format!(
-            "removed the worktree of {}: its pull request #{number} is closed. To get the branch back: git fetch origin pull/{number}/head:{}",
-            worktree.branch, worktree.branch
+            "removed the worktree of {}: its {} is closed. To get the branch back: {}",
+            worktree.branch, worktree.reference, worktree.recover_command
         ),
         _ => format!(
-            "removed the worktree of {}: its pull request #{number} is merged",
-            worktree.branch
+            "removed the worktree of {}: its {} is merged",
+            worktree.branch, worktree.reference
         ),
     };
     log.write(&message);
@@ -1175,6 +1174,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_folder;
 
     fn checkout(root: &str) -> Checkout {
         Checkout {
@@ -1594,17 +1594,6 @@ mod tests {
         let binary = binary_to_run(Path::new(OLD_BINARY), Some(Path::new(OLD_BINARY)), true);
 
         assert_eq!(binary, Some(PathBuf::from(OLD_BINARY)));
-    }
-
-    /// A new empty folder for one test, in the temporary folder.
-    fn test_folder(name: &str) -> PathBuf {
-        let folder = env::temp_dir().join(format!(
-            "herdr-worktrunk-test-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&folder);
-        fs::create_dir_all(&folder).unwrap();
-        folder
     }
 
     #[test]
