@@ -109,7 +109,7 @@ The agents follow the rules of the observer:
 | GitHub | yes | yes, with `gh` |
 | GitLab | yes | yes, with `glab` |
 | Gitea, Forgejo, Codeberg | yes | yes, with `tea` |
-| Azure DevOps | yes | planned (`az`) |
+| Azure DevOps | yes | yes, with `az` |
 | Other forges | yes | no |
 
 The forge comes from the host of `origin`: a host with github, gitlab, gitea, forgejo or codeberg in its name, or Azure DevOps. For a self-hosted forge with another name, give its platform to worktrunk, in `~/.config/worktrunk/config.toml`:
@@ -119,7 +119,7 @@ The forge comes from the host of `origin`: a host with github, gitlab, gitea, fo
 forge.platform = "gitlab"
 ```
 
-An ssh alias of a host (`Host gitlab-work` in `~/.ssh/config`) gives the real host with `ssh -G`. The CLI of the forge keeps the login of each host: `gh auth login`, `glab auth login --hostname <host>`, or `tea logins add --url https://<host>`. A public project on gitlab.com needs no login. Tested with glab 1.128.
+An ssh alias of a host (`Host gitlab-work` in `~/.ssh/config`) gives the real host with `ssh -G`. The CLI of the forge keeps the login of each host: `gh auth login`, `glab auth login --hostname <host>`, `tea logins add --url https://<host>`, or `az login`. A public project on gitlab.com needs no login. Tested with glab 1.128.
 
 On Gitea, the plugin sees fewer pull requests than on Forgejo:
 
@@ -127,6 +127,8 @@ On Gitea, the plugin sees fewer pull requests than on Forgejo:
 - Gitea has no such filter. The plugin reads the open pull requests of the repository (250 at most), then one pull request of the branch into the default branch. A finished pull request into another branch stays unknown.
 
 Gitea and Forgejo give the commit of the branch now as the head of a finished pull request. Thus the plugin reads the commits of each finished pull request, and looks for the local commit in this list.
+
+On Azure DevOps, only the last commit of a finished pull request proves its end. The plugin never lets `az` install its extension `azure-devops`: install it first.
 
 ### How the checks run
 
@@ -179,6 +181,7 @@ The thread removes the worktree of a branch only if the branch has no open pull 
 - GitHub: `git fetch origin pull/<number>/head:<branch>`.
 - GitLab: `git fetch origin <commit>:refs/heads/<branch>`. GitLab deletes the ref of a merge request 14 days after its close, but keeps its commits.
 - Gitea and Forgejo: `git fetch origin pull/<number>/head:<branch>`.
+- Azure DevOps: `git fetch origin <commit>:refs/heads/<branch>`.
 
 The agents of a finished worktree:
 
@@ -229,7 +232,7 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 observe = true
 
 # The observer removes the worktree of each merged or closed pull request (default: false).
-# Needs gh (GitHub), glab (GitLab) or tea (Gitea, Forgejo).
+# Needs gh (GitHub), glab (GitLab), tea (Gitea, Forgejo) or az (Azure DevOps).
 prune_merged = false
 
 # Once a day, open the cleaner if a worktree has no pull request and no change for this number
@@ -263,6 +266,7 @@ The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`
 - For the pull requests on GitHub: [gh](https://cli.github.com) with a login (`gh auth login`).
 - For the merge requests on GitLab: [glab](https://gitlab.com/gitlab-org/cli) with a login (`glab auth login`). A public project on gitlab.com needs no login. Tested with glab 1.128.
 - For the pull requests on Gitea and Forgejo: [tea](https://gitea.com/gitea/tea) 0.16 or later (its command `api`), with a login for each host (`tea logins add`).
+- For the pull requests on Azure DevOps: the [Azure CLI](https://learn.microsoft.com/cli/azure/) with its extension `azure-devops` (`az extension add --name azure-devops`), and a login (`az login`, or `az devops login` with a personal access token).
 
 ## Installation
 
