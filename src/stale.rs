@@ -22,6 +22,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DAY: u64 = 86_400;
 
 /// The time now, in seconds since 1970.
+/// The whole days between the time `time` and `now`, in seconds since the
+/// epoch. A time in the future gives 0.
+pub fn days_since(time: u64, now: u64) -> u64 {
+    now.saturating_sub(time) / DAY
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -153,7 +159,7 @@ pub fn select_old(
                 main_checkout: main_checkout.to_path_buf(),
                 path,
                 branch: worktree.branch,
-                days: now.saturating_sub(activity) / DAY,
+                days: days_since(activity, now),
                 close_idle_agents: false,
             })
         })
