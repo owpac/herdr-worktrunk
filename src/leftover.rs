@@ -720,7 +720,11 @@ fn push_line(facts: &Facts, reason: Reason) -> Line {
 }
 
 fn pull_requests_line(facts: &Facts, reason: Reason) -> Line {
-    let forge = facts.forge.map_or("forge", Provider::name);
+    let forge = match facts.forge {
+        Some(provider) => provider.name(),
+        None if reason == Reason::Checking => "forge",
+        None => "no forge",
+    };
     let number = facts.pull_request_number_text();
     let pull_requests = |mark: Mark, text: String| line(mark, "Pull requests", text, forge);
     match &facts.pull_requests {

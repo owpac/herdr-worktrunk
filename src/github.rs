@@ -1,7 +1,6 @@
 //! The calls to GitHub, with the gh CLI: the removal of the finished
 //! worktrees (`prune_merged`) and the checks of the popup cleaner.
 
-use std::env;
 use std::process::Command;
 use std::time::Duration;
 
@@ -22,8 +21,9 @@ pub struct GitHub {
 }
 
 impl GitHub {
-    /// Run gh without a terminal, and return its output. Not in a
-    /// repository: gh must not read the remotes of a checkout.
+    /// Run gh without a terminal, and return its output. The arguments
+    /// name the repository: gh reads no remote. gh runs in the folder of the
+    /// process, where a shim of mise finds its version.
     fn gh(&self, arguments: &[&str]) -> Result<String, Error> {
         let label = format!(
             "gh {}",
@@ -35,10 +35,7 @@ impl GitHub {
                 .join(" ")
         );
         let mut command = Command::new("gh");
-        command
-            .args(arguments)
-            .env("GH_PROMPT_DISABLED", "1")
-            .current_dir(env::temp_dir());
+        command.args(arguments).env("GH_PROMPT_DISABLED", "1");
         process::run_cli(&mut command, &label, self.limit)
     }
 

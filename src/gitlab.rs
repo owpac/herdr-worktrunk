@@ -10,7 +10,6 @@
 //!   `projects/<project>/repository/merge_base` of the commit and of the
 //!   head. The merge base is the commit itself if the head contains it.
 
-use std::env;
 use std::process::Command;
 use std::time::Duration;
 
@@ -60,10 +59,7 @@ impl GitLab {
             .args(["api", "--hostname", &self.host, endpoint])
             .env("GLAB_NO_PROMPT", "1")
             .env("GLAB_CHECK_UPDATE", "false")
-            .env("NO_COLOR", "1")
-            // Not in a repository: glab must not read the remotes of a
-            // checkout.
-            .current_dir(env::temp_dir());
+            .env("NO_COLOR", "1");
         process::run_cli(&mut command, "glab api", self.limit)
     }
 

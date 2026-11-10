@@ -90,9 +90,10 @@ impl Gitea {
         } else {
             (Flavor::Forgejo, "codeberg.org")
         };
+        let repository = forge::owner_and_name(forge)?.to_owned();
         Ok(Gitea::new(
             forge::api_host(forge, public_host)?,
-            forge::owner_and_name(forge)?.to_owned(),
+            repository,
             flavor,
             limit,
         ))
@@ -118,7 +119,7 @@ impl Gitea {
             .args(["api", "--login", &login, "-i", endpoint])
             .env("NO_COLOR", "1")
             // Not in a repository: tea must not read the remotes of a
-            // checkout.
+            // checkout. A shim of mise then finds only its global version.
             .current_dir(env::temp_dir());
         let output = process::cli_output(&mut command, "tea api", self.limit)?;
         let stderr = String::from_utf8_lossy(&output.stderr);

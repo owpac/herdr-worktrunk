@@ -10,7 +10,6 @@
 //! pull request. A commit on the forge after the local commit (for example
 //! a suggestion that a review applies) keeps the worktree.
 
-use std::env;
 use std::process::Command;
 use std::time::Duration;
 
@@ -111,8 +110,7 @@ impl AzureDevOps {
             .env("AZURE_CORE_COLLECT_TELEMETRY", "false")
             // The observer runs in the background: it must not install
             // software.
-            .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no")
-            .current_dir(env::temp_dir());
+            .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no");
         process::run_cli(&mut command, "az repos pr list", self.limit)
     }
 }

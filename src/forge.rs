@@ -109,16 +109,22 @@ pub trait Backend: Send + Sync {
 const OBSERVER_FORGE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// The provider of a forge.
+/// Its JSON name is the name of worktrunk: `github`, `azure-devops`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum Provider {
+    #[serde(rename = "github")]
     GitHub,
+    #[serde(rename = "gitlab")]
     GitLab,
+    #[serde(rename = "gitea")]
     Gitea,
     /// Forgejo, and Codeberg, its public host.
+    #[serde(rename = "forgejo")]
     Forgejo,
+    #[serde(rename = "azure-devops")]
     AzureDevOps,
     /// A host that the plugin does not know.
+    #[serde(rename = "unknown")]
     Unknown,
 }
 
@@ -601,6 +607,25 @@ mod tests {
             None
         );
         assert_eq!(from_remote("/work/bare-repo.git"), None);
+    }
+
+    #[test]
+    fn the_json_name_of_a_provider_is_the_name_of_worktrunk() {
+        for provider in [
+            Provider::GitHub,
+            Provider::GitLab,
+            Provider::Gitea,
+            Provider::Forgejo,
+            Provider::AzureDevOps,
+            Provider::Unknown,
+        ] {
+            let name = serde_json::to_string(&provider).unwrap();
+            assert_eq!(
+                Provider::from_worktrunk(name.trim_matches('"')),
+                provider,
+                "{name}"
+            );
+        }
     }
 
     #[test]
