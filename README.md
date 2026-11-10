@@ -55,7 +55,7 @@ The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a term
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes`, and `checks`: the verdict and the result of each layer. |
 | `Esc` | Quits. |
 
-A deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses changes that are not committed. The cleaner refuses a worktree where an agent works.
+A deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses changes that are not committed.
 
 ### The layers of proof
 
@@ -63,9 +63,9 @@ The cleaner checks each worktree layer by layer, from the cheapest to the most s
 
 | Layer | Source | Fact |
 |-------|--------|------|
-| Agent | herdr | An agent works in the worktree. |
+| Agent | herdr | An agent is in the worktree: busy, or idle (`idle` or `done`). |
 | Changes | `git status` | Changes that are not committed. |
-| Integration | `wt list` | The content of the branch is in the default branch: merge, rebase or squash merge. Any forge. |
+| Merged | `wt list` | The content of the branch is in the default branch: merge, rebase or squash merge. Any forge. |
 | Push | git | A branch that was never pushed has no pull request. A deleted remote branch is a hint only. |
 | Pull requests | the forge | Open, merged or closed, and the proof that a finished pull request contains the last commit. |
 | Activity | git | The days since the last commit, checkout or reset. A `git status` does not count. |
@@ -74,26 +74,35 @@ The verdict follows this order:
 
 ```mermaid
 flowchart TD
-    start([Worktree]) --> busy{"Agent<br/>or changes?"}
+    start([Worktree]) --> busy{"Busy agent<br/>or changes?"}
     busy -->|yes| kept1[Kept]
     busy -->|no| open{"Open<br/>pull request?"}
     open -->|yes| kept2[Kept]
     open -->|no| finished{"Finished pull request<br/>with the last commit?"}
     finished -->|yes| delete1[To delete]
-    finished -->|no| integrated{"Content in the default branch,<br/>1 day without activity?"}
-    integrated -->|yes| delete2[To delete]
-    integrated -->|no| nopr{"No pull request,<br/>or never pushed?"}
+    finished -->|no| merged{"Branch merged,<br/>1 day without activity?"}
+    merged -->|yes| delete2[To delete]
+    merged -->|no| nopr{"No pull request,<br/>or never pushed?"}
     nopr -->|no| kept3["Kept: no proof"]
     nopr -->|yes| old{"stale_days days<br/>without activity?"}
-    old -->|yes| delete3[To delete]
+    old -->|yes| idle{"Idle agent?"}
+    idle -->|no| delete3[To delete]
+    idle -->|yes| kept5["Kept: idle agent"]
     old -->|no| kept4["Kept: recent"]
 ```
 
-A new worktree has the commit of the default branch, so it is "integrated" at once: the day without activity keeps it. A forge that gives no answer (no login, no network, a limit of 15 s) never gives a leftover: the row says "not checked".
+A new worktree has the commit of the default branch, so it is "merged" at once: the day without activity keeps it. A forge that gives no answer (no login, no network, a limit of 15 s) never gives a leftover: the row says "not checked".
+
+The agents follow the rules of the observer:
+
+- An agent that works (`working`, `blocked`, `unknown`), or an agent in the focused workspace, keeps the worktree.
+- An idle agent (`idle` or `done`) does not keep a worktree with a proof of the end: a finished pull request, or a merged branch. The deletion closes the agent first, and gives the command that resumes it, for example `claude --resume <session>`.
+- An idle agent keeps an old worktree without a proof of the end.
+- An open pull request keeps the worktree, with or without an agent.
 
 ### The forges
 
-| Forge | Integration, push | Pull requests |
+| Forge | Merged, push | Pull requests |
 |-------|-------------------|---------------|
 | GitHub | yes | yes, with `gh` |
 | GitLab | yes | planned (`glab`) |
@@ -130,7 +139,7 @@ sequenceDiagram
     Popup->>User: the question (popup confirm)
 ```
 
-- The list shows before any check. One call to wt (30 s at most) gives the integration of each worktree and the forge of a repository, with the forge config of worktrunk.
+- The list shows before any check. One call to wt (30 s at most) tells if each worktree is merged, and gives the forge of a repository, with the forge config of worktrunk.
 - `every(0.1)` of fzf turns the spinners without a process. The cursor stays on its worktree when the list reloads.
 - After a question, the list comes back with the results of the last checks. A failed check runs again.
 - With `fetch_before_check = true`, the cleaner fetches `origin` first. Off by default: a fetch can ask the ssh agent (for example 1Password) for a key.

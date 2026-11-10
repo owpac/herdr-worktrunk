@@ -37,7 +37,7 @@ use crate::fzf;
 use crate::git::{self, canonical};
 use crate::github;
 use crate::herdr::{self, Error};
-use crate::leftover::{self, Changes, Facts, Integration, PullRequests, Push, Reason};
+use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::process;
 use crate::stale::{self, OldWorktree, DAY};
@@ -89,6 +89,7 @@ fn glyph(reason: Reason) -> (&'static str, &'static str) {
         Reason::Open | Reason::Recent | Reason::WorkAfter | Reason::InDefault => (GREEN, "✓"),
         Reason::Changes => (YELLOW, "●"),
         Reason::Agent => (ACCENT, "◐"),
+        Reason::IdleAgent => (DIM, "◐"),
         _ => (DIM, "?"),
     }
 }
@@ -104,14 +105,14 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// A worktree before its checks. A worktree with an agent gets its
-    /// verdict at once.
-    fn new(path: PathBuf, branch: String, main_checkout: PathBuf, agent: bool) -> Entry {
+    /// A worktree before its checks. A worktree with an agent that works
+    /// gets its verdict at once.
+    fn new(path: PathBuf, branch: String, main_checkout: PathBuf, agent: Agents) -> Entry {
         Entry {
             path,
             branch,
             main_checkout,
-            reason: if agent {
+            reason: if agent == Agents::Busy {
                 Reason::Agent
             } else {
                 Reason::Checking
@@ -139,6 +140,7 @@ impl Entry {
             path: self.path.clone(),
             branch: self.branch.clone(),
             days: self.facts.days.unwrap_or(0),
+            close_idle_agents: self.facts.agent == Agents::Idle && self.reason.is_leftover(),
         }
     }
 }
@@ -163,9 +165,9 @@ pub fn read_state(path: &Path) -> Vec<Entry> {
         .collect()
 }
 
-/// The main checkouts of the repositories of the herdr workspaces, and
-/// the checkouts that an agent uses (its folder, or its workspace).
-fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
+/// The main checkouts of the repositories of the herdr workspaces, the
+/// workspace of each checkout, and the snapshot of herdr (for the agents).
+fn herdr_repositories() -> Result<HerdrState, Error> {
     let snapshot = herdr::snapshot()?;
     // A few threads: herdr and git take about 20 ms for each workspace,
     // and the list must show at once. herdr refuses too many worktree
@@ -207,26 +209,29 @@ fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
             .collect()
     });
     let mut repositories = Vec::new();
-    let mut workspace_roots = HashMap::new();
+    let mut workspace_of_checkout = HashMap::new();
     for (workspace_id, found) in checkouts {
         let Some((root, main)) = found else {
             continue;
         };
-        workspace_roots.insert(workspace_id, root);
+        workspace_of_checkout.insert(root, workspace_id);
         if !repositories.contains(&main) {
             repositories.push(main);
         }
     }
-    let mut busy = HashSet::new();
-    for pane in snapshot.panes.iter().filter(|pane| pane.agent.is_some()) {
-        if let Some(found) = pane.folder().and_then(git::checkout_of) {
-            busy.insert(canonical(&found.root));
-        }
-        if let Some(root) = workspace_roots.get(&pane.workspace_id) {
-            busy.insert(root.clone());
-        }
-    }
-    Ok((repositories, busy))
+    Ok(HerdrState {
+        repositories,
+        workspace_of_checkout,
+        snapshot,
+    })
+}
+
+/// The state of herdr for the list: the repositories of the workspaces,
+/// the workspace of each checkout, and the snapshot (for the agents).
+struct HerdrState {
+    repositories: Vec<PathBuf>,
+    workspace_of_checkout: HashMap<PathBuf, String>,
+    snapshot: herdr::Snapshot,
 }
 
 /// The linked worktrees of `scope` (one repository), or of all the
@@ -235,7 +240,11 @@ fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
 /// results of an earlier list (the return after a question): these
 /// worktrees keep their result without a new check.
 pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<Entry>, Error> {
-    let (mut repositories, busy) = herdr_repositories()?;
+    let HerdrState {
+        mut repositories,
+        workspace_of_checkout,
+        snapshot,
+    } = herdr_repositories()?;
     if let Some(scope) = scope {
         let main = git::checkout_of(scope)
             .map(|checkout| canonical(&checkout.main_checkout()))
@@ -244,14 +253,11 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
             })?;
         repositories = vec![main];
     }
+    // A worktree without agent, then and now, keeps its last result.
     let known: HashMap<&Path, &Entry> = previous
         .iter()
-        .filter(|entry| {
-            !matches!(
-                entry.reason,
-                Reason::Checking | Reason::Agent | Reason::Unknown
-            )
-        })
+        .filter(|entry| entry.facts.agent == Agents::None)
+        .filter(|entry| !matches!(entry.reason, Reason::Checking | Reason::Unknown))
         .map(|entry| (entry.path.as_path(), entry))
         .collect();
     let listed: Vec<(PathBuf, Vec<git::LinkedWorktree>)> = thread::scope(|scope| {
@@ -274,13 +280,19 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
     for (repository, worktrees) in listed {
         for worktree in worktrees {
             let path = canonical(&worktree.path);
-            if busy.contains(&path) {
-                entries.push(Entry::new(path, worktree.branch, repository.clone(), true));
-                continue;
-            }
+            let workspace_id = workspace_of_checkout.get(&path).map(String::as_str);
+            let agents =
+                leftover::agents_state(&leftover::agents_of(&snapshot, &path, workspace_id));
             match known.get(path.as_path()) {
-                Some(entry) if entry.branch == worktree.branch => entries.push((*entry).clone()),
-                _ => entries.push(Entry::new(path, worktree.branch, repository.clone(), false)),
+                Some(entry) if entry.branch == worktree.branch && agents == Agents::None => {
+                    entries.push((*entry).clone())
+                }
+                _ => entries.push(Entry::new(
+                    path,
+                    worktree.branch,
+                    repository.clone(),
+                    agents,
+                )),
             }
         }
     }
@@ -293,7 +305,10 @@ struct RepositoryFacts {
     /// The forge, or the reason why the checks cannot ask a forge.
     forge: Result<forge::RepositoryForge, String>,
     default_branch: Option<String>,
-    integrations: HashMap<String, Integration>,
+    /// The name of the default branch (`main`), for the texts.
+    main_name: Option<String>,
+    /// The merge of each worktree, or None if wt gave no answer.
+    integrations: Option<HashMap<String, Integration>>,
     pushes: HashMap<String, Push>,
 }
 
@@ -312,10 +327,16 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         _ => HashMap::new(),
     };
     let listed = wt_list(main_checkout);
-    let integrations = listed
+    let integrations = listed.as_ref().map(leftover::parse_integrations);
+    let default_branch = git::default_branch(main_checkout);
+    let main_name = listed
         .as_ref()
-        .map(leftover::parse_integrations)
-        .unwrap_or_default();
+        .and_then(leftover::parse_default_branch)
+        .or_else(|| {
+            default_branch
+                .as_deref()
+                .map(|branch| branch.trim_start_matches("origin/").to_owned())
+        });
     // wt knows the forge, also a self-hosted one in its config.
     let forge = match listed.as_ref().and_then(forge::from_worktrunk) {
         Some(forge) => Ok(forge),
@@ -323,7 +344,8 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
     };
     RepositoryFacts {
         forge,
-        default_branch: git::default_branch(main_checkout),
+        default_branch,
+        main_name,
         integrations,
         pushes,
     }
@@ -362,11 +384,13 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
     };
     let now = stale::now();
     facts.days = git::last_activity(&entry.path).map(|time| now.saturating_sub(time) / DAY);
-    facts.integration = repository
-        .integrations
-        .get(&entry.branch)
-        .cloned()
-        .unwrap_or(Integration::Undetermined);
+    facts.integration = match &repository.integrations {
+        Some(integrations) => integrations.get(&entry.branch).cloned().unwrap_or_else(|| {
+            Integration::Undetermined("wt did not list this worktree".to_owned())
+        }),
+        None => Integration::Undetermined("wt gave no answer".to_owned()),
+    };
+    facts.default_branch = repository.main_name.clone();
     facts.push = repository
         .pushes
         .get(&entry.branch)
@@ -878,14 +902,14 @@ fn print_checklist(entry: &Entry, stale_days: u32) {
     // The rule of the verdict, on short lines: the preview does not wrap.
     for line in [
         "To delete, in this order:".to_owned(),
-        "- no agent and no change,".to_owned(),
+        "- no agent that works, and no change,".to_owned(),
         "- no open pull request,".to_owned(),
         "- a finished pull request with the last commit,".to_owned(),
         format!(
-            "- or the content in the default branch, {} day without activity,",
+            "- or a merged branch, {} day without activity,",
             leftover::INTEGRATED_MIN_DAYS
         ),
-        format!("- or no pull request, {stale_days} days without activity."),
+        format!("- or no pull request, {stale_days} days without activity and no agent."),
     ] {
         println!("{DIM}{line}{RESET}");
     }
@@ -949,7 +973,7 @@ fn scope_of(entries: &[Entry]) -> String {
 /// What the user chose in the list.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Choice {
-    Delete(Entry),
+    Delete(Box<Entry>),
     /// The worktrees of the group "To delete".
     DeleteAll(Vec<OldWorktree>),
 }
@@ -1090,7 +1114,7 @@ fn parse_choice(text: &str, entries: &[Entry]) -> Option<Choice> {
         .iter()
         .find(|entry| entry.path == Path::new(path))
         .cloned()
-        .map(Choice::Delete)
+        .map(|entry| Choice::Delete(Box::new(entry)))
 }
 
 #[cfg(test)]
@@ -1201,12 +1225,13 @@ mod tests {
     fn an_integrated_worktree_is_a_leftover_with_its_proof() {
         let mut squashed = entry("e-squash", "alpha", Reason::Integrated, Some(3));
         squashed.facts.integration = Integration::Integrated("patch_id_match".to_owned());
+        squashed.facts.default_branch = Some("main".to_owned());
 
         let text = line(&Row::Worktree(&squashed), 90);
         let shown = style::visible(text.split('\t').nth(ROW_FIELDS).unwrap());
 
         assert!(
-            shown.contains("✕ e-squash — in the default branch: a squash merge"),
+            shown.contains("✕ e-squash — merged: a squash merge into main"),
             "{shown}"
         );
         assert_eq!(ids(&layout(&[squashed], true))[0], "group:to-delete");
@@ -1311,7 +1336,7 @@ mod tests {
 
         assert_eq!(
             parse_choice(&format!("{text}\n"), &entries),
-            Some(Choice::Delete(entries[0].clone()))
+            Some(Choice::Delete(Box::new(entries[0].clone())))
         );
         assert_eq!(parse_choice("", &entries), None);
     }
@@ -1366,7 +1391,7 @@ mod tests {
                 worktree.to_str().unwrap(),
             ],
         );
-        let entry = Entry::new(worktree, "local".to_owned(), main.clone(), false);
+        let entry = Entry::new(worktree, "local".to_owned(), main.clone(), Agents::None);
 
         let result = check(&entry, &repository_facts(&main, false), 7);
 

@@ -90,6 +90,23 @@
         "merge_conflicts": null
       },
       "upstream": null
+    },
+    {
+      "branch": "feat-empty",
+      "worktree": {
+        "path": "/work/app.feat-empty",
+        "main": false
+      },
+      "head": null,
+      "default_branch": {
+        "ahead": null,
+        "behind": null,
+        "diff": null,
+        "orphan": null,
+        "integration": null,
+        "merge_conflicts": null
+      },
+      "upstream": null
     }
   ]
 }
