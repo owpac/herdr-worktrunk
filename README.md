@@ -130,24 +130,45 @@ The list has groups:
 - **To delete**, at the top: the leftovers, the oldest first.
 - One group for each project, with the other worktrees. Each row gives the reason that keeps the worktree.
 
-A leftover has no agent, no change that is not committed, and one of these conditions:
+The cleaner checks each worktree layer by layer:
 
-- A merged or closed pull request contains the commit of its branch, with the same proofs as `prune_merged`. The age does not count.
-- It has no pull request, and no activity for `stale_days` days (or 7 days if `stale_days` is 0). The cleaner ignores the last questions of the daily pass.
+| Layer | Source | Fact |
+|-------|--------|------|
+| Agent | herdr | An agent is in the worktree: busy, or idle (`idle` or `done`). |
+| Changes | `git status` | Changes that are not committed. |
+| Merged | `wt list` | The content of the branch is in the default branch: merge, rebase or squash merge. Any forge. |
+| Push | git | A branch that was never pushed has no pull request. A deleted remote branch is a hint only. |
+| Pull requests | the forge | Open, merged or closed, and the proof that a finished pull request contains the last commit. |
+| Activity | git | The days since the last commit, checkout or reset. A `git status` does not count. |
 
-The other reasons keep a worktree: an open pull request, a recent activity, changes that are not committed, an agent, work after a finished pull request, a finished pull request with the commit in the default branch, or a check that failed (git, gh, or no remote on GitHub).
+The verdict follows this order:
+
+1. A busy agent or changes keep the worktree.
+2. An open pull request keeps the worktree.
+3. A merged or closed pull request with the last commit of the branch: to delete, with the same proofs as `prune_merged`.
+4. A merged branch, and 1 day without activity: to delete. A new worktree is merged at once: the day keeps it.
+5. No pull request (from the forge, or never pushed when the forge gives no answer), and no activity for `stale_days` days (or 7 days if `stale_days` is 0): to delete, except with an idle agent. The cleaner ignores the last questions of the daily pass.
+6. Else the worktree stays: a recent activity, work after a finished pull request, or no answer.
+
+A forge that gives no answer (no login, no network, a limit of 15 s) never gives a leftover. The agents follow the rules of the observer:
+
+- An agent that works (`working`, `blocked`, `unknown`), or an agent in the focused workspace, keeps the worktree.
+- An idle agent (`idle` or `done`) does not keep a worktree with a proof of the end: rules 3 and 4. The deletion closes the agent first, and gives the command that resumes it, for example `claude --resume <session>`.
+- An idle agent keeps an old worktree without a proof of the end (rule 5).
+
+The proofs of git (Merged, Push, Activity) work on any forge. Only GitHub has a backend for the pull requests (`gh`), on `github.com` and through an ssh alias of `github.com`. The forge comes from `wt list`: for a self-hosted forge, give its platform to worktrunk (`forge.platform` in `~/.config/worktrunk/config.toml`).
 
 | Key | Result |
 |-----|--------|
 | `↑` `↓` | Move to the next worktree. The cursor skips the titles of the groups. |
 | `Enter` | Asks to delete the selected worktree, then the list comes back. The question gives the reason of the row, for example an open pull request. |
 | `ctrl-a` | Asks to delete all the worktrees of the group "To delete". A progress popup, then a summary, shows the result. |
-| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker), and `checks`. `checks` gives the verdict and the checklist of the worktree: agent, changes, pull requests, activity. The title of a group shows the summary of its worktrees. |
+| `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes` (as in the picker), and `checks`. `checks` gives the verdict and the result of each layer, with its source. The title of a group shows the summary of its worktrees. |
 | `Esc` | Quits. |
 
 A filter hides the titles of the groups. Each row gives the state, the branch and its reason on the left, and the folder and the days without activity on the right.
 
-Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner refuses a worktree where an agent works, and closes the workspace of each deleted worktree.
+Each deletion runs `wt remove`: wt keeps a branch that is not merged, and refuses a worktree with changes that are not committed. The cleaner closes the workspace of each deleted worktree.
 
 From a shell, `clean` opens the same popup, for one repository or for all of them. `list-stale` prints the old worktrees of one repository without a popup.
 
@@ -159,10 +180,12 @@ bin/herdr-worktrunk list-stale <folder of the repository>
 How the checks work:
 
 1. The popup lists the worktrees with git and herdr only, then shows the list.
-2. 8 threads check the worktrees: `git status`, the last activity, then one call to gh for the pull requests of the branch. A worktree with an agent or with changes needs no call to gh.
-3. After each result, the popup writes its state file, and sends a reload to fzf through the socket of fzf (`--listen`).
-4. Before each reload, the popup keeps the id of the row of the cursor. After the reload, the cursor goes back to this row, also after a click.
-5. After a question, the list comes back with the results of the last checks: these worktrees need no new check. A failed check runs again.
+2. With `fetch_before_check = true`, the popup fetches `origin` first, without a question in the terminal.
+3. For each repository, one call to `wt list --format json` (30 s at most) tells if each branch is merged, and gives the forge. 2 calls to `git for-each-ref` give the push state of each branch.
+4. 8 threads check the worktrees: `git status`, the last activity, then the forge for the pull requests of the branch. A worktree with a busy agent or with changes needs no call to the forge.
+5. After each result, the popup writes its state file, and sends a reload to fzf through the socket of fzf (`--listen`).
+6. Before each reload, the popup keeps the id of the row of the cursor. After the reload, the cursor goes back to this row, also after a click.
+7. After a question, the list comes back with the results of the last checks: these worktrees need no new check. A failed check runs again.
 
 Limits:
 
@@ -187,6 +210,10 @@ stale_days = 0
 # 74 % × 62 % of the window) or "big" (90 % × 80 %).
 popup_size = "default"
 
+# The cleaner fetches origin before its checks (default: false). The fetch can ask the ssh agent
+# for a key.
+fetch_before_check = false
+
 # What an agent can do without a question at the end of a task in a worktree: "ask" or "auto".
 # The plugin does not read this key: the agents read it (for example the skill worktrees of
 # owpac/prompts).
@@ -196,7 +223,7 @@ agent_mode = "ask"
 agent_mode = "auto"
 ```
 
-The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days` and `popup_size`, and ignores the other keys.
+The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`, `popup_size` and `fetch_before_check`, and ignores the other keys.
 
 ## Requirements
 

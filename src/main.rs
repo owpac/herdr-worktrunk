@@ -13,10 +13,12 @@
 mod actions;
 mod cleaner;
 mod config;
+mod forge;
 mod fzf;
 mod git;
 mod github;
 mod herdr;
+mod leftover;
 mod observer;
 mod picker;
 mod process;
@@ -105,7 +107,12 @@ fn list_merged(folder: &Path) -> Result<(), Error> {
 /// The days without activity of an old worktree for the cleaning:
 /// `stale_days` of the config, or 7 days if the key is 0.
 fn stale_days_or_default() -> u32 {
-    match load_config().stale_days {
+    stale_days_of(&load_config())
+}
+
+/// The days of `stale_days`, or `DEFAULT_STALE_DAYS` if it is 0.
+fn stale_days_of(config: &config::Config) -> u32 {
+    match config.stale_days {
         0 => DEFAULT_STALE_DAYS,
         days => days,
     }
@@ -240,7 +247,13 @@ fn main() -> ExitCode {
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
-        ["cleaner"] => (actions::cleaner(stale_days_or_default()), Some("cleaner")),
+        ["cleaner"] => (
+            {
+                let config = load_config();
+                actions::cleaner(stale_days_of(&config), config.fetch_before_check)
+            },
+            Some("cleaner"),
+        ),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

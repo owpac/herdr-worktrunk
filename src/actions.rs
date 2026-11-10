@@ -27,6 +27,7 @@ use std::time::Duration;
 use crate::cleaner;
 use crate::git::{self, Checkout};
 use crate::herdr::{self, Error};
+use crate::leftover::{self, Agents, WorktreeAgent};
 use crate::picker::{self, Picked, Row};
 use crate::stale;
 use crate::ui;
@@ -44,6 +45,9 @@ const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 const REASON_VARIABLE: &str = "TRUNK_REASON";
 /// The file of the worktrees that the popup confirm deletes together.
 const LIST_VARIABLE: &str = "TRUNK_CLEANER_LIST";
+/// A deletion of the popup cleaner: the idle agents of the worktree close
+/// first. The cleaner gives it only to a worktree with a proof of the end.
+const CLOSE_IDLE_VARIABLE: &str = "TRUNK_CLOSE_IDLE_AGENTS";
 /// The state file of the popup cleaner: the results of its checks. The
 /// cleaner comes back after a question with these results.
 const STATE_VARIABLE: &str = "TRUNK_CLEANER_STATE";
@@ -286,21 +290,40 @@ fn refuse_if_agent(workspace_id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The reason to keep a worktree: an agent works in its folder, from any
-/// workspace, or in its workspace. None if no agent uses it.
-fn agent_reason(
+/// The idle agents that a deletion of the cleaner closes first, or an
+/// error if an agent works in the worktree now.
+fn agents_to_close(
     checkout: &Path,
     workspace_id: Option<&str>,
-) -> Result<Option<&'static str>, Error> {
-    if herdr::agent_in_checkout(checkout)? {
-        return Ok(Some("an agent works in its folder"));
+) -> Result<Vec<WorktreeAgent>, Error> {
+    let snapshot = herdr::snapshot()?;
+    let agents = leftover::agents_of(&snapshot, checkout, workspace_id);
+    match leftover::agents_state(&agents) {
+        Agents::None => Ok(Vec::new()),
+        Agents::Idle => Ok(agents),
+        Agents::Busy => Err(Error::Command(
+            "An agent works in this worktree. Stop it first: the deletion removes its folder."
+                .to_owned(),
+        )),
     }
-    if let Some(workspace_id) = workspace_id {
-        if herdr::workspace_has_agent(workspace_id)? {
-            return Ok(Some("an agent works in its workspace"));
+}
+
+/// Close the panes of idle agents, then wait until herdr shows no agent in
+/// the worktree, for 10 seconds at most. The conversations stay on the
+/// disk.
+fn close_agents(agents: &[WorktreeAgent], checkout: &Path) -> Result<(), Error> {
+    for agent in agents {
+        herdr::close_pane(&agent.pane_id)?;
+    }
+    for _ in 0..20 {
+        if !herdr::agent_in_checkout(checkout)? {
+            return Ok(());
         }
+        thread::sleep(Duration::from_millis(500));
     }
-    Ok(None)
+    Err(Error::Command(
+        "The idle agent of this worktree did not close.".to_owned(),
+    ))
 }
 
 /// Popup confirm: ask before a deletion or a merge, then do it. If the
@@ -379,15 +402,23 @@ fn ask_and_run() -> Result<(), Error> {
         Some(workspace_id) => Some(workspace_id.clone()),
         None => herdr::workspace_of_checkout(&checkout.root)?,
     };
-    if let Some(workspace_id) = &workspace_id {
-        refuse_if_agent(workspace_id)?;
-    }
-    if herdr::agent_in_checkout(&checkout.root)? {
-        return Err(Error::Command(
-            "An agent works in the folder of this worktree. Stop the agent first: the deletion removes its folder."
-                .to_owned(),
-        ));
-    }
+    // A deletion of the cleaner closes the idle agents of a worktree with a
+    // proof of the end. Any other agent stops the deletion.
+    let close_idle = operation != MERGE && env::var_os(CLOSE_IDLE_VARIABLE).is_some();
+    let idle_agents = if close_idle {
+        agents_to_close(&checkout.root, workspace_id.as_deref())?
+    } else {
+        if let Some(workspace_id) = &workspace_id {
+            refuse_if_agent(workspace_id)?;
+        }
+        if herdr::agent_in_checkout(&checkout.root)? {
+            return Err(Error::Command(
+                "An agent works in the folder of this worktree. Stop the agent first: the deletion removes its folder."
+                    .to_owned(),
+            ));
+        }
+        Vec::new()
+    };
     let (branch, folder_name) = describe(&checkout);
     if operation == MERGE {
         let question = format!(
@@ -409,6 +440,12 @@ fn ask_and_run() -> Result<(), Error> {
     if let Ok(reason) = env::var(REASON_VARIABLE) {
         question = format!("{reason}\n{question}");
     }
+    if let Some(agent) = idle_agents.first() {
+        question.push_str(&format!(
+            "\nIts idle agent closes first. To resume it: {}",
+            agent.resume_command()
+        ));
+    }
     if !ui::confirm("Delete the worktree", &question, "Delete", true) {
         return Ok(());
     }
@@ -416,6 +453,9 @@ fn ask_and_run() -> Result<(), Error> {
         "Delete the worktree",
         &format!("Deleting the worktree of {branch}…"),
     );
+    if !idle_agents.is_empty() {
+        close_agents(&idle_agents, &checkout.root)?;
+    }
     wt::remove_quietly(&checkout.main_checkout(), &checkout.root)?;
     if let Some(workspace_id) = &workspace_id {
         close_after_removal(workspace_id, &checkout)?;
@@ -452,6 +492,7 @@ fn delete_all() -> Result<(), Error> {
     }
     let mut deleted = 0;
     let mut kept = Vec::new();
+    let mut closed = Vec::new();
     for worktree in &old {
         ui::show_progress(
             "Clean the worktrees",
@@ -466,14 +507,27 @@ fn delete_all() -> Result<(), Error> {
                 continue;
             }
         };
-        match agent_reason(&worktree.path, workspace_id.as_deref()) {
-            Ok(None) => {}
-            Ok(Some(reason)) => {
-                kept.push(format!("{}: {reason}", worktree.branch));
+        match agents_to_close(&worktree.path, workspace_id.as_deref()) {
+            Ok(agents) if agents.is_empty() => {}
+            // Only a worktree with a proof of the end closes its idle
+            // agents: the age alone keeps them.
+            Ok(agents) if worktree.close_idle_agents => {
+                if let Err(error) = close_agents(&agents, &worktree.path) {
+                    kept.push(format!("{}: {error}", worktree.branch));
+                    continue;
+                }
+                closed.extend(
+                    agents
+                        .iter()
+                        .map(|agent| format!("{}: {}", worktree.branch, agent.resume_command())),
+                );
+            }
+            Ok(_) => {
+                kept.push(format!("{}: an idle agent is in it", worktree.branch));
                 continue;
             }
             Err(error) => {
-                kept.push(format!("{}: herdr failed: {error}", worktree.branch));
+                kept.push(format!("{}: {error}", worktree.branch));
                 continue;
             }
         }
@@ -490,6 +544,12 @@ fn delete_all() -> Result<(), Error> {
         }
     }
     let mut summary = format!("Deleted {deleted} worktrees.");
+    if !closed.is_empty() {
+        summary.push_str(&format!(
+            "\nClosed idle agents, to resume:\n{}",
+            closed.join("\n")
+        ));
+    }
     if !kept.is_empty() {
         summary.push_str(&format!("\nKept:\n{}", kept.join("\n")));
     }
@@ -505,7 +565,7 @@ fn delete_all() -> Result<(), Error> {
 /// The list covers `TRUNK_CLEANER_SCOPE`, or all the repositories of the
 /// herdr workspaces. After a question, `TRUNK_CLEANER_STATE` gives the
 /// results of the last checks: these worktrees need no new check.
-pub fn cleaner(stale_days: u32) -> Result<(), Error> {
+pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
     let folder = popup_folder()?;
     let is_return = env::var(RETURN_VARIABLE).as_deref() == Ok(RETURN_TO_CLEANER);
     // The main checkout of the scope: the return after a question needs a
@@ -561,7 +621,7 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
     if let Some(scope_text) = &scope_text {
         environment.push((SCOPE_VARIABLE, scope_text.as_str()));
     }
-    match cleaner::choose(entries, &state_path, stale_days)? {
+    match cleaner::choose(entries, &state_path, stale_days, fetch)? {
         None => {
             cleaner::stop_checks();
             let _ = std::fs::remove_file(&state_path);
@@ -582,6 +642,9 @@ pub fn cleaner(stale_days: u32) -> Result<(), Error> {
             environment.push((OPERATION_VARIABLE, DELETE));
             environment.push((CHECKOUT_VARIABLE, checkout_text.as_ref()));
             environment.push((REASON_VARIABLE, reason.as_str()));
+            if entry.reason.is_leftover() && entry.facts.agent == Agents::Idle {
+                environment.push((CLOSE_IDLE_VARIABLE, "1"));
+            }
             open_after_this_popup("confirm", &folder, &environment)
         }
     }

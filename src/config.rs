@@ -4,7 +4,7 @@
 //! The agents also read this file (the skill worktrees of the agent
 //! plugin herdr): `agent_mode` and the `[repositories."<path>"]` tables
 //! are for them. The plugin reads only the top-level keys `observe`,
-//! `prune_merged`, `stale_days` and `popup_size`.
+//! `prune_merged`, `stale_days`, `popup_size` and `fetch_before_check`.
 
 use std::env;
 use std::fs;
@@ -50,6 +50,9 @@ pub struct Config {
     pub stale_days: u32,
     /// The size of the large popups (default: the size of herdr-bar).
     pub popup_size: PopupSize,
+    /// The popup cleaner fetches `origin` before its checks (default:
+    /// false). The fetch can ask the ssh agent for a key.
+    pub fetch_before_check: bool,
 }
 
 impl Default for Config {
@@ -59,6 +62,7 @@ impl Default for Config {
             prune_merged: false,
             stale_days: 0,
             popup_size: PopupSize::Default,
+            fetch_before_check: false,
         }
     }
 }
@@ -104,6 +108,7 @@ fn parse(text: &str) -> Config {
             "observe" => config.observe = value != "false",
             "prune_merged" => config.prune_merged = value == "true",
             "stale_days" => config.stale_days = value.parse().unwrap_or(0),
+            "fetch_before_check" => config.fetch_before_check = value == "true",
             "popup_size" => {
                 config.popup_size = match value.trim_matches('"') {
                     "big" => PopupSize::Big,
@@ -146,6 +151,13 @@ mod tests {
         assert_eq!(parse("stale_days = 7 # a week\n").stale_days, 7);
         assert_eq!(parse("stale_days = \"x\"\n").stale_days, 0);
         assert_eq!(Config::default().stale_days, 0);
+    }
+
+    #[test]
+    fn fetch_before_check_is_off_by_default() {
+        assert!(!Config::default().fetch_before_check);
+        assert!(parse("fetch_before_check = true # fetch origin\n").fetch_before_check);
+        assert!(!parse("fetch_before_check = 1\n").fetch_before_check);
     }
 
     #[test]

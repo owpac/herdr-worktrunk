@@ -5,10 +5,7 @@
 //! "To delete" at the top. The other worktrees stay in a group for each
 //! project, with the reason that keeps them.
 //!
-//! A leftover has no agent, no change that is not committed, and:
-//!
-//! - a finished pull request (merged or closed) that contains its commit,
-//! - or no pull request, and no activity for `stale_days` days.
+//! The module `leftover` gives the layers of the checks and the verdict.
 //!
 //! `Enter` deletes one worktree after a question, `ctrl-a` deletes the
 //! group "To delete". Then the list comes back.
@@ -28,16 +25,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::forge;
 use crate::fzf;
 use crate::git::{self, canonical};
-use crate::github::{self, PullRequestState};
+use crate::github;
 use crate::herdr::{self, Error};
+use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
-use crate::prune::{self, BranchStatus, KeptWhy};
+use crate::process;
 use crate::stale::{self, OldWorktree, DAY};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
@@ -70,6 +72,8 @@ const WORKERS: usize = 8;
 /// Set when the popup closes without a choice: the checks stop writing
 /// the state file, so the plugin can remove it.
 static CHECKS_STOPPED: AtomicBool = AtomicBool::new(false);
+/// The time limit of the call to wt for the facts of a repository.
+const WT_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// The threads that list the checkouts of the workspaces.
 const LIST_THREADS: usize = 4;
 /// The id of the title of the group "To delete".
@@ -77,152 +81,57 @@ const TO_DELETE_ID: &str = "group:to-delete";
 const TITLE_KIND: &str = "title";
 const WORKTREE_KIND: &str = "worktree";
 
-/// Why the cleaner deletes or keeps a worktree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reason {
-    /// The check runs.
-    Checking,
-    /// A leftover: its merged pull request contains its commit.
-    Merged,
-    /// A leftover: its closed pull request contains its commit.
-    Closed,
-    /// A leftover: no pull request, and no activity for `stale_days` days.
-    Old,
-    /// Kept: an open pull request.
-    Open,
-    /// Kept: no pull request, but some activity in the last days.
-    Recent,
-    /// Kept: changes that are not committed.
-    Changes,
-    /// Kept: an agent works in the worktree.
-    Agent,
-    /// Kept: the branch has work after its finished pull request.
-    WorkAfter,
-    /// Kept: a finished pull request, and the default branch contains the
-    /// commit of the branch (a new worktree, or a merge of wt).
-    InDefault,
-    /// Kept: the check failed (gh, no remote on GitHub...).
-    Unknown,
-}
-
-const REASON_CODES: [(Reason, &str); 11] = [
-    (Reason::Checking, "checking"),
-    (Reason::Merged, "merged"),
-    (Reason::Closed, "closed"),
-    (Reason::Old, "old"),
-    (Reason::Open, "open"),
-    (Reason::Recent, "recent"),
-    (Reason::Changes, "changes"),
-    (Reason::Agent, "agent"),
-    (Reason::WorkAfter, "work-after"),
-    (Reason::InDefault, "in-default"),
-    (Reason::Unknown, "unknown"),
-];
-
-impl Reason {
-    fn code(self) -> &'static str {
-        REASON_CODES
-            .iter()
-            .find(|(reason, _)| *reason == self)
-            .map(|(_, code)| *code)
-            .unwrap_or("unknown")
-    }
-
-    fn from_code(code: &str) -> Option<Reason> {
-        REASON_CODES
-            .iter()
-            .find(|(_, known)| *known == code)
-            .map(|(reason, _)| *reason)
-    }
-
-    /// Return true for a leftover: the group "To delete".
-    pub fn is_leftover(self) -> bool {
-        matches!(self, Reason::Merged | Reason::Closed | Reason::Old)
-    }
-
-    /// The glyph of a finished check, and its color.
-    fn glyph(self) -> (&'static str, &'static str) {
-        match self {
-            Reason::Checking => (ACCENT, SPINNER[0]),
-            Reason::Merged | Reason::Closed | Reason::Old => (RED, "✕"),
-            Reason::Open | Reason::Recent | Reason::WorkAfter | Reason::InDefault => (GREEN, "✓"),
-            Reason::Changes => (YELLOW, "●"),
-            Reason::Agent => (ACCENT, "◐"),
-            Reason::Unknown => (DIM, "?"),
-        }
+/// The glyph of a verdict, and its color.
+fn glyph(reason: Reason) -> (&'static str, &'static str) {
+    match reason {
+        Reason::Checking => (ACCENT, SPINNER[0]),
+        reason if reason.is_leftover() => (RED, "✕"),
+        Reason::Open | Reason::Recent | Reason::WorkAfter | Reason::InDefault => (GREEN, "✓"),
+        Reason::Changes => (YELLOW, "●"),
+        Reason::Agent => (ACCENT, "◐"),
+        Reason::IdleAgent => (DIM, "◐"),
+        _ => (DIM, "?"),
     }
 }
 
-/// A worktree of the list, and the result of its check.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A worktree of the list, its facts, and the verdict of the cleaner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub path: PathBuf,
     pub branch: String,
     pub main_checkout: PathBuf,
     pub reason: Reason,
-    /// The days without activity, once the check knows them.
-    pub days: Option<u64>,
-    /// The number of the pull request of the reason.
-    pub pull_request: Option<u64>,
-    /// The error of a check that failed.
-    pub detail: String,
+    pub facts: Facts,
 }
 
 impl Entry {
-    fn new(path: PathBuf, branch: String, main_checkout: PathBuf, reason: Reason) -> Entry {
+    /// A worktree before its checks. A worktree with an agent that works
+    /// gets its verdict at once.
+    fn new(path: PathBuf, branch: String, main_checkout: PathBuf, agent: Agents) -> Entry {
         Entry {
             path,
             branch,
             main_checkout,
-            reason,
-            days: None,
-            pull_request: None,
-            detail: String::new(),
+            reason: if agent == Agents::Busy {
+                Reason::Agent
+            } else {
+                Reason::Checking
+            },
+            facts: Facts {
+                agent,
+                ..Facts::default()
+            },
         }
     }
 
-    fn number(&self) -> String {
-        self.pull_request
-            .map(|number| format!("#{number}"))
-            .unwrap_or_default()
-    }
-
-    /// The reason in the row.
+    /// The verdict in the row.
     fn reason_text(&self) -> String {
-        let number = self.number();
-        match self.reason {
-            Reason::Checking => "checking…".to_owned(),
-            Reason::Merged => format!("PR {number} merged"),
-            Reason::Closed => format!("PR {number} closed"),
-            Reason::Old => "no PR, no recent activity".to_owned(),
-            Reason::Open => format!("PR {number} open"),
-            Reason::Recent => "no PR, recent activity".to_owned(),
-            Reason::Changes => "changes not committed".to_owned(),
-            Reason::Agent => "an agent works here".to_owned(),
-            Reason::WorkAfter => format!("work after PR {number}"),
-            Reason::InDefault => format!("PR {number} finished, commit in the default branch"),
-            Reason::Unknown => format!("not checked: {}", self.detail),
-        }
+        leftover::reason_text(self.reason, &self.facts)
     }
 
-    /// The reason in the question of the popup confirm.
+    /// The verdict in the question of the popup confirm.
     pub fn question(&self) -> String {
-        let number = self.number();
-        let days = self.days.unwrap_or(0);
-        match self.reason {
-            Reason::Merged => format!("Its pull request {number} is merged."),
-            Reason::Closed => format!("Its pull request {number} is closed."),
-            Reason::Old => format!("No pull request, and no change for {days} days."),
-            Reason::Open => format!("Careful: its pull request {number} is open."),
-            Reason::Recent => format!("No pull request, but a change {days} days ago."),
-            Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
-            Reason::Agent => "Careful: an agent works in it.".to_owned(),
-            Reason::WorkAfter => format!("Careful: the branch has work after {number}."),
-            Reason::InDefault => format!(
-                "Its pull request {number} is finished, and the default branch contains its commit."
-            ),
-            Reason::Checking | Reason::Unknown => "The cleaner did not check it.".to_owned(),
-        }
+        leftover::question(self.reason, &self.facts)
     }
 
     fn as_old_worktree(&self) -> OldWorktree {
@@ -230,62 +139,35 @@ impl Entry {
             main_checkout: self.main_checkout.clone(),
             path: self.path.clone(),
             branch: self.branch.clone(),
-            days: self.days.unwrap_or(0),
+            days: self.facts.days.unwrap_or(0),
+            close_idle_agents: self.facts.agent == Agents::Idle && self.reason.is_leftover(),
         }
     }
 }
 
-/// A line of the state file: the fields of an entry, separated by tabs.
-fn record(entry: &Entry) -> String {
-    let clean = |text: &str| text.replace(['\t', '\n'], " ");
-    [
-        entry.path.display().to_string(),
-        clean(&entry.branch),
-        entry.main_checkout.display().to_string(),
-        entry.reason.code().to_owned(),
-        entry
-            .pull_request
-            .map(|number| number.to_string())
-            .unwrap_or_default(),
-        entry.days.map(|days| days.to_string()).unwrap_or_default(),
-        clean(&entry.detail),
-    ]
-    .join("\t")
-}
-
-fn parse_record(line: &str) -> Option<Entry> {
-    let fields: Vec<&str> = line.split('\t').collect();
-    let [path, branch, main_checkout, code, pull_request, days, detail] = fields[..] else {
-        return None;
-    };
-    Some(Entry {
-        path: PathBuf::from(path),
-        branch: branch.to_owned(),
-        main_checkout: PathBuf::from(main_checkout),
-        reason: Reason::from_code(code)?,
-        days: days.parse().ok(),
-        pull_request: pull_request.parse().ok(),
-        detail: detail.to_owned(),
-    })
-}
-
-/// Write the state file in one rename: fzf reads it at the same time.
+/// Write the state file in one rename, one JSON line for each entry: fzf
+/// reads it at the same time.
 pub fn write_state(path: &Path, entries: &[Entry]) -> io::Result<()> {
-    let text: String = entries.iter().map(|entry| record(entry) + "\n").collect();
+    let mut text = String::new();
+    for entry in entries {
+        text.push_str(&serde_json::to_string(entry).map_err(io::Error::other)?);
+        text.push('\n');
+    }
     stale::write_atomically(path, &text)
 }
 
+/// Read the state file. A line that is not an entry is left out.
 pub fn read_state(path: &Path) -> Vec<Entry> {
     fs::read_to_string(path)
         .unwrap_or_default()
         .lines()
-        .filter_map(parse_record)
+        .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
 }
 
-/// The main checkouts of the repositories of the herdr workspaces, and
-/// the checkouts that an agent uses (its folder, or its workspace).
-fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
+/// The main checkouts of the repositories of the herdr workspaces, the
+/// workspace of each checkout, and the snapshot of herdr (for the agents).
+fn herdr_repositories() -> Result<HerdrState, Error> {
     let snapshot = herdr::snapshot()?;
     // A few threads: herdr and git take about 20 ms for each workspace,
     // and the list must show at once. herdr refuses too many worktree
@@ -327,26 +209,29 @@ fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
             .collect()
     });
     let mut repositories = Vec::new();
-    let mut workspace_roots = HashMap::new();
+    let mut workspace_of_checkout = HashMap::new();
     for (workspace_id, found) in checkouts {
         let Some((root, main)) = found else {
             continue;
         };
-        workspace_roots.insert(workspace_id, root);
+        workspace_of_checkout.insert(root, workspace_id);
         if !repositories.contains(&main) {
             repositories.push(main);
         }
     }
-    let mut busy = HashSet::new();
-    for pane in snapshot.panes.iter().filter(|pane| pane.agent.is_some()) {
-        if let Some(found) = pane.folder().and_then(git::checkout_of) {
-            busy.insert(canonical(&found.root));
-        }
-        if let Some(root) = workspace_roots.get(&pane.workspace_id) {
-            busy.insert(root.clone());
-        }
-    }
-    Ok((repositories, busy))
+    Ok(HerdrState {
+        repositories,
+        workspace_of_checkout,
+        snapshot,
+    })
+}
+
+/// The state of herdr for the list: the repositories of the workspaces,
+/// the workspace of each checkout, and the snapshot (for the agents).
+struct HerdrState {
+    repositories: Vec<PathBuf>,
+    workspace_of_checkout: HashMap<PathBuf, String>,
+    snapshot: herdr::Snapshot,
 }
 
 /// The linked worktrees of `scope` (one repository), or of all the
@@ -355,7 +240,11 @@ fn herdr_repositories() -> Result<(Vec<PathBuf>, HashSet<PathBuf>), Error> {
 /// results of an earlier list (the return after a question): these
 /// worktrees keep their result without a new check.
 pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<Entry>, Error> {
-    let (mut repositories, busy) = herdr_repositories()?;
+    let HerdrState {
+        mut repositories,
+        workspace_of_checkout,
+        snapshot,
+    } = herdr_repositories()?;
     if let Some(scope) = scope {
         let main = git::checkout_of(scope)
             .map(|checkout| canonical(&checkout.main_checkout()))
@@ -364,14 +253,11 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
             })?;
         repositories = vec![main];
     }
+    // A worktree without agent, then and now, keeps its last result.
     let known: HashMap<&Path, &Entry> = previous
         .iter()
-        .filter(|entry| {
-            !matches!(
-                entry.reason,
-                Reason::Checking | Reason::Agent | Reason::Unknown
-            )
-        })
+        .filter(|entry| entry.facts.agent == Agents::None)
+        .filter(|entry| !matches!(entry.reason, Reason::Checking | Reason::Unknown))
         .map(|entry| (entry.path.as_path(), entry))
         .collect();
     let listed: Vec<(PathBuf, Vec<git::LinkedWorktree>)> = thread::scope(|scope| {
@@ -394,22 +280,18 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
     for (repository, worktrees) in listed {
         for worktree in worktrees {
             let path = canonical(&worktree.path);
-            if busy.contains(&path) {
-                entries.push(Entry::new(
-                    path,
-                    worktree.branch,
-                    repository.clone(),
-                    Reason::Agent,
-                ));
-                continue;
-            }
+            let workspace_id = workspace_of_checkout.get(&path).map(String::as_str);
+            let agents =
+                leftover::agents_state(&leftover::agents_of(&snapshot, &path, workspace_id));
             match known.get(path.as_path()) {
-                Some(entry) if entry.branch == worktree.branch => entries.push((*entry).clone()),
+                Some(entry) if entry.branch == worktree.branch && agents == Agents::None => {
+                    entries.push((*entry).clone())
+                }
                 _ => entries.push(Entry::new(
                     path,
                     worktree.branch,
                     repository.clone(),
-                    Reason::Checking,
+                    agents,
                 )),
             }
         }
@@ -417,91 +299,126 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
     Ok(entries)
 }
 
-/// What a repository gives to the checks of its worktrees.
+/// What a repository gives to the checks of its worktrees: one call to
+/// each tool for all its branches.
 struct RepositoryFacts {
-    /// The repository on GitHub, or the reason why there is none.
-    github: Result<String, String>,
+    /// The forge, or the reason why the checks cannot ask a forge.
+    forge: Result<forge::RepositoryForge, String>,
     default_branch: Option<String>,
+    /// The name of the default branch (`main`), for the texts.
+    main_name: Option<String>,
+    /// The merge of each worktree, or None if wt gave no answer.
+    integrations: Option<HashMap<String, Integration>>,
+    pushes: HashMap<String, Push>,
 }
 
-fn repository_facts(main_checkout: &Path) -> RepositoryFacts {
+/// Read the facts of a repository. With `fetch`, fetch `origin` first: the
+/// integration and the push state then see the last state of the remote.
+fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
+    if fetch {
+        // A failed fetch keeps the old state of the remote.
+        let _ = git::fetch_prune(main_checkout);
+    }
+    let pushes = match (
+        git::branch_upstreams(main_checkout),
+        git::remote_branches(main_checkout),
+    ) {
+        (Some(branches), Some(remotes)) => leftover::parse_pushes(&branches, &remotes),
+        _ => HashMap::new(),
+    };
+    let listed = wt_list(main_checkout);
+    let integrations = listed.as_ref().map(leftover::parse_integrations);
+    let default_branch = git::default_branch(main_checkout);
+    let main_name = listed
+        .as_ref()
+        .and_then(leftover::parse_default_branch)
+        .or_else(|| {
+            default_branch
+                .as_deref()
+                .map(|branch| branch.trim_start_matches("origin/").to_owned())
+        });
+    // wt knows the forge, also a self-hosted one in its config.
+    let forge = match listed.as_ref().and_then(forge::from_worktrunk) {
+        Some(forge) => Ok(forge),
+        None => forge::from_origin(main_checkout),
+    };
     RepositoryFacts {
-        github: prune::github_repository(main_checkout).map_err(|error| error.to_string()),
-        default_branch: git::default_branch(main_checkout),
+        forge,
+        default_branch,
+        main_name,
+        integrations,
+        pushes,
     }
 }
 
-/// The result of a check, from its facts: the reason, the number of the
-/// pull request, and the error text of a failed check.
-fn classify(
-    is_clean: Option<bool>,
-    days: Option<u64>,
-    status: Result<&BranchStatus, &str>,
-    stale_days: u32,
-) -> (Reason, Option<u64>, String) {
-    match is_clean {
-        None => return (Reason::Unknown, None, "git status failed".to_owned()),
-        Some(false) => return (Reason::Changes, None, String::new()),
-        Some(true) => {}
+/// The JSON of `wt list` for the worktrees of a repository: the
+/// integration of each branch, and the forge. None if wt fails or takes
+/// more than 30 s. The config of the user must not change the JSON: schema
+/// 2, and no `--full` (no network, no summary by an LLM).
+fn wt_list(main_checkout: &Path) -> Option<Value> {
+    let mut command = Command::new("wt");
+    command.arg("-C").arg(main_checkout).args([
+        "--config-set",
+        "list.json-schema=2",
+        "--config-set",
+        "list.full=false",
+        "list",
+        "--format",
+        "json",
+    ]);
+    let output = process::output_with_limit(&mut command, WT_TIME_LIMIT).ok()?;
+    if !output.status.success() {
+        return None;
     }
-    match status {
-        Err(error) => (Reason::Unknown, None, error.to_owned()),
-        Ok(BranchStatus::Open(number)) => (Reason::Open, Some(*number), String::new()),
-        Ok(BranchStatus::Kept { number, why }) => match why {
-            KeptWhy::WorkAfter => (Reason::WorkAfter, Some(*number), String::new()),
-            KeptWhy::InDefaultBranch => (Reason::InDefault, Some(*number), String::new()),
-            KeptWhy::NoLocalCommit => {
-                (Reason::Unknown, Some(*number), "no local commit".to_owned())
-            }
-        },
-        Ok(BranchStatus::Finished { pull_request, .. }) => {
-            let reason = if pull_request.state == PullRequestState::Merged {
-                Reason::Merged
-            } else {
-                Reason::Closed
-            };
-            (reason, Some(pull_request.number), String::new())
-        }
-        Ok(BranchStatus::NoPullRequest) => match days {
-            Some(days) if days >= u64::from(stale_days) => (Reason::Old, None, String::new()),
-            Some(_) => (Reason::Recent, None, String::new()),
-            None => (Reason::Unknown, None, "no date of activity".to_owned()),
-        },
-    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
-/// Check one worktree: the local criteria first, then gh.
-fn check(entry: &Entry, facts: &RepositoryFacts, stale_days: u32) -> Entry {
+/// Check one worktree, layer by layer, then give the verdict.
+fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry {
     let mut result = entry.clone();
-    let is_clean = git::clean_status(&entry.path);
+    let facts = &mut result.facts;
+    facts.changes = match git::clean_status(&entry.path) {
+        Some(true) => Changes::None,
+        Some(false) => Changes::Some,
+        None => Changes::Failed,
+    };
     let now = stale::now();
-    result.days = git::last_activity(&entry.path).map(|time| now.saturating_sub(time) / DAY);
-    let status = if is_clean != Some(true) {
-        Err("not needed".to_owned())
-    } else {
-        match &facts.github {
-            Err(error) => Err(error.clone()),
-            // A gh that does not answer gives "not checked" after 15 s: the
-            // worktree stays, and the spinner stops.
-            Ok(repository) => prune::branch_status(
+    facts.days = git::last_activity(&entry.path).map(|time| now.saturating_sub(time) / DAY);
+    facts.integration = match &repository.integrations {
+        Some(integrations) => integrations.get(&entry.branch).cloned().unwrap_or_else(|| {
+            Integration::Undetermined("wt did not list this worktree".to_owned())
+        }),
+        None => Integration::Undetermined("wt gave no answer".to_owned()),
+    };
+    facts.default_branch = repository.main_name.clone();
+    facts.push = repository
+        .pushes
+        .get(&entry.branch)
+        .cloned()
+        .unwrap_or_default();
+    facts.forge = match &repository.forge {
+        Ok(forge) => forge.provider.name().to_owned(),
+        Err(_) => "no forge".to_owned(),
+    };
+    facts.pull_requests = match facts.changes {
+        Changes::Some => PullRequests::NotNeeded("the changes keep the worktree".to_owned()),
+        Changes::Failed => PullRequests::NotNeeded("git status failed".to_owned()),
+        _ => match &repository.forge {
+            // A repository without a remote has no pull request.
+            Err(error) if error == forge::NO_REMOTE => PullRequests::NotNeeded(error.clone()),
+            Err(error) => PullRequests::Failed(error.clone()),
+            // A forge that does not answer gives "no answer" after 15 s:
+            // the worktree stays, and the spinner stops.
+            Ok(forge) => PullRequests::from_status(forge::branch_status(
+                forge,
                 &entry.main_checkout,
-                repository,
-                facts.default_branch.as_deref(),
+                repository.default_branch.as_deref(),
                 &entry.branch,
                 github::POPUP_TIME_LIMIT,
-            )
-            .map_err(|error| error.to_string().replace('\n', " ")),
-        }
+            )),
+        },
     };
-    let (reason, pull_request, detail) = classify(
-        is_clean,
-        result.days,
-        status.as_ref().map_err(String::as_str),
-        stale_days,
-    );
-    result.reason = reason;
-    result.pull_request = pull_request;
-    result.detail = detail;
+    result.reason = leftover::verdict(&result.facts, stale_days);
     result
 }
 
@@ -514,65 +431,83 @@ fn start_checks(
     socket: PathBuf,
     reload_action: String,
     stale_days: u32,
+    fetch: bool,
 ) {
-    let todo: VecDeque<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.reason == Reason::Checking)
-        .map(|(index, _)| index)
-        .collect();
+    let todo = interleave(&entries);
     if todo.is_empty() {
         return;
     }
-    let repositories: HashSet<PathBuf> = todo
-        .iter()
-        .map(|index| entries[*index].main_checkout.clone())
-        .collect();
+    // The facts of each repository, read once, by the first worker that
+    // needs them. The order of todo takes one worktree of each repository
+    // in turn: the first workers read the facts of several repositories at
+    // the same time.
+    let repositories: Arc<HashMap<PathBuf, OnceLock<RepositoryFacts>>> = Arc::new(
+        todo.iter()
+            .map(|index| (entries[*index].main_checkout.clone(), OnceLock::new()))
+            .collect(),
+    );
     let entries = Arc::new(Mutex::new(entries));
     let todo = Arc::new(Mutex::new(todo));
     let (sender, receiver) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        let facts: Arc<HashMap<PathBuf, RepositoryFacts>> = Arc::new(
-            repositories
-                .into_iter()
-                .map(|repository| {
-                    let facts = repository_facts(&repository);
-                    (repository, facts)
-                })
-                .collect(),
+    for _ in 0..WORKERS {
+        let (entries, todo, repositories, sender, state_path) = (
+            Arc::clone(&entries),
+            Arc::clone(&todo),
+            Arc::clone(&repositories),
+            sender.clone(),
+            state_path.clone(),
         );
-        for _ in 0..WORKERS {
-            let (entries, todo, facts, sender, state_path) = (
-                Arc::clone(&entries),
-                Arc::clone(&todo),
-                Arc::clone(&facts),
-                sender.clone(),
-                state_path.clone(),
-            );
-            thread::spawn(move || loop {
-                let Some(index) = todo.lock().ok().and_then(|mut todo| todo.pop_front()) else {
+        thread::spawn(move || loop {
+            let Some(index) = todo.lock().ok().and_then(|mut todo| todo.pop_front()) else {
+                return;
+            };
+            let entry = match entries.lock() {
+                Ok(entries) => entries[index].clone(),
+                Err(_) => return,
+            };
+            let Some(cell) = repositories.get(&entry.main_checkout) else {
+                continue;
+            };
+            let facts = cell.get_or_init(|| repository_facts(&entry.main_checkout, fetch));
+            let result = check(&entry, facts, stale_days);
+            if let Ok(mut entries) = entries.lock() {
+                if CHECKS_STOPPED.load(Ordering::SeqCst) {
                     return;
-                };
-                let entry = match entries.lock() {
-                    Ok(entries) => entries[index].clone(),
-                    Err(_) => return,
-                };
-                let Some(facts) = facts.get(&entry.main_checkout) else {
-                    continue;
-                };
-                let result = check(&entry, facts, stale_days);
-                if let Ok(mut entries) = entries.lock() {
-                    if CHECKS_STOPPED.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    entries[index] = result;
-                    let _ = write_state(&state_path, &entries);
                 }
-                let _ = sender.send(());
-            });
-        }
-    });
+                entries[index] = result;
+                let _ = write_state(&state_path, &entries);
+            }
+            let _ = sender.send(());
+        });
+    }
+    drop(sender);
     thread::spawn(move || notify_fzf(&receiver, &socket, &reload_action));
+}
+
+/// The entries in check, one of each repository in turn.
+fn interleave(entries: &[Entry]) -> VecDeque<usize> {
+    let mut groups: Vec<(&Path, VecDeque<usize>)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.reason != Reason::Checking {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|(main, _)| *main == entry.main_checkout.as_path())
+        {
+            Some((_, group)) => group.push_back(index),
+            None => groups.push((entry.main_checkout.as_path(), VecDeque::from([index]))),
+        }
+    }
+    let mut todo = VecDeque::new();
+    while groups.iter().any(|(_, group)| !group.is_empty()) {
+        for (_, group) in &mut groups {
+            if let Some(index) = group.pop_front() {
+                todo.push_back(index);
+            }
+        }
+    }
+    todo
 }
 
 /// Stop the checks: they do not write the state file anymore. The threads
@@ -685,7 +620,12 @@ fn layout(entries: &[Entry], with_titles: bool) -> Vec<Row<'_>> {
         .iter()
         .filter(|entry| entry.reason.is_leftover())
         .collect();
-    leftovers.sort_by(|a, b| b.days.cmp(&a.days).then_with(|| a.branch.cmp(&b.branch)));
+    leftovers.sort_by(|a, b| {
+        b.facts
+            .days
+            .cmp(&a.facts.days)
+            .then_with(|| a.branch.cmp(&b.branch))
+    });
     // One group for each repository, sorted by name, then by path.
     let mut projects: BTreeMap<(String, &Path), Vec<&Entry>> = BTreeMap::new();
     for entry in entries.iter().filter(|entry| !entry.reason.is_leftover()) {
@@ -772,7 +712,7 @@ fn line(row: &Row, width: usize) -> String {
                     let (color, glyph) = if entry.reason == Reason::Checking {
                         (ACCENT, SPINNER[frame])
                     } else {
-                        entry.reason.glyph()
+                        glyph(entry.reason)
                     };
                     let reason_color = if entry.reason.is_leftover() {
                         RED
@@ -787,7 +727,7 @@ fn line(row: &Row, width: usize) -> String {
                         part(reason_color, entry.reason_text()),
                     ];
                     let mut right = vec![part(MUTED, git::folder_name(&entry.path))];
-                    if let Some(days) = entry.days {
+                    if let Some(days) = entry.facts.days {
                         right.push(part(MUTED, format!("{days}d")));
                     }
                     style::row(&left, &right, width)
@@ -929,149 +869,15 @@ pub fn print_delete_all(state_path: &Path) {
     }
 }
 
-/// The result of a check in the checklist of a worktree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mark {
-    Pass,
-    Fail,
-    /// The cleaner did not need this check.
-    Skip,
-    /// The check runs.
-    Wait,
-    /// The check failed: no result.
-    Unknown,
-}
-
-impl Mark {
-    fn glyph(self) -> (&'static str, &'static str) {
-        match self {
-            Mark::Pass => (GREEN, "✓"),
-            Mark::Fail => (RED, "✗"),
-            Mark::Skip => (DIM, "–"),
-            Mark::Wait => (ACCENT, "…"),
-            Mark::Unknown => (YELLOW, "?"),
-        }
-    }
-}
-
-/// The checklist of a worktree: the 4 checks of the cleaner, in their
-/// order, with their results. The cleaner stops at the first check that
-/// keeps the worktree: the next checks show as not needed.
-fn checklist(entry: &Entry, stale_days: u32) -> [(Mark, String); 4] {
-    let number = entry.number();
-    let days = entry.days.unwrap_or(0);
-    let not_needed = |what: &str| (Mark::Skip, format!("{what}: not needed."));
-    let agent_pass = (Mark::Pass, "No agent works in it.".to_owned());
-    let clean_pass = (Mark::Pass, "No change that is not committed.".to_owned());
-    let no_pull_request = (Mark::Pass, "No pull request.".to_owned());
-    // The check that failed, from the error text.
-    let unknown_step = match entry.detail.as_str() {
-        "git status failed" => 2,
-        "no date of activity" => 4,
-        _ => 3,
-    };
-    match entry.reason {
-        Reason::Checking => [
-            agent_pass,
-            (Mark::Wait, "Changes: checking…".to_owned()),
-            (Mark::Wait, "Pull requests: checking…".to_owned()),
-            (Mark::Wait, "Activity: checking…".to_owned()),
-        ],
-        Reason::Agent => [
-            (Mark::Fail, "An agent works in it.".to_owned()),
-            not_needed("Changes"),
-            not_needed("Pull requests"),
-            not_needed("Activity"),
-        ],
-        Reason::Changes => [
-            agent_pass,
-            (
-                Mark::Fail,
-                "It has changes that are not committed.".to_owned(),
-            ),
-            not_needed("Pull requests"),
-            not_needed("Activity"),
-        ],
-        Reason::Unknown => {
-            let failed = (Mark::Unknown, format!("Not checked: {}.", entry.detail));
-            match unknown_step {
-                2 => [
-                    agent_pass,
-                    failed,
-                    not_needed("Pull requests"),
-                    not_needed("Activity"),
-                ],
-                4 => [agent_pass, clean_pass, no_pull_request, failed],
-                _ => [agent_pass, clean_pass, failed, not_needed("Activity")],
-            }
-        }
-        Reason::Open | Reason::WorkAfter | Reason::InDefault => {
-            let text = match entry.reason {
-                Reason::Open => format!("Pull request {number} is open."),
-                Reason::WorkAfter => {
-                    format!(
-                        "Pull request {number} is finished, but the branch has commits after it."
-                    )
-                }
-                _ => format!(
-                    "Pull request {number} is finished, but the default branch contains the commit."
-                ),
-            };
-            [
-                agent_pass,
-                clean_pass,
-                (Mark::Fail, text),
-                not_needed("Activity"),
-            ]
-        }
-        Reason::Merged | Reason::Closed => {
-            let state = if entry.reason == Reason::Merged {
-                "merged"
-            } else {
-                "closed"
-            };
-            [
-                agent_pass,
-                clean_pass,
-                (
-                    Mark::Pass,
-                    format!(
-                        "Pull request {number} is {state}, with the last commit of the branch."
-                    ),
-                ),
-                (
-                    Mark::Skip,
-                    "Activity: not needed after a finished pull request.".to_owned(),
-                ),
-            ]
-        }
-        Reason::Old => [
-            agent_pass,
-            clean_pass,
-            no_pull_request,
-            (
-                Mark::Pass,
-                format!("No activity for {days} days (limit: {stale_days} days)."),
-            ),
-        ],
-        Reason::Recent => [
-            agent_pass,
-            clean_pass,
-            no_pull_request,
-            (
-                Mark::Fail,
-                format!("Activity {days} days ago (limit: {stale_days} days)."),
-            ),
-        ],
-    }
-}
-
-/// The tab `checks`: the verdict, the checklist, and the rule of a
-/// leftover.
+/// The tab `checks`: the verdict, one line for each layer with its fact
+/// and its source, then the rule of the verdict.
 fn print_checklist(entry: &Entry, stale_days: u32) {
     let verdict = match entry.reason {
         Reason::Checking => format!("{BOLD}{ACCENT}Checking…{RESET}"),
-        reason if reason.is_leftover() => format!("{BOLD}{RED}To delete{RESET}"),
+        reason if reason.is_leftover() => format!(
+            "{BOLD}{RED}To delete{RESET}{RULE} · {RESET}{MUTED}{}{RESET}",
+            entry.reason_text()
+        ),
         _ => format!(
             "{BOLD}{GREEN}Kept{RESET}{RULE} · {RESET}{MUTED}{}{RESET}",
             entry.reason_text()
@@ -1079,18 +885,31 @@ fn print_checklist(entry: &Entry, stale_days: u32) {
     };
     println!("{verdict}");
     println!();
-    for (mark, text) in checklist(entry, stale_days) {
-        let (color, glyph) = mark.glyph();
-        let text_color = if mark == Mark::Skip { DIM } else { "" };
-        println!("{color}{glyph}{RESET} {text_color}{text}{RESET}");
+    let lines = leftover::lines(&entry.facts, entry.reason, stale_days);
+    let width = lines
+        .iter()
+        .map(|line| line.layer.chars().count())
+        .max()
+        .unwrap_or(0);
+    for line in lines {
+        let (color, glyph) = line.mark.glyph();
+        println!(
+            "{color}{glyph}{RESET} {BOLD}{:<width$}{RESET}  {}  {DIM}{}{RESET}",
+            line.layer, line.text, line.source
+        );
     }
     println!();
-    // The rule of a leftover, on short lines: the preview does not wrap.
+    // The rule of the verdict, on short lines: the preview does not wrap.
     for line in [
-        "A worktree goes to the group To delete if:".to_owned(),
-        "- it has no agent and no change,".to_owned(),
-        "- and it has a finished pull request,".to_owned(),
-        format!("- or no pull request and no activity for {stale_days} days."),
+        "To delete, in this order:".to_owned(),
+        "- no agent that works, and no change,".to_owned(),
+        "- no open pull request,".to_owned(),
+        "- a finished pull request with the last commit,".to_owned(),
+        format!(
+            "- or a merged branch, {} day without activity,",
+            leftover::INTEGRATED_MIN_DAYS
+        ),
+        format!("- or no pull request, {stale_days} days without activity and no agent."),
     ] {
         println!("{DIM}{line}{RESET}");
     }
@@ -1129,7 +948,7 @@ pub fn print_preview(
         }
     });
     for entry in members {
-        let (color, glyph) = entry.reason.glyph();
+        let (color, glyph) = glyph(entry.reason);
         println!(
             "{color}{glyph}{RESET} {} {RULE}—{RESET} {MUTED}{}{RESET}",
             entry.branch,
@@ -1154,7 +973,7 @@ fn scope_of(entries: &[Entry]) -> String {
 /// What the user chose in the list.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Choice {
-    Delete(Entry),
+    Delete(Box<Entry>),
     /// The worktrees of the group "To delete".
     DeleteAll(Vec<OldWorktree>),
 }
@@ -1166,6 +985,7 @@ pub fn choose(
     entries: Vec<Entry>,
     state_path: &Path,
     stale_days: u32,
+    fetch: bool,
 ) -> Result<Option<Choice>, Error> {
     write_state(state_path, &entries)
         .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
@@ -1259,6 +1079,7 @@ pub fn choose(
         socket,
         reload_action,
         stale_days,
+        fetch,
     );
     let output = child
         .wait_with_output()
@@ -1293,13 +1114,12 @@ fn parse_choice(text: &str, entries: &[Entry]) -> Option<Choice> {
         .iter()
         .find(|entry| entry.path == Path::new(path))
         .cloned()
-        .map(Choice::Delete)
+        .map(|entry| Choice::Delete(Box::new(entry)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::PullRequest;
 
     fn entry(branch: &str, project: &str, reason: Reason, days: Option<u64>) -> Entry {
         Entry {
@@ -1307,9 +1127,11 @@ mod tests {
             branch: branch.to_owned(),
             main_checkout: PathBuf::from(format!("/work/{project}")),
             reason,
-            days,
-            pull_request: None,
-            detail: String::new(),
+            facts: Facts {
+                changes: Changes::None,
+                days,
+                ..Facts::default()
+            },
         }
     }
 
@@ -1400,6 +1222,22 @@ mod tests {
     }
 
     #[test]
+    fn an_integrated_worktree_is_a_leftover_with_its_proof() {
+        let mut squashed = entry("e-squash", "alpha", Reason::Integrated, Some(3));
+        squashed.facts.integration = Integration::Integrated("patch_id_match".to_owned());
+        squashed.facts.default_branch = Some("main".to_owned());
+
+        let text = line(&Row::Worktree(&squashed), 90);
+        let shown = style::visible(text.split('\t').nth(ROW_FIELDS).unwrap());
+
+        assert!(
+            shown.contains("✕ e-squash — merged: a squash merge into main"),
+            "{shown}"
+        );
+        assert_eq!(ids(&layout(&[squashed], true))[0], "group:to-delete");
+    }
+
+    #[test]
     fn two_repositories_with_the_same_name_get_two_groups() {
         let mut other = entry("b", "app", Reason::Open, Some(1));
         other.main_checkout = PathBuf::from("/other/app");
@@ -1420,117 +1258,6 @@ mod tests {
     }
 
     #[test]
-    fn the_checklist_gives_each_check_in_its_order() {
-        let marks = |entry: &Entry| -> Vec<Mark> {
-            checklist(entry, 7).iter().map(|(mark, _)| *mark).collect()
-        };
-        let mut merged = entry("a", "alpha", Reason::Merged, Some(1));
-        merged.pull_request = Some(12);
-        let mut failed = entry("b", "alpha", Reason::Unknown, None);
-        failed.detail = "git status failed".to_owned();
-
-        assert_eq!(
-            marks(&entry("a", "alpha", Reason::Old, Some(9))),
-            [Mark::Pass, Mark::Pass, Mark::Pass, Mark::Pass]
-        );
-        assert_eq!(
-            marks(&entry("a", "alpha", Reason::Recent, Some(2))),
-            [Mark::Pass, Mark::Pass, Mark::Pass, Mark::Fail]
-        );
-        assert_eq!(
-            marks(&merged),
-            [Mark::Pass, Mark::Pass, Mark::Pass, Mark::Skip]
-        );
-        assert_eq!(
-            marks(&entry("a", "alpha", Reason::Agent, None)),
-            [Mark::Fail, Mark::Skip, Mark::Skip, Mark::Skip]
-        );
-        assert_eq!(
-            marks(&failed),
-            [Mark::Pass, Mark::Unknown, Mark::Skip, Mark::Skip]
-        );
-        assert!(checklist(&merged, 7)[2].1.contains("#12 is merged"));
-        assert!(
-            checklist(&entry("a", "alpha", Reason::Recent, Some(2)), 7)[3]
-                .1
-                .contains("2 days ago (limit: 7 days)")
-        );
-    }
-
-    /// Run git in `folder` for a test, without the global config (for
-    /// example a signature with an agent).
-    fn git_in(folder: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(folder)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(arguments)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {arguments:?}");
-    }
-
-    #[test]
-    fn a_repository_without_github_keeps_its_worktree_without_gh() {
-        let base = env::temp_dir().join(format!("herdr-worktrunk-check-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let main = base.join("repo");
-        fs::create_dir_all(&main).unwrap();
-        git_in(&main, &["init", "-q", "-b", "main"]);
-        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
-        let worktree = base.join("repo.old");
-        git_in(
-            &main,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "old",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        let entry = Entry::new(
-            worktree.clone(),
-            "old".to_owned(),
-            main.clone(),
-            Reason::Checking,
-        );
-
-        // No remote origin: the check does not call gh, and keeps the
-        // worktree with the reason.
-        let result = check(&entry, &repository_facts(&main), 0);
-
-        assert_eq!(result.reason, Reason::Unknown);
-        assert_eq!(result.detail, "no remote origin");
-        assert!(!result.reason.is_leftover());
-        assert_eq!(checklist(&result, 0)[2].0, Mark::Unknown);
-        fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn a_failed_call_to_gh_never_gives_a_leftover() {
-        for days in [Some(0), Some(400), None] {
-            let (reason, _, detail) =
-                classify(Some(true), days, Err("gh pr: no end after 15 s"), 7);
-
-            assert_eq!(reason, Reason::Unknown);
-            assert!(!reason.is_leftover());
-            assert_eq!(detail, "gh pr: no end after 15 s");
-        }
-    }
-
-    #[test]
     fn the_cursor_skips_the_titles() {
         let is_title = [true, false, false, true, false];
 
@@ -1542,67 +1269,39 @@ mod tests {
     }
 
     #[test]
-    fn the_state_file_keeps_each_entry() {
-        let mut first = entry("feat/a", "alpha", Reason::Merged, Some(3));
-        first.pull_request = Some(12);
-        let mut second = entry("b", "alpha", Reason::Unknown, None);
-        second.detail = "gh failed".to_owned();
+    fn the_checks_take_one_worktree_of_each_repository_in_turn() {
+        let list = vec![
+            entry("a1", "alpha", Reason::Checking, None),
+            entry("a2", "alpha", Reason::Checking, None),
+            entry("a3", "alpha", Reason::Checking, None),
+            entry("done", "alpha", Reason::Old, Some(9)),
+            entry("z1", "zeta", Reason::Checking, None),
+        ];
 
-        assert_eq!(parse_record(&record(&first)), Some(first));
-        assert_eq!(parse_record(&record(&second)), Some(second));
-        assert_eq!(parse_record("a\tb"), None);
+        assert_eq!(interleave(&list), [0, 4, 1, 2]);
     }
-
-    fn finished(state: PullRequestState) -> BranchStatus {
-        BranchStatus::Finished {
-            pull_request: PullRequest {
-                number: 7,
-                state,
-                head: "abc".to_owned(),
-            },
-            commit: "abc".to_owned(),
-        }
-    }
-
-    /// A case of `classify`: clean, days, status of the branch, reason.
-    type Case<'a> = (
-        Option<bool>,
-        Option<u64>,
-        Result<&'a BranchStatus, &'a str>,
-        Reason,
-    );
 
     #[test]
-    fn classify_gives_the_reason_of_each_case() {
-        let none = BranchStatus::NoPullRequest;
-        let merged = finished(PullRequestState::Merged);
-        let closed = finished(PullRequestState::Closed);
-        let open = BranchStatus::Open(3);
-        let kept = BranchStatus::Kept {
-            number: 3,
-            why: KeptWhy::WorkAfter,
+    fn the_state_file_keeps_each_entry() {
+        let mut merged = entry("feat/a", "alpha", Reason::Merged, Some(3));
+        merged.facts.pull_requests = PullRequests::Finished {
+            number: 12,
+            merged: true,
         };
-        let in_default = BranchStatus::Kept {
-            number: 3,
-            why: KeptWhy::InDefaultBranch,
-        };
-        let cases: [Case; 11] = [
-            (Some(false), Some(30), Ok(&none), Reason::Changes),
-            (None, Some(30), Ok(&none), Reason::Unknown),
-            (Some(true), Some(30), Err("gh failed"), Reason::Unknown),
-            (Some(true), Some(1), Ok(&open), Reason::Open),
-            (Some(true), Some(1), Ok(&kept), Reason::WorkAfter),
-            (Some(true), Some(1), Ok(&in_default), Reason::InDefault),
-            (Some(true), Some(1), Ok(&merged), Reason::Merged),
-            (Some(true), Some(1), Ok(&closed), Reason::Closed),
-            (Some(true), Some(7), Ok(&none), Reason::Old),
-            (Some(true), Some(6), Ok(&none), Reason::Recent),
-            (Some(true), None, Ok(&none), Reason::Unknown),
-        ];
-        for (is_clean, days, status, expected) in cases {
-            let (reason, _, _) = classify(is_clean, days, status, 7);
-            assert_eq!(reason, expected, "{is_clean:?} {days:?} {status:?}");
-        }
+        merged.facts.push = Push::Gone("origin/feat/a".to_owned());
+        let list = vec![merged, entry("b", "alpha", Reason::Checking, None)];
+        let path = env::temp_dir().join(format!(
+            "herdr-worktrunk-state-test-{}.json",
+            std::process::id()
+        ));
+
+        write_state(&path, &list).unwrap();
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str("not an entry\n");
+        fs::write(&path, text).unwrap();
+
+        assert_eq!(read_state(&path), list);
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1637,8 +1336,109 @@ mod tests {
 
         assert_eq!(
             parse_choice(&format!("{text}\n"), &entries),
-            Some(Choice::Delete(entries[0].clone()))
+            Some(Choice::Delete(Box::new(entries[0].clone())))
         );
         assert_eq!(parse_choice("", &entries), None);
+    }
+
+    /// Run git in `folder` for a test, without the global config (for
+    /// example a signature with an agent).
+    fn git_in(folder: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(folder)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    /// A new empty folder for a test.
+    fn test_folder(name: &str) -> PathBuf {
+        let base = env::temp_dir().join(format!("herdr-worktrunk-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn a_branch_that_was_never_pushed_needs_no_forge() {
+        let base = test_folder("never-pushed");
+        let main = base.join("repo");
+        fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let worktree = base.join("repo.local");
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "local",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let entry = Entry::new(worktree, "local".to_owned(), main.clone(), Agents::None);
+
+        let result = check(&entry, &repository_facts(&main, false), 7);
+
+        // No remote: no call to a forge, and the age decides.
+        assert_eq!(result.facts.push, Push::Never);
+        assert_eq!(
+            result.facts.pull_requests,
+            PullRequests::NotNeeded("no remote origin".to_owned())
+        );
+        assert_eq!(result.facts.changes, Changes::None);
+        assert_eq!(result.reason, Reason::Recent);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn the_push_state_comes_from_the_real_branches() {
+        let base = test_folder("push-state");
+        let remote = base.join("remote.git");
+        let main = base.join("repo");
+        fs::create_dir_all(&remote).unwrap();
+        fs::create_dir_all(&main).unwrap();
+        git_in(&remote, &["init", "-q", "--bare"]);
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        git_in(
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git_in(&main, &["push", "-q", "-u", "origin", "main"]);
+        for branch in ["with-u", "without-u", "local", "gone"] {
+            git_in(&main, &["branch", branch]);
+        }
+        git_in(&main, &["push", "-q", "-u", "origin", "with-u"]);
+        git_in(&main, &["push", "-q", "origin", "without-u"]);
+        git_in(&main, &["push", "-q", "-u", "origin", "gone"]);
+        git_in(&main, &["push", "-q", "origin", "--delete", "gone"]);
+        git_in(&main, &["fetch", "-q", "--prune", "origin"]);
+
+        let pushes = repository_facts(&main, false).pushes;
+
+        assert_eq!(pushes["with-u"], Push::Pushed("origin/with-u".to_owned()));
+        assert_eq!(
+            pushes["without-u"],
+            Push::Pushed("origin/without-u".to_owned())
+        );
+        assert_eq!(pushes["local"], Push::Never);
+        assert_eq!(pushes["gone"], Push::Gone("origin/gone".to_owned()));
+        fs::remove_dir_all(&base).unwrap();
     }
 }

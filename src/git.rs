@@ -195,6 +195,54 @@ pub fn is_clean(checkout: &Path) -> bool {
     clean_status(checkout).unwrap_or(false)
 }
 
+/// The local branches with their upstream and its state, one line each:
+/// `<branch>\t<upstream>\t<track>`. The track is `[gone]` when the last
+/// fetch removed the upstream.
+pub fn branch_upstreams(main_checkout: &Path) -> Option<String> {
+    run_in(
+        main_checkout,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)",
+            "refs/heads",
+        ],
+    )
+    .ok()
+}
+
+/// The remote branches, one line each: `<remote>/<branch>`.
+pub fn remote_branches(main_checkout: &Path) -> Option<String> {
+    run_in(
+        main_checkout,
+        &["for-each-ref", "--format=%(refname:short)", "refs/remotes"],
+    )
+    .ok()
+}
+
+/// Fetch `origin` and remove the remote branches that it does not have
+/// anymore. The fetch can ask the ssh agent for a key.
+pub fn fetch_prune(main_checkout: &Path) -> Result<(), Error> {
+    // The popup shows fzf: git and ssh must not ask a question in the
+    // terminal. An ssh agent (1Password) can still give the key.
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(main_checkout)
+        .args(["fetch", "--prune", "--quiet", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    let output = process::output_with_limit(&mut command, GIT_TIME_LIMIT)
+        .map_err(|error| Error::Command(format!("git fetch: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Command(format!(
+            "git fetch: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+}
+
 /// Return true if the checkout has no change that is not committed, or
 /// None if `git status` fails.
 pub fn clean_status(checkout: &Path) -> Option<bool> {

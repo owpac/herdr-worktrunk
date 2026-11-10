@@ -115,6 +115,9 @@ pub struct OldWorktree {
     pub branch: String,
     /// The days without activity.
     pub days: u64,
+    /// The worktree has a proof of the end (a finished pull request or a
+    /// merge): the deletion closes its idle agents first.
+    pub close_idle_agents: bool,
 }
 
 /// Select the old worktrees among the worktrees without pull request of
@@ -151,6 +154,7 @@ pub fn select_old(
                 path,
                 branch: worktree.branch,
                 days: now.saturating_sub(activity) / DAY,
+                close_idle_agents: false,
             })
         })
         .collect()
@@ -164,11 +168,12 @@ pub fn write_list(path: &Path, old: &[OldWorktree]) -> Result<(), std::io::Error
         .iter()
         .map(|worktree| {
             format!(
-                "{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\n",
                 worktree.path.display(),
                 worktree.branch,
                 worktree.main_checkout.display(),
-                worktree.days
+                worktree.days,
+                u8::from(worktree.close_idle_agents)
             )
         })
         .collect();
@@ -208,6 +213,8 @@ fn parse_list(text: &str) -> Vec<OldWorktree> {
                 branch: fields.next()?.to_owned(),
                 main_checkout: PathBuf::from(fields.next()?),
                 days: fields.next()?.parse().ok()?,
+                // A list of an older version has 4 fields.
+                close_idle_agents: fields.next() == Some("1"),
             })
         })
         .collect()
@@ -224,10 +231,13 @@ mod tests {
             path: PathBuf::from("/work/repo.old"),
             branch: "feature/old".to_owned(),
             days: 12,
+            close_idle_agents: false,
         }];
         let text = "/work/repo.old\tfeature/old\t/work/repo\t12\nbad line\n";
 
         assert_eq!(parse_list(text), old);
+        let with_agents = "/work/repo.old\tfeature/old\t/work/repo\t12\t1\n";
+        assert!(parse_list(with_agents)[0].close_idle_agents);
     }
 
     const NOW: u64 = 1_800_000_000;

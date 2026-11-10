@@ -1,0 +1,112 @@
+{
+  "schema": 2,
+  "repo": {
+    "default_branch": "main",
+    "forge": {
+      "url": "https://git.company.example/team/app",
+      "provider": "gitlab",
+      "host": "git.company.example",
+      "owner": "team",
+      "name": "app",
+      "remote": "origin"
+    }
+  },
+  "collected": [
+    "status",
+    "default_branch",
+    "upstream"
+  ],
+  "items": [
+    {
+      "branch": "main",
+      "worktree": {
+        "path": "/work/app",
+        "main": true
+      },
+      "default_branch": null,
+      "upstream": {
+        "remote": "origin",
+        "branch": "main",
+        "ahead": 0,
+        "behind": 0
+      }
+    },
+    {
+      "branch": "feat-squashed",
+      "worktree": {
+        "path": "/work/app.feat-squashed",
+        "main": false
+      },
+      "default_branch": {
+        "ahead": 1,
+        "behind": 3,
+        "diff": {
+          "added": 12,
+          "deleted": 2
+        },
+        "orphan": false,
+        "integration": {
+          "reason": "patch_id_match"
+        },
+        "merge_conflicts": false
+      },
+      "upstream": null
+    },
+    {
+      "branch": "feat-open",
+      "worktree": {
+        "path": "/work/app.feat-open",
+        "main": false
+      },
+      "default_branch": {
+        "ahead": 1,
+        "behind": 0,
+        "diff": {
+          "added": 32,
+          "deleted": 8
+        },
+        "orphan": false,
+        "merge_conflicts": false
+      },
+      "upstream": {
+        "remote": "origin",
+        "branch": "feat-open",
+        "ahead": 0,
+        "behind": 0
+      }
+    },
+    {
+      "branch": "feat-orphan",
+      "worktree": {
+        "path": "/work/app.feat-orphan",
+        "main": false
+      },
+      "default_branch": {
+        "ahead": null,
+        "behind": null,
+        "diff": null,
+        "orphan": null,
+        "integration": null,
+        "merge_conflicts": null
+      },
+      "upstream": null
+    },
+    {
+      "branch": "feat-empty",
+      "worktree": {
+        "path": "/work/app.feat-empty",
+        "main": false
+      },
+      "head": null,
+      "default_branch": {
+        "ahead": null,
+        "behind": null,
+        "diff": null,
+        "orphan": null,
+        "integration": null,
+        "merge_conflicts": null
+      },
+      "upstream": null
+    }
+  ]
+}
