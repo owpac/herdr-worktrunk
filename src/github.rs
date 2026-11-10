@@ -10,6 +10,9 @@ use crate::forge::{Backend, PullRequest, PullRequestState};
 use crate::herdr::Error;
 use crate::process;
 
+/// The number of pull requests that one call reads. A branch has few.
+const PAGE_SIZE: usize = 50;
+
 /// The backend of a repository on github.com.
 pub struct GitHub {
     /// The repository: `owner/name`.
@@ -81,7 +84,7 @@ fn pull_requests(
             "--state",
             "all",
             "--limit",
-            "50",
+            &PAGE_SIZE.to_string(),
             "--json",
             "number,state,headRefOid,isCrossRepository",
         ],
@@ -111,6 +114,12 @@ fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
     }
     let listed: Vec<Listed> = serde_json::from_str(text)
         .map_err(|error| Error::Command(format!("gh pr list: invalid JSON: {error}")))?;
+    // A full page can miss an open pull request.
+    if listed.len() >= PAGE_SIZE {
+        return Err(Error::Command(format!(
+            "{PAGE_SIZE} pull requests or more for this branch"
+        )));
+    }
     Ok(listed
         .into_iter()
         .filter(|listed| !listed.is_cross_repository)
@@ -162,5 +171,13 @@ mod tests {
             ]
         );
         assert_eq!(pull_requests[0].head, "3541f65");
+    }
+
+    #[test]
+    fn a_full_page_gives_an_error() {
+        let items: Vec<String> = (1..=50).map(|number| format!(r#"{{"headRefOid":"aaa","number":{number},"state":"CLOSED","isCrossRepository":false}}"#)).collect();
+
+        assert!(parse_pull_requests(&format!("[{}]", items.join(","))).is_err());
+        assert!(parse_pull_requests(&format!("[{}]", items[..49].join(","))).is_ok());
     }
 }
