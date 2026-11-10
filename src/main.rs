@@ -98,7 +98,10 @@ fn observe(is_observer: bool) -> Result<(), Error> {
 /// agent that works keeps any worktree.
 fn list_merged(folder: &Path) -> Result<(), Error> {
     let main_checkout = main_checkout_of(folder)?;
-    let check = prune::check_worktrees(&main_checkout, |_| false)?;
+    let check = prune::check_worktrees(&main_checkout)?;
+    for (branch, error) in &check.errors {
+        eprintln!("{branch}: not checked: {error}");
+    }
     for worktree in check.finished {
         let state = match worktree.pull_request.state {
             forge::PullRequestState::Closed => "closed",

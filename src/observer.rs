@@ -709,11 +709,12 @@ fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: 
 
 /// Check the merged pull requests of each repository, every 5 minutes.
 ///
-/// The thread writes each removal in the log. It writes an error only if
-/// the previous pass did not write it: an error that stays gives one line,
-/// not one line every 5 minutes.
+/// The thread writes each removal in the log. It writes a notice (an
+/// error, or a worktree that an agent keeps) only if the previous pass did
+/// not write it: a notice that stays gives one line, not one line every 5
+/// minutes.
 fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings) {
-    let mut previous_errors = HashSet::new();
+    let mut previous_notices = HashSet::new();
     thread::sleep(PRUNE_FIRST_DELAY);
     loop {
         let repositories: Vec<PathBuf> = lock(view).repositories.iter().cloned().collect();
@@ -730,9 +731,9 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
         };
         let mut old = Vec::new();
         let mut is_checked = false;
-        let mut errors = HashSet::new();
+        let mut notices = HashSet::new();
         for repository in repositories {
-            let Some(without_pull_request) = prune_repository(&repository, view, log, &mut errors)
+            let Some(without_pull_request) = prune_repository(&repository, view, log, &mut notices)
             else {
                 continue;
             };
@@ -747,42 +748,41 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
                 ));
             }
         }
-        // A pass without a checked repository (no workspace yet, or gh
-        // fails) does not count: the next pass tries again.
+        // A pass without a checked repository (no workspace yet, or the
+        // forge fails for all the branches) does not count: the next pass
+        // tries again.
         if is_stale_pass && is_checked {
             stale::write_last_pass(&settings.state_dir, stale::now());
             ask_about_old_worktrees(old, settings.clone(), Arc::clone(log));
         }
-        for error in &errors {
-            if !previous_errors.contains(error) {
-                log.write(error);
+        for notice in &notices {
+            if !previous_notices.contains(notice) {
+                log.write(notice);
             }
         }
-        previous_errors = errors;
+        previous_notices = notices;
         thread::sleep(PRUNE_INTERVAL);
     }
 }
 
 /// Remove the finished worktrees of one repository. Write each removal in
-/// the log, and add each error to `errors`. Return the worktrees without
-/// pull request, for the daily question, or None if the check failed.
+/// the log, and add each error and each worktree that an agent keeps to
+/// `notices`. Return the worktrees without pull request, for the daily
+/// question, or None if the check failed for all the branches.
 ///
-/// A worktree where an agent must stay (see `agent_decision`) costs no
-/// call to the forge.
+/// The thread asks the forge also about a worktree where an agent works:
+/// the log then tells that the agent keeps a finished worktree. The cost
+/// is one call to the forge for each of these worktrees, every 5 minutes.
 fn prune_repository(
     main_checkout: &Path,
     view: &Mutex<PruneView>,
     log: &Log,
-    errors: &mut HashSet<String>,
+    notices: &mut HashSet<String>,
 ) -> Option<Vec<LinkedWorktree>> {
-    let must_stay = |checkout: &Path| {
-        let agents = lock(view).agents_in(checkout);
-        agent_decision(&agents, checkout) == AgentDecision::Wait
-    };
-    let check = match prune::check_worktrees(main_checkout, must_stay) {
+    let check = match prune::check_worktrees(main_checkout) {
         Ok(check) => check,
         Err(error) => {
-            errors.insert(format!(
+            notices.insert(format!(
                 "prune_merged {}: {}",
                 main_checkout.display(),
                 one_line(&error)
@@ -790,17 +790,41 @@ fn prune_repository(
             return None;
         }
     };
+    // One notice for the repository: a forge that does not answer gives
+    // one line, not one line for each branch.
+    if let Some((branch, error)) = check.errors.first() {
+        notices.insert(format!(
+            "prune_merged {}: {} not checked. {branch}: {}",
+            main_checkout.display(),
+            branches_text(check.errors.len()),
+            one_line(error)
+        ));
+    }
     for worktree in &check.finished {
-        if let Err(error) = finish_worktree(main_checkout, worktree, view, log) {
-            errors.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
+        if let Err(error) = finish_worktree(main_checkout, worktree, view, log, notices) {
+            notices.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
         }
     }
     for worktree in &check.merged {
         if let Err(error) = finish_merged_worktree(main_checkout, worktree, view, log) {
-            errors.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
+            notices.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
         }
     }
+    // Without any checked branch, the daily question has no list: the
+    // pass does not count for it.
+    if check.checked == 0 && !check.errors.is_empty() {
+        return None;
+    }
     Some(check.without_pull_request)
+}
+
+/// A number of branches: `1 branch`, `3 branches`.
+fn branches_text(count: usize) -> String {
+    if count == 1 {
+        "1 branch".to_owned()
+    } else {
+        format!("{count} branches")
+    }
 }
 
 /// Remove one finished worktree and its branch.
@@ -815,6 +839,7 @@ fn finish_worktree(
     worktree: &FinishedWorktree,
     view: &Mutex<PruneView>,
     log: &Log,
+    notices: &mut HashSet<String>,
 ) -> Result<(), Error> {
     let target = Target {
         main_checkout,
@@ -822,21 +847,29 @@ fn finish_worktree(
         branch: &worktree.branch,
         commit: &worktree.commit,
     };
-    if !prepare_removal(&target, view, log, |_| true)? {
-        return Ok(());
-    }
-    wt::remove_finished(main_checkout, &worktree.path)?;
-    let message = match worktree.pull_request.state {
-        PullRequestState::Closed => format!(
-            "removed the worktree of {}: its {} is closed. To get the branch back: {}",
-            worktree.branch, worktree.reference, worktree.recover_command
-        ),
-        _ => format!(
-            "removed the worktree of {}: its {} is merged",
-            worktree.branch, worktree.reference
-        ),
+    let is_closed = worktree.pull_request.state == PullRequestState::Closed;
+    let state = if is_closed { "closed" } else { "merged" };
+    let closed_agents = match prepare_removal(&target, view, log, |_| true)? {
+        Preparation::Ready(closed_agents) => closed_agents,
+        Preparation::AgentStays => {
+            notices.insert(format!(
+                "kept the worktree of {}: its {} is {state}, but an agent works in it, or its workspace has the focus",
+                worktree.branch, worktree.reference
+            ));
+            return Ok(());
+        }
+        Preparation::Kept => return Ok(()),
     };
-    log.write(&message);
+    wt::remove_finished(main_checkout, &worktree.path)?;
+    let why = if is_closed {
+        format!(
+            "its {} is closed. To get the branch back: {}",
+            worktree.reference, worktree.recover_command
+        )
+    } else {
+        format!("its {} is merged", worktree.reference)
+    };
+    report_removal(log, &worktree.branch, &why, &closed_agents);
     Ok(())
 }
 
@@ -871,11 +904,13 @@ fn finish_merged_worktree(
         };
         leftover::merged_branch(history, days, agents) == Some(leftover::Reason::BranchMerged)
     };
-    if !prepare_removal(&target, view, log, may_remove)? {
+    // An agent in a new worktree is the usual case: no notice. The agent
+    // of a merge without pull request reports, then stops.
+    let Preparation::Ready(closed_agents) = prepare_removal(&target, view, log, may_remove)? else {
         return Ok(());
-    }
+    };
     wt::remove_quietly(main_checkout, &worktree.path)?;
-    let why = match history.get() {
+    let commits = match history.get() {
         Some(leftover::History::OwnCommits) => "its commits",
         _ => "its commit, and the worktree had no use for 1 day",
     };
@@ -884,11 +919,36 @@ fn finish_merged_worktree(
     } else {
         ""
     };
-    log.write(&format!(
-        "removed the worktree of {}: {} contains {why}{kept_branch}",
-        worktree.branch, worktree.default_branch
-    ));
+    let why = format!(
+        "{} contains {commits}{kept_branch}",
+        worktree.default_branch
+    );
+    report_removal(log, &worktree.branch, &why, &closed_agents);
     Ok(())
+}
+
+/// Write a removal in the log, and show it to the user in a herdr
+/// notification, with the commands that resume the closed agents.
+fn report_removal(log: &Log, branch: &str, why: &str, closed_agents: &[String]) {
+    log.write(&format!("removed the worktree of {branch}: {why}"));
+    let body = removal_body(why, closed_agents);
+    if let Err(error) = herdr::show_notification(&format!("Worktree {branch} removed"), &body) {
+        log.write(&format!(
+            "cannot show the notification: {}",
+            one_line(&error)
+        ));
+    }
+}
+
+/// The text of the notification of a removal: the reason, then one line
+/// for each closed agent. The reason keeps its case: it can start with the
+/// name of a branch.
+fn removal_body(why: &str, closed_agents: &[String]) -> String {
+    let mut body = format!("Reason: {why}.");
+    for resume in closed_agents {
+        body.push_str(&format!("\nClosed agent, to resume it: {resume}"));
+    }
+    body
 }
 
 /// A worktree that the thread can remove, with the commit of its branch
@@ -907,8 +967,20 @@ impl Target<'_> {
     }
 }
 
-/// Prepare the removal of a worktree: return true if the thread can
-/// remove it now.
+/// The result of the preparation of a removal.
+#[derive(Debug, PartialEq, Eq)]
+enum Preparation {
+    /// The thread can remove the worktree now. The commands that resume
+    /// the agents that it closed.
+    Ready(Vec<String>),
+    /// An agent works in the worktree, waits for an answer, or its
+    /// workspace has the focus.
+    AgentStays,
+    /// The branch, the changes or the rule keep the worktree.
+    Kept,
+}
+
+/// Prepare the removal of a worktree.
 ///
 /// The thread reads the view and the commit of the branch just before the
 /// removal: during the calls to the forge, an agent can enter the
@@ -922,34 +994,43 @@ fn prepare_removal(
     view: &Mutex<PruneView>,
     log: &Log,
     may_remove: impl Fn(leftover::Agents) -> bool,
-) -> Result<bool, Error> {
+) -> Result<Preparation, Error> {
     let agents = lock(view).agents_in(target.path);
     let state = match agent_decision(&agents, target.path) {
-        AgentDecision::Wait => return Ok(false),
+        AgentDecision::Wait => return Ok(Preparation::AgentStays),
         AgentDecision::Remove => leftover::Agents::None,
         AgentDecision::CloseThenRemove => leftover::Agents::Idle,
     };
     // Check the branch and the changes before an agent closes: if the
     // worktree must stay, its agents stay too. The cheap checks first.
     if !target.is_unchanged() || !git::is_clean(target.path) || !may_remove(state) {
-        return Ok(false);
+        return Ok(Preparation::Kept);
     }
+    let mut closed_agents = Vec::new();
     if state == leftover::Agents::Idle {
         for agent in &agents {
             herdr::close_pane(&agent.pane_id)?;
+            let resume = resume_command(agent);
             log.write(&format!(
-                "closed the idle agent of {} (pane {}): {}",
-                target.branch,
-                agent.pane_id,
-                resume_command(agent)
+                "closed the idle agent of {} (pane {}): {resume}",
+                target.branch, agent.pane_id
             ));
+            closed_agents.push(resume);
         }
         if !wait_for_no_agent(view, target.path) {
-            return Ok(false);
+            // The agents closed, but the view of herdr is late: the next
+            // pass removes the worktree.
+            log.write(&format!(
+                "closed the agents of {}, but herdr still shows one: the worktree stays until the next pass",
+                target.branch
+            ));
+            return Ok(Preparation::Kept);
         }
-        return Ok(target.is_unchanged() && git::is_clean(target.path));
+        if !target.is_unchanged() || !git::is_clean(target.path) {
+            return Ok(Preparation::Kept);
+        }
     }
-    Ok(true)
+    Ok(Preparation::Ready(closed_agents))
 }
 
 /// Wait until the view shows no agent in `checkout`, for 10 seconds at
@@ -1773,5 +1854,20 @@ mod tests {
         git_in(&folder, &["switch", "-q", "main"]);
         git_in(&folder, &["branch", "-q", "-D", "feat"]);
         assert!(!target.is_unchanged(), "a deleted branch");
+    }
+
+    #[test]
+    fn the_notification_of_a_removal_gives_the_resume_commands() {
+        assert_eq!(
+            removal_body("its pull request #3 is merged", &[]),
+            "Reason: its pull request #3 is merged."
+        );
+        assert_eq!(
+            removal_body(
+                "main contains its commits",
+                &["claude --resume abc".to_owned()]
+            ),
+            "Reason: main contains its commits.\nClosed agent, to resume it: claude --resume abc"
+        );
     }
 }

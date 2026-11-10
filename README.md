@@ -191,8 +191,8 @@ The thread removes the worktree of a branch only if the branch has no open pull 
 
 The agents of a finished worktree:
 
-- If all its agents are `idle` or `done`, the thread closes their panes, then removes the worktree. The log gives the command that resumes each conversation, for example `claude --resume <session>`.
-- If an agent is `working`, `blocked` or `unknown`, or if its workspace has the focus, the thread keeps the worktree, and tries again at the next pass.
+- If all its agents are `idle` or `done`, the thread closes their panes, then removes the worktree. The log and a herdr notification give the command that resumes each conversation, for example `claude --resume <session>`.
+- If an agent is `working`, `blocked` or `unknown`, or if its workspace has the focus, the thread keeps the worktree, and tries again at the next pass. The log tells it once. For this message, the thread asks the forge also about a worktree where an agent works.
 
 The thread also removes the worktree of a branch that the default branch contains (the local branch, or the branch of `origin`). The branch has a finished pull request, or it was never pushed and has no pull request. The thread applies the rule of the cleaner:
 
@@ -219,7 +219,7 @@ bin/herdr-worktrunk list-merged <folder of the repository>
 - A workspace where an agent works stays open after the removal of its worktree. Close it with the herdr key `close_workspace`.
 - `prune_merged` asks only the forge of the remote `origin`, with a backend (see [The forges](#the-forges)), and only when herdr runs. It stops a command of the forge after 1 minute, and a `git` command after 30 seconds.
 - The observer never approves the hooks of a project (`--yes`). If a hook has no approval, run `wt config approvals add` in the repository.
-- The observer writes each removal and each new error in `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
+- The observer writes each removal and each new error in `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`). Each removal also shows a herdr notification. An error of the forge for one branch keeps this branch only: the thread checks the other branches.
 
 herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detected` also starts the observer. A lock keeps one observer for each herdr server. herdr installs each version in a new folder: each `observe` command writes the path of its binary in `observer.binary`, and a running observer runs this binary within 2 seconds. The observer reads `config.toml` when it starts: after a change, run `pkill -f 'herdr-worktrunk observe --run'`.
 
