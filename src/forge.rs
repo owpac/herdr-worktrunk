@@ -122,6 +122,7 @@ impl Provider {
     /// the hosts of Forgejo and Codeberg.
     pub fn from_host(host: &str) -> Provider {
         let host = host.to_ascii_lowercase();
+        let host_name = host.split(':').next().unwrap_or_default();
         if host.contains("github") {
             Provider::GitHub
         } else if host.contains("gitlab") {
@@ -130,9 +131,8 @@ impl Provider {
             Provider::Forgejo
         } else if host.contains("gitea") {
             Provider::Gitea
-        } else if host == "dev.azure.com"
-            || host == "ssh.dev.azure.com"
-            || host.ends_with(".visualstudio.com")
+        } else if ["dev.azure.com", "ssh.dev.azure.com"].contains(&host_name)
+            || host_name.ends_with(".visualstudio.com")
         {
             Provider::AzureDevOps
         } else {
@@ -196,15 +196,12 @@ pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
         provider => provider,
     };
     let repository = match (forge["owner"].as_str(), forge["name"].as_str()) {
-        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
-            match (provider, forge["project"].as_str()) {
-                // wt gives the project of Azure DevOps apart, encoded.
-                (Provider::AzureDevOps, Some(project)) => {
-                    Some(format!("{owner}/{}/{name}", azure::percent_decode(project)))
-                }
-                (Provider::AzureDevOps, None) => None,
-                _ => Some(format!("{owner}/{name}")),
-            }
+        // wt gives a wrong project for some remotes of Azure DevOps:
+        // `resolve` reads the remote itself.
+        (Some(owner), Some(name))
+            if !owner.is_empty() && !name.is_empty() && provider != Provider::AzureDevOps =>
+        {
+            Some(format!("{owner}/{name}"))
         }
         _ => None,
     };
@@ -228,21 +225,11 @@ fn from_remote(url: &str) -> Option<RepositoryForge> {
     let (host, path) = split_remote(url)?;
     let provider = Provider::from_host(host);
     if provider == Provider::AzureDevOps {
-        let repository =
-            azure::parse_remote_path(host, path).map(|(organization, project, repository)| {
-                format!("{organization}/{project}/{repository}")
-            });
-        // The API of `ssh.dev.azure.com` is on `dev.azure.com`.
-        let host = if host.eq_ignore_ascii_case("ssh.dev.azure.com") {
-            "dev.azure.com"
-        } else {
-            host
-        };
-        return Some(RepositoryForge {
+        return azure_forge(url).or(Some(RepositoryForge {
             provider,
             host: host.to_owned(),
-            repository,
-        });
+            repository: None,
+        }));
     }
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
@@ -266,9 +253,33 @@ pub const NO_REMOTE: &str = "no remote origin";
 /// order.
 pub fn resolve(main_checkout: &Path, listed: Option<&Value>) -> Result<RepositoryForge, String> {
     match listed.and_then(from_worktrunk) {
+        // The remote of Azure DevOps gives its 3 parts. wt can give the
+        // provider of a host with another name (Azure DevOps Server).
+        Some(forge) if forge.provider == Provider::AzureDevOps => {
+            let url = git::origin_url(main_checkout).ok_or_else(|| NO_REMOTE.to_owned())?;
+            Ok(azure_forge(&url).unwrap_or(forge))
+        }
         Some(forge) => Ok(forge),
         None => from_origin(main_checkout),
     }
+}
+
+/// The forge of a remote of Azure DevOps, with its organization, its
+/// project and its repository. None if the path has another form.
+fn azure_forge(url: &str) -> Option<RepositoryForge> {
+    let (host, path) = split_remote(url)?;
+    let (organization, project, repository) = azure::parse_remote_path(host, path)?;
+    // The API of `ssh.dev.azure.com` is on `dev.azure.com`.
+    let host = if host.eq_ignore_ascii_case("ssh.dev.azure.com") {
+        "dev.azure.com"
+    } else {
+        host
+    };
+    Some(RepositoryForge {
+        provider: Provider::AzureDevOps,
+        host: host.to_owned(),
+        repository: Some(format!("{organization}/{project}/{repository}")),
+    })
 }
 
 /// The forge of a repository, for the observer: as `resolve`, with one
@@ -429,6 +440,7 @@ pub fn encode_url_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, test_folder};
 
     #[test]
     fn the_provider_comes_from_the_name_of_the_host() {
@@ -600,29 +612,18 @@ mod tests {
 
     #[test]
     fn azure_devops_keeps_its_project() {
-        // The answer of wt for a remote on dev.azure.com.
-        let json = serde_json::json!({ "repo": { "forge": {
-            "url": "https://dev.azure.com/myorg/My%20Project/_git/my-repo",
-            "provider": "azure-devops",
-            "host": "dev.azure.com",
-            "owner": "myorg",
-            "name": "my-repo",
-            "project": "My%20Project",
-            "remote": "origin"
-        } } });
         let expected = RepositoryForge {
             provider: Provider::AzureDevOps,
             host: "dev.azure.com".to_owned(),
-            repository: Some("myorg/My Project/my-repo".to_owned()),
+            repository: Some("myorg/My Project/my repo".to_owned()),
         };
 
-        assert_eq!(from_worktrunk(&json).as_ref(), Some(&expected));
         assert_eq!(
-            from_remote("git@ssh.dev.azure.com:v3/myorg/My%20Project/my-repo").as_ref(),
+            from_remote("git@ssh.dev.azure.com:v3/myorg/My%20Project/my%20repo").as_ref(),
             Some(&expected)
         );
         assert_eq!(
-            from_remote("https://myorg@dev.azure.com/myorg/My%20Project/_git/my-repo").as_ref(),
+            from_remote("https://myorg@dev.azure.com/myorg/My%20Project/_git/my%20repo").as_ref(),
             Some(&expected)
         );
         let limit = Duration::from_secs(1);
@@ -634,6 +635,52 @@ mod tests {
         assert_eq!(
             backend(&without_project, limit).err(),
             Some("no organization, project and name on Azure DevOps: myorg/my-repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_remote_gives_the_parts_of_azure_devops_not_wt() {
+        // wt 0.81 gives a wrong project for a remote with
+        // DefaultCollection, and keeps the name encoded.
+        let folder = test_folder("azure-remote");
+        git_in(&folder, &["init", "-q"]);
+        git_in(
+            &folder,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://myorg.visualstudio.com/DefaultCollection/My%20Project/_git/my%20repo",
+            ],
+        );
+        let json = serde_json::json!({ "repo": { "forge": {
+            "provider": "azure-devops",
+            "host": "myorg.visualstudio.com",
+            "owner": "myorg",
+            "name": "my%20repo",
+            "project": "DefaultCollection",
+            "remote": "origin"
+        } } });
+
+        assert_eq!(
+            from_worktrunk(&json).and_then(|forge| forge.repository),
+            None
+        );
+        assert_eq!(
+            resolve(&folder, Some(&json)),
+            Ok(RepositoryForge {
+                provider: Provider::AzureDevOps,
+                host: "myorg.visualstudio.com".to_owned(),
+                repository: Some("myorg/My Project/my repo".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn an_azure_host_with_a_port_is_azure_devops() {
+        assert_eq!(
+            Provider::from_host("dev.azure.com:443"),
+            Provider::AzureDevOps
         );
     }
 

@@ -6,8 +6,9 @@
 //! extension: a missing extension gives an error.
 //!
 //! The proof of a finished pull request is its last commit only
-//! (`lastMergeSourceCommit`): Azure DevOps has no button that adds a commit
-//! to the branch of a pull request, as "Update branch" on GitHub.
+//! (`lastMergeSourceCommit`): the backend does not read the commits of a
+//! pull request. A commit on the forge after the local commit (for example
+//! a suggestion that a review applies) keeps the worktree.
 
 use std::env;
 use std::process::Command;
@@ -90,10 +91,11 @@ impl Backend for AzureDevOps {
         false
     }
 
-    /// Azure DevOps gives a commit by its hash, also after the deletion of
-    /// the branch.
+    /// git keeps the local commit until its next `git gc`. Azure DevOps
+    /// gives the commit of a completed pull request by its hash, also
+    /// after the deletion of the branch: not tested for an abandoned one.
     fn recover_command(&self, _pull_request: &PullRequest, commit: &str, branch: &str) -> String {
-        format!("git fetch origin {commit}:refs/heads/{branch}")
+        format!("git branch {branch} {commit} || git fetch origin {commit}:refs/heads/{branch}")
     }
 
     fn reference(&self, number: u64) -> String {
@@ -122,6 +124,12 @@ fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Err
     }
     let listed: Vec<Listed> = serde_json::from_str(text)
         .map_err(|error| Error::Command(format!("az repos pr list: invalid JSON: {error}")))?;
+    // A full page can miss an open pull request.
+    if listed.len() >= PAGE_SIZE.parse().unwrap_or(usize::MAX) {
+        return Err(Error::Command(format!(
+            "{PAGE_SIZE} pull requests or more for {branch}"
+        )));
+    }
     let source = format!("refs/heads/{branch}");
     let mut pull_requests: Vec<PullRequest> = listed
         .into_iter()
@@ -144,61 +152,88 @@ fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Err
     Ok(pull_requests)
 }
 
-/// The URL of the organization of a host: `dev.azure.com` needs the
-/// organization in its path, `<organization>.visualstudio.com` does not.
+/// The name of a host, without its port and in lowercase.
+fn host_name(host: &str) -> String {
+    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
+}
+
+/// The URL of the organization (or of the collection, on Azure DevOps
+/// Server) of a host.
 pub fn organization_url(host: &str, organization: &str) -> String {
-    if host.eq_ignore_ascii_case("dev.azure.com") || host.eq_ignore_ascii_case("ssh.dev.azure.com")
-    {
+    let name = host_name(host);
+    if name == "dev.azure.com" || name == "ssh.dev.azure.com" {
         format!("https://dev.azure.com/{organization}")
+    } else if name.ends_with(".visualstudio.com") {
+        format!("https://{organization}.visualstudio.com")
     } else {
-        format!("https://{host}")
+        format!("https://{host}/{organization}")
     }
 }
 
 /// The organization, the project and the repository of the path of a
 /// remote on Azure DevOps, with the host of the remote:
 ///
-/// - `dev.azure.com`: `<organization>/<project>/_git/<repository>`
-/// - `ssh.dev.azure.com`: `v3/<organization>/<project>/<repository>`
+/// - ssh (`ssh.dev.azure.com`, `vs-ssh.visualstudio.com`):
+///   `v3/<organization>/<project>/<repository>`
+/// - `dev.azure.com`: `<organization>/[<project>/]_git/<repository>`
 /// - `<organization>.visualstudio.com`:
-///   `[DefaultCollection/]<project>/_git/<repository>`
+///   `[DefaultCollection/][<project>/]_git/<repository>`
+/// - Azure DevOps Server: `<collection>/[<project>/]_git/<repository>`
 ///
-/// The names come back decoded: `My%20Project` gives `My Project`.
+/// Without a project in the path, the project has the name of the
+/// repository. The names come back decoded: `My%20Project` gives
+/// `My Project`.
 pub fn parse_remote_path(host: &str, path: &str) -> Option<(String, String, String)> {
     let parts: Vec<&str> = path
         .trim_matches('/')
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
-    let host = host.to_ascii_lowercase();
-    let (organization, project, repository) = if host == "ssh.dev.azure.com" {
+    let name = host_name(host);
+    let (organization, project, repository) = if name == "ssh.dev.azure.com"
+        || name == "vs-ssh.visualstudio.com"
+    {
         match parts.as_slice() {
-            ["v3", organization, project, repository] => (*organization, *project, *repository),
-            _ => return None,
-        }
-    } else if host == "dev.azure.com" {
-        match parts.as_slice() {
-            [organization, project, "_git", repository] => (*organization, *project, *repository),
+            ["v3", organization, project, repository] => {
+                (*organization, Some(*project), *repository)
+            }
             _ => return None,
         }
     } else {
-        let organization = host.strip_suffix(".visualstudio.com")?;
-        match parts.as_slice() {
-            [project, "_git", repository] | ["DefaultCollection", project, "_git", repository] => {
-                (organization, *project, *repository)
-            }
+        let (before, repository) = match parts.as_slice() {
+            [before @ .., "_git", repository] => (before, *repository),
             _ => return None,
+        };
+        if let Some(organization) = name.strip_suffix(".visualstudio.com") {
+            let before = match before {
+                [collection, rest @ ..] if collection.eq_ignore_ascii_case("DefaultCollection") => {
+                    rest
+                }
+                _ => before,
+            };
+            match before {
+                [] => (organization, None, repository),
+                [project] => (organization, Some(*project), repository),
+                _ => return None,
+            }
+        } else {
+            // dev.azure.com, or a collection of Azure DevOps Server.
+            match before {
+                [organization] => (*organization, None, repository),
+                [organization, project] => (*organization, Some(*project), repository),
+                _ => return None,
+            }
         }
     };
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
     Some((
         percent_decode(organization),
-        percent_decode(project),
+        percent_decode(project.unwrap_or(repository)),
         percent_decode(repository),
     ))
 }
 
-/// Decode the `%XX` of an URL.
+/// Decode the `%XX` of an URL. A `%` without 2 hexadecimal digits stays.
 pub fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -206,6 +241,7 @@ pub fn percent_decode(value: &str) -> String {
     while index < bytes.len() {
         let hex = bytes
             .get(index + 1..index + 3)
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
             .and_then(|hex| std::str::from_utf8(hex).ok())
             .and_then(|hex| u8::from_str_radix(hex, 16).ok());
         match (bytes[index], hex) {
@@ -287,6 +323,81 @@ mod tests {
             expected
         );
         assert_eq!(parse_remote_path("dev.azure.com", "myorg/my-repo"), None);
+        // Old ssh, a lowercase collection, a port, an encoded name.
+        assert_eq!(
+            parse_remote_path("vs-ssh.visualstudio.com", "v3/myorg/My%20Project/my-repo"),
+            expected
+        );
+        assert_eq!(
+            parse_remote_path(
+                "myorg.visualstudio.com",
+                "defaultcollection/My%20Project/_git/my-repo"
+            ),
+            expected
+        );
+        assert_eq!(
+            parse_remote_path("dev.azure.com:443", "myorg/My%20Project/_git/my-repo"),
+            expected
+        );
+        assert_eq!(
+            parse_remote_path("dev.azure.com", "myorg/My%20Project/_git/my%20repo"),
+            Some((
+                "myorg".to_owned(),
+                "My Project".to_owned(),
+                "my repo".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_path_without_project_names_the_project_after_the_repository() {
+        let expected = Some((
+            "myorg".to_owned(),
+            "my-repo".to_owned(),
+            "my-repo".to_owned(),
+        ));
+
+        assert_eq!(
+            parse_remote_path("dev.azure.com", "myorg/_git/my-repo"),
+            expected
+        );
+        assert_eq!(
+            parse_remote_path("myorg.visualstudio.com", "_git/my-repo"),
+            expected
+        );
+    }
+
+    #[test]
+    fn azure_devops_server_has_a_collection() {
+        assert_eq!(
+            parse_remote_path("tfs.example.com", "DefaultCollection/Project/_git/repo"),
+            Some((
+                "DefaultCollection".to_owned(),
+                "Project".to_owned(),
+                "repo".to_owned()
+            ))
+        );
+        assert_eq!(
+            organization_url("tfs.example.com:8080", "DefaultCollection"),
+            "https://tfs.example.com:8080/DefaultCollection"
+        );
+    }
+
+    #[test]
+    fn a_full_page_of_pull_requests_gives_an_error() {
+        let page: Vec<serde_json::Value> = (1..=50)
+            .map(|number| {
+                serde_json::json!({
+                    "pullRequestId": number,
+                    "status": "completed",
+                    "sourceRefName": "refs/heads/develop",
+                })
+            })
+            .collect();
+
+        let result = parse_pull_requests(&serde_json::to_string(&page).unwrap(), "develop");
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -299,6 +410,10 @@ mod tests {
             organization_url("myorg.visualstudio.com", "myorg"),
             "https://myorg.visualstudio.com"
         );
+        assert_eq!(
+            organization_url("vs-ssh.visualstudio.com", "myorg"),
+            "https://myorg.visualstudio.com"
+        );
     }
 
     #[test]
@@ -307,6 +422,7 @@ mod tests {
         assert_eq!(percent_decode("%C3%A9t%C3%A9"), "été");
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%+A"), "%+A");
     }
 
     #[test]
@@ -326,7 +442,7 @@ mod tests {
         assert_eq!(azure.reference(5), "pull request !5");
         assert_eq!(
             azure.recover_command(&merged, "aaa", "feat/x"),
-            "git fetch origin aaa:refs/heads/feat/x"
+            "git branch feat/x aaa || git fetch origin aaa:refs/heads/feat/x"
         );
         assert!(!azure.contains("aaa", "aaa"));
     }
