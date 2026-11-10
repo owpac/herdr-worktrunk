@@ -35,7 +35,7 @@ use crate::forge;
 use crate::fzf;
 use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
-use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
+use crate::leftover::{self, Agents, Changes, Facts, Merge, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
 use crate::stale::{self, OldWorktree, DAY};
@@ -82,12 +82,21 @@ const WORKTREE_KIND: &str = "worktree";
 fn glyph(reason: Reason) -> (&'static str, &'static str) {
     match reason {
         Reason::Checking => (ACCENT, SPINNER[0]),
+        // is_leftover decides the group To delete: the color follows it.
         reason if reason.is_leftover() => (RED, "✕"),
-        Reason::Open | Reason::Recent | Reason::WorkAfter | Reason::InDefault => (GREEN, "✓"),
+        Reason::PullRequestMerged
+        | Reason::PullRequestClosed
+        | Reason::BranchMerged
+        | Reason::Old => (RED, "✕"),
+        Reason::PullRequestOpen
+        | Reason::Recent
+        | Reason::MergedRecently
+        | Reason::WorkAfterPullRequest
+        | Reason::CommitInDefaultBranch => (GREEN, "✓"),
         Reason::Changes => (YELLOW, "●"),
         Reason::Agent => (ACCENT, "◐"),
         Reason::IdleAgent => (DIM, "◐"),
-        _ => (DIM, "?"),
+        Reason::Unknown => (DIM, "?"),
     }
 }
 
@@ -304,16 +313,17 @@ struct RepositoryFacts {
     /// The backend of the forge, for all the worktrees of the repository:
     /// it keeps what it reads, for example the open pull requests of Gitea.
     backend: Result<Box<dyn forge::Backend>, String>,
-    default_branch: Option<String>,
+    /// The default branch of `origin`: `origin/main`.
+    origin_default_branch: Option<String>,
     /// The name of the default branch (`main`), for the texts.
     main_name: Option<String>,
     /// The merge of each worktree, or None if wt gave no answer.
-    integrations: Option<HashMap<String, Integration>>,
+    merges: Option<HashMap<String, Merge>>,
     pushes: HashMap<String, Push>,
 }
 
 /// Read the facts of a repository. With `fetch`, fetch `origin` first: the
-/// integration and the push state then see the last state of the remote.
+/// merge and the push state then see the last state of the remote.
 fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
     if fetch {
         // A failed fetch keeps the old state of the remote.
@@ -327,13 +337,13 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         _ => HashMap::new(),
     };
     let listed = wt::list_json(main_checkout);
-    let integrations = listed.as_ref().map(leftover::parse_integrations);
-    let default_branch = git::default_branch(main_checkout);
+    let merges = listed.as_ref().map(leftover::parse_merges);
+    let origin_default_branch = git::default_branch(main_checkout);
     let main_name = listed
         .as_ref()
         .and_then(leftover::parse_default_branch)
         .or_else(|| {
-            default_branch
+            origin_default_branch
                 .as_deref()
                 .map(|branch| branch.trim_start_matches("origin/").to_owned())
         });
@@ -345,9 +355,9 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
     RepositoryFacts {
         forge,
         backend,
-        default_branch,
+        origin_default_branch,
         main_name,
-        integrations,
+        merges,
         pushes,
     }
 }
@@ -357,19 +367,20 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
     let mut result = entry.clone();
     let facts = &mut result.facts;
     facts.changes = match git::clean_status(&entry.path) {
-        Some(true) => Changes::None,
-        Some(false) => Changes::Some,
+        Some(true) => Changes::Clean,
+        Some(false) => Changes::Uncommitted,
         None => Changes::Failed,
     };
     let now = stale::now();
     facts.days = git::last_activity(&entry.path).map(|time| now.saturating_sub(time) / DAY);
-    facts.integration = match &repository.integrations {
-        Some(integrations) => integrations.get(&entry.branch).cloned().unwrap_or_else(|| {
-            Integration::Undetermined("wt did not list this worktree".to_owned())
-        }),
-        None => Integration::Undetermined("wt gave no answer".to_owned()),
+    facts.merge = match &repository.merges {
+        Some(merges) => merges
+            .get(&entry.branch)
+            .cloned()
+            .unwrap_or_else(|| Merge::Undetermined("wt did not list this worktree".to_owned())),
+        None => Merge::Undetermined("wt gave no answer".to_owned()),
     };
-    facts.default_branch = repository.main_name.clone();
+    facts.default_branch_name = repository.main_name.clone();
     facts.push = repository
         .pushes
         .get(&entry.branch)
@@ -380,7 +391,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
         Err(_) => "no forge".to_owned(),
     };
     facts.pull_requests = match facts.changes {
-        Changes::Some => PullRequests::NotNeeded("the changes keep the worktree".to_owned()),
+        Changes::Uncommitted => PullRequests::NotNeeded("the changes keep the worktree".to_owned()),
         Changes::Failed => PullRequests::NotNeeded("git status failed".to_owned()),
         _ => match &repository.backend {
             // A repository without a remote has no pull request.
@@ -392,7 +403,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
                 prune::branch_status(
                     &entry.main_checkout,
                     backend.as_ref(),
-                    repository.default_branch.as_deref(),
+                    repository.origin_default_branch.as_deref(),
                     &entry.branch,
                 )
                 .map_err(|error| error.to_string().replace('\n', " ")),
@@ -880,18 +891,7 @@ fn print_checklist(entry: &Entry, stale_days: u32) {
         );
     }
     println!();
-    // The rule of the verdict, on short lines: the preview does not wrap.
-    for line in [
-        "To delete, in this order:".to_owned(),
-        "- no agent that works, and no change,".to_owned(),
-        "- no open pull request,".to_owned(),
-        "- a finished pull request with the last commit,".to_owned(),
-        format!(
-            "- or a merged branch, {} day without activity,",
-            leftover::INTEGRATED_MIN_DAYS
-        ),
-        format!("- or no pull request, {stale_days} days without activity and no agent."),
-    ] {
+    for line in leftover::rule_lines(stale_days) {
         println!("{DIM}{line}{RESET}");
     }
 }
@@ -1110,7 +1110,7 @@ mod tests {
             main_checkout: PathBuf::from(format!("/work/{project}")),
             reason,
             facts: Facts {
-                changes: Changes::None,
+                changes: Changes::Clean,
                 days,
                 ..Facts::default()
             },
@@ -1119,10 +1119,10 @@ mod tests {
 
     fn entries() -> Vec<Entry> {
         vec![
-            entry("b-open", "zeta", Reason::Open, Some(1)),
+            entry("b-open", "zeta", Reason::PullRequestOpen, Some(1)),
             entry("a-old", "alpha", Reason::Old, Some(12)),
             entry("c-check", "alpha", Reason::Checking, None),
-            entry("d-merged", "zeta", Reason::Merged, Some(40)),
+            entry("d-merged", "zeta", Reason::PullRequestMerged, Some(40)),
         ]
     }
 
@@ -1166,7 +1166,7 @@ mod tests {
 
     #[test]
     fn without_leftover_the_group_to_delete_goes_away() {
-        let entries = vec![entry("b-open", "zeta", Reason::Open, Some(1))];
+        let entries = vec![entry("b-open", "zeta", Reason::PullRequestOpen, Some(1))];
 
         assert_eq!(ids(&layout(&entries, true)), ["group:/work/zeta", "b-open"]);
     }
@@ -1204,10 +1204,10 @@ mod tests {
     }
 
     #[test]
-    fn an_integrated_worktree_is_a_leftover_with_its_proof() {
-        let mut squashed = entry("e-squash", "alpha", Reason::Integrated, Some(3));
-        squashed.facts.integration = Integration::Integrated("patch_id_match".to_owned());
-        squashed.facts.default_branch = Some("main".to_owned());
+    fn a_merged_worktree_is_a_leftover_with_its_proof() {
+        let mut squashed = entry("e-squash", "alpha", Reason::BranchMerged, Some(3));
+        squashed.facts.merge = Merge::Merged("patch_id_match".to_owned());
+        squashed.facts.default_branch_name = Some("main".to_owned());
 
         let text = line(&Row::Worktree(&squashed), 90);
         let shown = style::visible(text.split('\t').nth(ROW_FIELDS).unwrap());
@@ -1221,10 +1221,10 @@ mod tests {
 
     #[test]
     fn two_repositories_with_the_same_name_get_two_groups() {
-        let mut other = entry("b", "app", Reason::Open, Some(1));
+        let mut other = entry("b", "app", Reason::PullRequestOpen, Some(1));
         other.main_checkout = PathBuf::from("/other/app");
         other.path = PathBuf::from("/other/app.b");
-        let entries = vec![entry("a", "app", Reason::Open, Some(1)), other];
+        let entries = vec![entry("a", "app", Reason::PullRequestOpen, Some(1)), other];
 
         let rows = layout(&entries, true);
 
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[test]
     fn the_state_file_keeps_each_entry() {
-        let mut merged = entry("feat/a", "alpha", Reason::Merged, Some(3));
+        let mut merged = entry("feat/a", "alpha", Reason::PullRequestMerged, Some(3));
         merged.facts.pull_requests = PullRequests::Finished {
             number: 12,
             merged: true,
@@ -1324,6 +1324,45 @@ mod tests {
     }
 
     #[test]
+    fn a_new_worktree_is_kept_today() {
+        let base = test_folder("new-worktree");
+        let main = base.join("repo");
+        fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let worktree = base.join("repo.fresh");
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fresh",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let entry = Entry::new(worktree, "fresh".to_owned(), main.clone(), Agents::None);
+
+        let result = check(&entry, &repository_facts(&main, false), 7);
+
+        // wt sees the commit of main: merged at once. Without wt (the CI),
+        // the merge is unknown. In both cases, the worktree stays.
+        let has_wt = Command::new("wt")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let expected = if has_wt {
+            Reason::MergedRecently
+        } else {
+            Reason::Recent
+        };
+        assert_eq!(result.reason, expected);
+        assert!(!result.reason.is_leftover());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn a_branch_that_was_never_pushed_needs_no_forge() {
         let base = test_folder("never-pushed");
         let main = base.join("repo");
@@ -1342,6 +1381,11 @@ mod tests {
                 worktree.to_str().unwrap(),
             ],
         );
+        // A commit that main does not have: the branch is not merged, with
+        // or without wt.
+        fs::write(worktree.join("work.txt"), "work").unwrap();
+        git_in(&worktree, &["add", "work.txt"]);
+        git_in(&worktree, &["commit", "-q", "-m", "work"]);
         let entry = Entry::new(worktree, "local".to_owned(), main.clone(), Agents::None);
 
         let result = check(&entry, &repository_facts(&main, false), 7);
@@ -1352,7 +1396,7 @@ mod tests {
             result.facts.pull_requests,
             PullRequests::NotNeeded("no remote origin".to_owned())
         );
-        assert_eq!(result.facts.changes, Changes::None);
+        assert_eq!(result.facts.changes, Changes::Clean);
         assert_eq!(result.reason, Reason::Recent);
         fs::remove_dir_all(&base).unwrap();
     }
