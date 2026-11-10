@@ -29,6 +29,7 @@ use crate::gitlab::GitLab;
 use crate::herdr::Error;
 use crate::process;
 use crate::sync::lock;
+use crate::url;
 use crate::wt;
 
 /// The URL schemes of a remote. A remote without scheme has the form
@@ -182,7 +183,7 @@ impl Provider {
     /// the hosts of Forgejo and Codeberg.
     pub fn from_host(host: &str) -> Provider {
         let host = host.to_ascii_lowercase();
-        let host_name = host.split(':').next().unwrap_or_default();
+        let host_name = url::host_name(&host);
         if host.contains("github") {
             Provider::GitHub
         } else if host.contains("gitlab") {
@@ -191,7 +192,7 @@ impl Provider {
             Provider::Forgejo
         } else if host.contains("gitea") {
             Provider::Gitea
-        } else if ["dev.azure.com", "ssh.dev.azure.com"].contains(&host_name)
+        } else if ["dev.azure.com", "ssh.dev.azure.com"].contains(&host_name.as_str())
             || host_name.ends_with(".visualstudio.com")
         {
             Provider::AzureDevOps
@@ -474,21 +475,6 @@ pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backe
     })
 }
 
-/// Encode a value for a path segment or a query of a URL: each byte
-/// outside the unreserved characters of RFC 3986 becomes `%XX`. The braces
-/// get encoded too: tea replaces `{owner}`, `{repo}` and `{branch}`.
-pub fn encode_url_part(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,16 +655,6 @@ mod tests {
                 .map(|error| error.to_string()),
             Some("no backend for an unknown forge yet".to_owned())
         );
-    }
-
-    #[test]
-    fn encode_url_part_keeps_only_the_unreserved_characters() {
-        assert_eq!(encode_url_part("group/sub/app"), "group%2Fsub%2Fapp");
-        assert_eq!(encode_url_part("feat/forge-layers"), "feat%2Fforge-layers");
-        assert_eq!(encode_url_part("v1.2_x~y"), "v1.2_x~y");
-        assert_eq!(encode_url_part("a+b c&d=e#f"), "a%2Bb%20c%26d%3De%23f");
-        assert_eq!(encode_url_part("é"), "%C3%A9");
-        assert_eq!(encode_url_part("feat/{branch}"), "feat%2F%7Bbranch%7D");
     }
 
     #[test]

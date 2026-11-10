@@ -15,12 +15,12 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::encode_url_part as encode;
 use crate::forge::{
     self, Backend, ForgeError, Provider, PullRequest, PullRequestState, RepositoryForge, PAGE_SIZE,
 };
 use crate::herdr::Error;
 use crate::process;
+use crate::url::encode_part as encode;
 
 /// The backend of a project on a GitLab host.
 pub struct GitLab {

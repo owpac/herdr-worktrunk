@@ -22,6 +22,7 @@ use crate::forge::{
 };
 use crate::herdr::Error;
 use crate::process;
+use crate::url;
 
 /// The backend of a repository on Azure DevOps.
 pub struct AzureDevOps {
@@ -171,15 +172,10 @@ fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Err
         .collect())
 }
 
-/// The name of a host, without its port and in lowercase.
-fn host_name(host: &str) -> String {
-    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
-}
-
 /// The URL of the organization (or of the collection, on Azure DevOps
 /// Server) of a host.
 pub fn organization_url(host: &str, organization: &str) -> String {
-    let name = host_name(host);
+    let name = url::host_name(host);
     if name == "dev.azure.com" || name == "ssh.dev.azure.com" {
         format!("https://dev.azure.com/{organization}")
     } else if name.ends_with(".visualstudio.com") {
@@ -208,7 +204,7 @@ pub fn parse_remote_path(host: &str, path: &str) -> Option<Location> {
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
-    let name = host_name(host);
+    let name = url::host_name(host);
     let (organization, project, repository) = if name == "ssh.dev.azure.com"
         || name == "vs-ssh.visualstudio.com"
     {
@@ -246,35 +242,10 @@ pub fn parse_remote_path(host: &str, path: &str) -> Option<Location> {
     };
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
     Some(Location {
-        organization: percent_decode(organization),
-        project: percent_decode(project.unwrap_or(repository)),
-        name: percent_decode(repository),
+        organization: url::decode(organization),
+        project: url::decode(project.unwrap_or(repository)),
+        name: url::decode(repository),
     })
-}
-
-/// Decode the `%XX` of an URL. A `%` without 2 hexadecimal digits stays.
-pub fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let hex = bytes
-            .get(index + 1..index + 3)
-            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match (bytes[index], hex) {
-            (b'%', Some(byte)) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            (byte, _) => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 #[cfg(test)]
@@ -408,15 +379,6 @@ mod tests {
             organization_url("vs-ssh.visualstudio.com", "myorg"),
             "https://myorg.visualstudio.com"
         );
-    }
-
-    #[test]
-    fn percent_decode_keeps_an_invalid_sequence() {
-        assert_eq!(percent_decode("My%20Project"), "My Project");
-        assert_eq!(percent_decode("%C3%A9t%C3%A9"), "été");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        assert_eq!(percent_decode("%+A"), "%+A");
     }
 
     #[test]

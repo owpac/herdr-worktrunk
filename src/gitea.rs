@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::forge::{
-    self, encode_url_part as encode, Backend, ForgeError, Provider, PullRequest, PullRequestState,
-    RepositoryForge,
+    self, Backend, ForgeError, Provider, PullRequest, PullRequestState, RepositoryForge,
 };
 use crate::herdr::Error;
 use crate::process;
 use crate::sync::lock;
+use crate::url::encode_part as encode;
 
 /// The number of items that one call asks for.
 const PAGE_SIZE: usize = 50;
