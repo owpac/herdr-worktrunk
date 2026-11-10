@@ -83,8 +83,9 @@ const OBSERVER_FORGE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 pub enum Provider {
     GitHub,
     GitLab,
-    /// Gitea, Forgejo and Codeberg.
     Gitea,
+    /// Forgejo, and Codeberg, its public host.
+    Forgejo,
     AzureDevOps,
     /// A host that the plugin does not know.
     Unknown,
@@ -97,6 +98,7 @@ impl Provider {
             Provider::GitHub => "GitHub",
             Provider::GitLab => "GitLab",
             Provider::Gitea => "Gitea",
+            Provider::Forgejo => "Forgejo",
             Provider::AzureDevOps => "Azure DevOps",
             Provider::Unknown => "an unknown forge",
         }
@@ -107,7 +109,8 @@ impl Provider {
         match provider {
             "github" => Provider::GitHub,
             "gitlab" => Provider::GitLab,
-            "gitea" | "forgejo" => Provider::Gitea,
+            "gitea" => Provider::Gitea,
+            "forgejo" => Provider::Forgejo,
             "azure-devops" => Provider::AzureDevOps,
             _ => Provider::Unknown,
         }
@@ -121,10 +124,9 @@ impl Provider {
             Provider::GitHub
         } else if host.contains("gitlab") {
             Provider::GitLab
-        } else if ["gitea", "forgejo", "codeberg"]
-            .iter()
-            .any(|name| host.contains(name))
-        {
+        } else if host.contains("forgejo") || host.contains("codeberg") {
+            Provider::Forgejo
+        } else if host.contains("gitea") {
             Provider::Gitea
         } else if host == "dev.azure.com"
             || host == "ssh.dev.azure.com"
@@ -182,8 +184,13 @@ pub struct RepositoryForge {
 /// The forge that `wt list --format json` gives in `repo.forge`.
 pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
     let forge = &json["repo"]["forge"];
-    let provider = Provider::from_worktrunk(forge["provider"].as_str()?);
     let host = forge["host"].as_str().unwrap_or_default().to_owned();
+    // wt does not know some hosts, for example codeberg.org: their name
+    // then gives the provider.
+    let provider = match Provider::from_worktrunk(forge["provider"].as_str()?) {
+        Provider::Unknown => Provider::from_host(&host),
+        provider => provider,
+    };
     let repository = match (forge["owner"].as_str(), forge["name"].as_str()) {
         (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
             Some(format!("{owner}/{name}"))
@@ -368,8 +375,8 @@ mod tests {
             ("gitlab.com", Provider::GitLab),
             ("gitlab.company.example", Provider::GitLab),
             ("gitea.com", Provider::Gitea),
-            ("codeberg.org", Provider::Gitea),
-            ("forgejo.example.org", Provider::Gitea),
+            ("codeberg.org", Provider::Forgejo),
+            ("forgejo.example.org", Provider::Forgejo),
             ("dev.azure.com", Provider::AzureDevOps),
             ("ssh.dev.azure.com", Provider::AzureDevOps),
             ("team.visualstudio.com", Provider::AzureDevOps),
@@ -467,6 +474,28 @@ mod tests {
     }
 
     #[test]
+    fn a_host_that_wt_does_not_know_gets_the_provider_of_its_name() {
+        // The answer of wt for a remote on codeberg.org.
+        let json = serde_json::json!({ "repo": { "forge": {
+            "url": "https://codeberg.org/forgejo/forgejo",
+            "provider": "unknown",
+            "host": "codeberg.org",
+            "owner": "forgejo",
+            "name": "forgejo",
+            "remote": "origin"
+        } } });
+
+        assert_eq!(
+            from_worktrunk(&json),
+            Some(RepositoryForge {
+                provider: Provider::Forgejo,
+                host: "codeberg.org".to_owned(),
+                repository: Some("forgejo/forgejo".to_owned()),
+            })
+        );
+    }
+
+    #[test]
     fn the_json_of_wt_gives_the_forge() {
         let json: Value =
             serde_json::from_str(include_str!("../tests/fixtures/wt-list.json")).unwrap();
@@ -485,8 +514,8 @@ mod tests {
     #[test]
     fn a_provider_without_backend_gives_an_error() {
         let forge = RepositoryForge {
-            provider: Provider::Gitea,
-            host: "codeberg.org".to_owned(),
+            provider: Provider::AzureDevOps,
+            host: "dev.azure.com".to_owned(),
             repository: Some("team/app".to_owned()),
         };
 
@@ -498,7 +527,7 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        assert_eq!(status, Err("no backend for Gitea yet".to_owned()));
+        assert_eq!(status, Err("no backend for Azure DevOps yet".to_owned()));
     }
 
     #[test]
