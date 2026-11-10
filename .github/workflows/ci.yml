@@ -65,4 +65,4 @@ jobs:
           version: 2026.10.17
           install_args: shellcheck
       - name: ShellCheck
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh docs/make-images
