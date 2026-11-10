@@ -1,0 +1,74 @@
+[
+  {
+    "number": 15024,
+    "title": "Update dependency chart.js to v4.6.1 (forgejo)",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://codeberg.org/forgejo/forgejo/pulls/15024",
+    "head": {
+      "label": "renovate/forgejo-chart.js-4.x",
+      "ref": "renovate/forgejo-chart.js-4.x",
+      "sha": "ff15529c31381e054109cbe4b313a7e88d616c47",
+      "repo_id": 73144
+    },
+    "base": {
+      "label": "forgejo",
+      "ref": "forgejo",
+      "repo_id": 73144
+    }
+  },
+  {
+    "number": 9677,
+    "title": "Update dependency chart.js to v4.5.1 (forgejo)",
+    "state": "closed",
+    "merged": true,
+    "html_url": "https://codeberg.org/forgejo/forgejo/pulls/9677",
+    "head": {
+      "label": "renovate/forgejo-chart.js-4.x",
+      "ref": "renovate/forgejo-chart.js-4.x",
+      "sha": "ff15529c31381e054109cbe4b313a7e88d616c47",
+      "repo_id": 73144
+    },
+    "base": {
+      "label": "forgejo",
+      "ref": "forgejo",
+      "repo_id": 73144
+    }
+  },
+  {
+    "number": 8190,
+    "title": "Update dependency chart.js to v4.5.0 (forgejo)",
+    "state": "closed",
+    "merged": true,
+    "html_url": "https://codeberg.org/forgejo/forgejo/pulls/8190",
+    "head": {
+      "label": "renovate/forgejo-chart.js-4.x",
+      "ref": "renovate/forgejo-chart.js-4.x",
+      "sha": "ff15529c31381e054109cbe4b313a7e88d616c47",
+      "repo_id": 73144
+    },
+    "base": {
+      "label": "forgejo",
+      "ref": "forgejo",
+      "repo_id": 73144
+    }
+  },
+  {
+    "number": 15300,
+    "title": "A pull request from a fork, with the same branch name",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://codeberg.org/forgejo/forgejo/pulls/15300",
+    "head": {
+      "label": "someone:renovate/forgejo-chart.js-4.x",
+      "ref": "renovate/forgejo-chart.js-4.x",
+      "sha": "0123456789abcdef0123456789abcdef01234567",
+      "repo_id": 999999
+    },
+    "base": {
+      "label": "forgejo",
+      "ref": "forgejo",
+      "repo_id": 73144
+    }
+  }
+]

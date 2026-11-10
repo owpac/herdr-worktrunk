@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::git;
+use crate::gitea::{Flavor, Gitea};
 use crate::github::GitHub;
 use crate::gitlab::GitLab;
 use crate::herdr::Error;
@@ -59,7 +60,13 @@ pub struct PullRequest {
 pub trait Backend {
     /// The pull requests of `branch` in the repository itself, in all the
     /// states, the newest first. A pull request from a fork does not count.
-    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error>;
+    /// `default_branch` is the name of the default branch (`main`), if git
+    /// knows it: a backend can need it.
+    fn pull_requests(
+        &self,
+        branch: &str,
+        default_branch: Option<&str>,
+    ) -> Result<Vec<PullRequest>, Error>;
 
     /// Return true if the commit `head` contains the commit `commit`, as
     /// the forge sees them. False if the forge does not know `commit`.
@@ -344,6 +351,25 @@ pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backe
             repository()?,
             limit,
         ))),
+        Provider::Gitea | Provider::Forgejo => {
+            let (flavor, public_host) = if forge.provider == Provider::Gitea {
+                (Flavor::Gitea, "gitea.com")
+            } else {
+                (Flavor::Forgejo, "codeberg.org")
+            };
+            let repository = repository()?;
+            if repository.matches('/').count() != 1 {
+                return Err(format!(
+                    "no owner and name for the repository on {provider}: {repository}"
+                ));
+            }
+            Ok(Box::new(Gitea::new(
+                api_host(forge, public_host)?,
+                repository,
+                flavor,
+                limit,
+            )))
+        }
         _ => Err(format!("no backend for {provider} yet")),
     }
 }
@@ -545,6 +571,16 @@ mod tests {
         };
         assert!(backend(&github, limit).is_ok());
         assert!(backend(&forge(Provider::GitLab, "gitlab.com"), limit).is_ok());
+        let codeberg = RepositoryForge {
+            repository: Some("forgejo/forgejo".to_owned()),
+            ..forge(Provider::Forgejo, "codeberg.org")
+        };
+        assert!(backend(&codeberg, limit).is_ok());
+        // Gitea has no subgroups.
+        assert_eq!(
+            backend(&forge(Provider::Gitea, "gitea.com"), limit).err(),
+            Some("no owner and name for the repository on Gitea: group/sub/app".to_owned())
+        );
         assert_eq!(
             backend(&forge(Provider::GitLab, ""), limit).err(),
             Some("no host for GitLab".to_owned())

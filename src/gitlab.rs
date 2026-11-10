@@ -60,7 +60,11 @@ impl GitLab {
 }
 
 impl Backend for GitLab {
-    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+    fn pull_requests(
+        &self,
+        branch: &str,
+        _default_branch: Option<&str>,
+    ) -> Result<Vec<PullRequest>, Error> {
         let endpoint = format!(
             "{}/merge_requests?source_branch={}&state=all&per_page={PAGE_SIZE}",
             self.project_endpoint(),

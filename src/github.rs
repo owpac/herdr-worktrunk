@@ -25,7 +25,11 @@ impl GitHub {
 }
 
 impl Backend for GitHub {
-    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+    fn pull_requests(
+        &self,
+        branch: &str,
+        _default_branch: Option<&str>,
+    ) -> Result<Vec<PullRequest>, Error> {
         pull_requests(&self.repository, branch, self.limit)
     }
 
