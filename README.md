@@ -108,9 +108,11 @@ The agents follow the rules of the observer:
 |-------|-------------------|---------------|
 | GitHub | yes | yes, with `gh` |
 | GitLab | yes | yes, with `glab` |
-| Gitea, Forgejo, Codeberg | yes | yes, with `tea` |
-| Azure DevOps | yes | yes, with `az` |
+| Gitea, Forgejo, Codeberg | yes | experimental, with `tea` |
+| Azure DevOps | yes | experimental, with `az` |
 | Other forges | yes | no |
+
+Experimental: the backend never ran with the real CLI. Its tests used the public API of the forge, through a script that plays the CLI. worktrunk also marks Gitea and Azure DevOps as experimental.
 
 The forge comes from the host of `origin`: a host with github, gitlab, gitea, forgejo or codeberg in its name, or Azure DevOps. For a self-hosted forge with another name, give its platform to worktrunk, in `~/.config/worktrunk/config.toml`:
 
@@ -265,8 +267,8 @@ The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`
 - [fzf](https://github.com/junegunn/fzf) 0.73 or later (tested with 0.74): the popups use its events `every` and `load`, its server `--listen`, and its options `--footer`, `--ghost` and `--gutter`.
 - For the pull requests on GitHub: [gh](https://cli.github.com) with a login (`gh auth login`).
 - For the merge requests on GitLab: [glab](https://gitlab.com/gitlab-org/cli) with a login (`glab auth login`). A public project on gitlab.com needs no login. Tested with glab 1.128.
-- For the pull requests on Gitea and Forgejo: [tea](https://gitea.com/gitea/tea) 0.16 or later (its command `api`), with a login for each host (`tea logins add`).
-- For the pull requests on Azure DevOps: the [Azure CLI](https://learn.microsoft.com/cli/azure/) with its extension `azure-devops` (`az extension add --name azure-devops`), and a login (`az login`, or `az devops login` with a personal access token).
+- For the pull requests on Gitea and Forgejo (experimental): [tea](https://gitea.com/gitea/tea) 0.16 or later (its command `api`), with a login for each host (`tea logins add`).
+- For the pull requests on Azure DevOps (experimental): the [Azure CLI](https://learn.microsoft.com/cli/azure/) with its extension `azure-devops` (`az extension add --name azure-devops`), and a login (`az login`, or `az devops login` with a personal access token).
 
 ## Installation
 
