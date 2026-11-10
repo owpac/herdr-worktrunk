@@ -6,7 +6,8 @@
 //! 1. Agent (herdr): no agent, idle agents, or an agent that works.
 //! 2. Changes (git status): changes that are not committed.
 //! 3. Merged (wt): the content of the branch is in the default branch,
-//!    for example after a merge or a squash merge. Any forge.
+//!    for example after a merge or a squash merge. Any forge. The reflog
+//!    of the branch tells if it has its own commits.
 //! 4. Push (git): a branch that was never pushed has no pull request. A
 //!    deleted remote branch is a hint only.
 //! 5. Pull requests (the backend of the forge): open, merged or closed, and
@@ -19,8 +20,9 @@
 //! 2. An open pull request: kept.
 //! 3. A finished pull request (merged or closed) that contains the last
 //!    commit: to delete.
-//! 4. The content is in the default branch, and no activity for 1 day: to
-//!    delete.
+//! 4. The content is in the default branch (see `merged_branch`): to
+//!    delete at once if the branch has its own commits, else after 1 day
+//!    without activity and without agent.
 //! 5. No pull request (the forge says so, or the branch was never pushed
 //!    and the forge gives no answer), and no activity for `stale_days`
 //!    days: to delete.
@@ -30,10 +32,10 @@
 //!    answer.
 //!
 //! Idle agents (idle or done, in the worktree and in its workspace,
-//! without the focus) do not keep a worktree with a proof of the end (rules
-//! 3 and 4): the deletion closes them first, as the observer does. They
-//! keep a worktree of rule 5: the age alone does not prove that the work is
-//! finished.
+//! without the focus) do not keep a worktree with a proof of the end (rule
+//! 3, and rule 4 with own commits): the deletion closes them first, as the
+//! observer does. They keep a worktree without this proof: the age alone
+//! does not prove that the work is finished.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -47,9 +49,9 @@ use crate::herdr::Snapshot;
 use crate::prune::{BranchStatus, KeptWhy};
 use crate::style::{ACCENT, DIM, GREEN, RED, YELLOW};
 
-/// The days without activity before a merged worktree is a leftover: a
-/// new worktree has the commit of the default branch, so it is merged at
-/// once. `wt step prune` has the same rule.
+/// The days without activity before a merged worktree without own commit
+/// is a leftover: a new worktree has the commit of the default branch, so
+/// it is merged at once. `wt step prune --min-age=1d` has the same limit.
 pub const MERGED_MIN_DAYS: u64 = 1;
 
 /// The agents of a worktree.
@@ -188,6 +190,31 @@ pub enum Merge {
     Undetermined(String),
 }
 
+/// The commits of the branch itself, from its reflog (see
+/// `git::has_own_commits`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum History {
+    #[default]
+    NotChecked,
+    /// A commit was made on the branch: its content in the default branch
+    /// proves the end of its work.
+    OwnCommits,
+    /// No commit on the branch, or no reflog: a new or unused worktree.
+    NoOwnCommit,
+}
+
+impl History {
+    /// The history of a branch from the answer of git.
+    pub fn of(has_own_commits: bool) -> History {
+        if has_own_commits {
+            History::OwnCommits
+        } else {
+            History::NoOwnCommit
+        }
+    }
+}
+
 /// Where the branch is on the remotes, from git.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -259,6 +286,9 @@ pub struct Facts {
     pub agent: Agents,
     pub changes: Changes,
     pub merge: Merge,
+    /// Checked only for a merged branch.
+    #[serde(default)]
+    pub history: History,
     pub push: Push,
     pub pull_requests: PullRequests,
     /// The provider of the forge that gave the pull requests.
@@ -327,8 +357,9 @@ pub enum Reason {
     /// Kept: no pull request, and some activity in the last `stale_days`
     /// days.
     Recent,
-    /// Kept: the branch is merged, but its last activity is less than
-    /// `MERGED_MIN_DAYS` old. A new worktree is merged at once.
+    /// Kept: the branch is merged without own commit, and its last
+    /// activity is less than `MERGED_MIN_DAYS` old. A new worktree is
+    /// merged at once.
     MergedRecently,
     /// Kept: changes that are not committed.
     Changes,
@@ -366,6 +397,28 @@ impl Reason {
     }
 }
 
+/// The rule for a branch whose content is in the default branch. The
+/// cleaner and the observer apply it.
+///
+/// - Its own commits prove the end of its work: to delete at once. Idle
+///   agents close first.
+/// - Without its own commit, the worktree is new or unused: a new worktree
+///   starts on the commit of the default branch. It is a leftover only
+///   without an agent, after `MERGED_MIN_DAYS` days without activity.
+///
+/// Return `BranchMerged` (to delete), `Agent` or `IdleAgent` (kept), or
+/// None if the activity is recent or unknown.
+pub fn merged_branch(history: History, days: Option<u64>, agent: Agents) -> Option<Reason> {
+    let is_old = days.is_some_and(|days| days >= MERGED_MIN_DAYS);
+    match (agent, history) {
+        (Agents::Busy, _) => Some(Reason::Agent),
+        (_, History::OwnCommits) => Some(Reason::BranchMerged),
+        _ if !is_old => None,
+        (Agents::Idle, _) => Some(Reason::IdleAgent),
+        (Agents::None, _) => Some(Reason::BranchMerged),
+    }
+}
+
 /// The verdict for the facts of a worktree (see the module doc).
 pub fn verdict(facts: &Facts, stale_days: u32) -> Reason {
     if facts.agent == Agents::Busy {
@@ -379,7 +432,7 @@ pub fn verdict(facts: &Facts, stale_days: u32) -> Reason {
     reason
 }
 
-/// The verdict from the layers after the agents.
+/// The verdict from the layers after an agent that works.
 fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
     match facts.changes {
         Changes::Clean => {}
@@ -393,8 +446,10 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
         _ => {}
     }
     let is_merged = matches!(facts.merge, Merge::Merged(_));
-    if is_merged && facts.days.is_some_and(|days| days >= MERGED_MIN_DAYS) {
-        return Reason::BranchMerged;
+    if is_merged {
+        if let Some(reason) = merged_branch(facts.history, facts.days, facts.agent) {
+            return reason;
+        }
     }
     // A branch that was never pushed has no pull request, but only if the
     // forge gives no answer: a push without -u, or to another name, can
@@ -423,13 +478,14 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
     }
 }
 
-/// The days without activity that the verdict needs: `MERGED_MIN_DAYS` for
-/// a merged branch, else `stale_days`.
-pub fn activity_limit(facts: &Facts, stale_days: u32) -> u64 {
-    if matches!(facts.merge, Merge::Merged(_)) {
-        MERGED_MIN_DAYS
-    } else {
-        u64::from(stale_days)
+/// The days without activity that the verdict needs: none for a merged
+/// branch with its own commits, `MERGED_MIN_DAYS` for another merged
+/// branch, else `stale_days`.
+pub fn activity_limit(facts: &Facts, stale_days: u32) -> Option<u64> {
+    match (&facts.merge, facts.history) {
+        (Merge::Merged(_), History::OwnCommits) => None,
+        (Merge::Merged(_), _) => Some(MERGED_MIN_DAYS),
+        _ => Some(u64::from(stale_days)),
     }
 }
 
@@ -441,8 +497,10 @@ pub fn rule_lines(stale_days: u32) -> Vec<String> {
         "- no agent that works, and no change,".to_owned(),
         "- no open pull request,".to_owned(),
         "- a finished pull request with the last commit,".to_owned(),
+        "- or a merged branch with its own commits,".to_owned(),
+        "- or a merged branch without own commit,".to_owned(),
         format!(
-            "- or a merged branch, {} without activity,",
+            "  {} without activity and no agent,",
             days_text(MERGED_MIN_DAYS)
         ),
         format!(
@@ -689,7 +747,17 @@ fn merge_line(facts: &Facts, reason: Reason) -> Line {
     let main = facts.default_branch_text();
     let merge = |mark: Mark, text: String| line(mark, "Merged", text, "wt");
     match &facts.merge {
-        Merge::Merged(how) => merge(Mark::Pass, format!("yes: {}", merge_words(how, main))),
+        Merge::Merged(how) => {
+            let commits = match facts.history {
+                History::OwnCommits => ", own commits",
+                History::NoOwnCommit => ", no own commit",
+                History::NotChecked => "",
+            };
+            merge(
+                Mark::Pass,
+                format!("yes: {}{commits}", merge_words(how, main)),
+            )
+        }
         Merge::NotMerged(Some(commits)) => merge(
             Mark::Info,
             format!("no: {} not in {main}", commits_text(*commits)),
@@ -755,7 +823,14 @@ fn activity_line(facts: &Facts, reason: Reason, stale_days: u32) -> Line {
     let Some(days) = facts.days else {
         return missing_line(facts, reason, "Activity", "git");
     };
-    let limit = activity_limit(facts, stale_days);
+    let Some(limit) = activity_limit(facts, stale_days) else {
+        return line(
+            Mark::Info,
+            "Activity",
+            format!("{} without activity (no limit)", days_text(days)),
+            "git",
+        );
+    };
     let mark = if days >= limit {
         Mark::Pass
     } else if matches!(reason, Reason::Recent | Reason::MergedRecently) {
@@ -855,6 +930,7 @@ mod tests {
             agent: Agents::None,
             changes: Changes::Clean,
             merge: Merge::NotMerged(Some(2)),
+            history: History::NotChecked,
             push: Push::Pushed("origin/feat".to_owned()),
             pull_requests: PullRequests::NoPullRequest,
             forge: Some(Provider::GitHub),
@@ -937,7 +1013,9 @@ mod tests {
         assert_eq!(
             rule_lines(7)[4..],
             [
-                "- or a merged branch, 1 day without activity,",
+                "- or a merged branch with its own commits,",
+                "- or a merged branch without own commit,",
+                "  1 day without activity and no agent,",
                 "- or no pull request, 7 days without activity and no agent.",
             ]
         );
@@ -1187,10 +1265,12 @@ mod tests {
         );
         let squashed = idle(Facts {
             merge: Merge::Merged("patch_id_match".to_owned()),
-            days: Some(2),
+            history: History::OwnCommits,
+            days: Some(0),
             ..facts()
         });
         assert_eq!(verdict(&squashed, 7), Reason::BranchMerged);
+        assert!(closes_idle_agents(Reason::BranchMerged, &squashed));
         // The age alone: the idle agent keeps the worktree.
         assert_eq!(verdict(&idle(facts()), 7), Reason::IdleAgent);
         // An open PR stays an open PR.
@@ -1199,6 +1279,102 @@ mod tests {
             ..facts()
         });
         assert_eq!(verdict(&open, 7), Reason::PullRequestOpen);
+    }
+
+    #[test]
+    fn a_merged_branch_goes_at_once_only_with_its_own_commits() {
+        use History::{NoOwnCommit, NotChecked, OwnCommits};
+        let cases = [
+            // Own commits: the proof of the end, also today, also with an
+            // idle agent.
+            (
+                OwnCommits,
+                Some(0),
+                Agents::None,
+                Some(Reason::BranchMerged),
+            ),
+            (
+                OwnCommits,
+                Some(0),
+                Agents::Idle,
+                Some(Reason::BranchMerged),
+            ),
+            (OwnCommits, None, Agents::Idle, Some(Reason::BranchMerged)),
+            // A new or unused worktree: only without agent, after 1 day.
+            (
+                NoOwnCommit,
+                Some(1),
+                Agents::None,
+                Some(Reason::BranchMerged),
+            ),
+            (
+                NotChecked,
+                Some(1),
+                Agents::None,
+                Some(Reason::BranchMerged),
+            ),
+            (NoOwnCommit, Some(0), Agents::None, None),
+            (NoOwnCommit, None, Agents::None, None),
+            (NoOwnCommit, Some(9), Agents::Idle, Some(Reason::IdleAgent)),
+            (NoOwnCommit, Some(0), Agents::Idle, None),
+            // An agent that works always keeps the worktree.
+            (OwnCommits, Some(9), Agents::Busy, Some(Reason::Agent)),
+            (NoOwnCommit, Some(9), Agents::Busy, Some(Reason::Agent)),
+        ];
+        for (history, days, agent, expected) in cases {
+            assert_eq!(
+                merged_branch(history, days, agent),
+                expected,
+                "{history:?} {days:?} {agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cleaner_applies_the_rule_of_a_merged_branch() {
+        let merged = |history: History, days: u64, agent: Agents| Facts {
+            merge: Merge::Merged("ancestor".to_owned()),
+            history,
+            days: Some(days),
+            agent,
+            ..facts()
+        };
+
+        // A merge without pull request (wt merge --no-remove), today.
+        let local_merge = merged(History::OwnCommits, 0, Agents::Idle);
+        assert_eq!(verdict(&local_merge, 7), Reason::BranchMerged);
+        assert_eq!(
+            reason_text(Reason::BranchMerged, &local_merge),
+            "merged: an older commit of main, idle agent closed first"
+        );
+        let shown = lines(&local_merge, Reason::BranchMerged, 7);
+        assert_eq!(
+            layer(&shown, "Merged").text,
+            "yes: an older commit of main, own commits"
+        );
+        assert_eq!(layer(&shown, "Activity").mark, Mark::Info);
+        assert_eq!(
+            layer(&shown, "Activity").text,
+            "0 days without activity (no limit)"
+        );
+        // A fork that waits on the commit of main: kept.
+        let waiting_fork = merged(History::NoOwnCommit, 3, Agents::Idle);
+        assert_eq!(verdict(&waiting_fork, 7), Reason::IdleAgent);
+        assert!(!closes_idle_agents(Reason::IdleAgent, &waiting_fork));
+        let shown = lines(&waiting_fork, Reason::IdleAgent, 7);
+        assert_eq!(
+            layer(&shown, "Merged").text,
+            "yes: an older commit of main, no own commit"
+        );
+        // An unused worktree without agent: as wt step prune --min-age=1d.
+        assert_eq!(
+            verdict(&merged(History::NoOwnCommit, 1, Agents::None), 7),
+            Reason::BranchMerged
+        );
+        assert_eq!(
+            verdict(&merged(History::NoOwnCommit, 0, Agents::None), 7),
+            Reason::MergedRecently
+        );
     }
 
     #[test]

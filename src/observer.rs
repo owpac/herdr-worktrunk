@@ -14,9 +14,12 @@
 //! does not move. A change to another repository does not move.
 //!
 //! With `prune_merged = true`, a second thread removes the worktrees of
-//! the merged pull requests every 5 minutes (see `prune`). It skips a
-//! worktree where an agent works. Then the rule 2 closes the workspace.
+//! the finished pull requests every 5 minutes (see `prune`). It also
+//! removes the worktrees whose branch is in the default branch, with the
+//! rule of the cleaner (`leftover::merged_branch`). It skips a worktree
+//! where an agent works. Then the rule 2 closes the workspace.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
@@ -35,7 +38,7 @@ use crate::forge::PullRequestState;
 use crate::git::{self, Checkout, LinkedWorktree};
 use crate::herdr::{self, Error, Pane, Snapshot};
 use crate::leftover;
-use crate::prune::{self, FinishedWorktree};
+use crate::prune::{self, FinishedWorktree, MergedWorktree};
 use crate::stale::{self, OldWorktree};
 use crate::sync::lock;
 use crate::wt;
@@ -792,6 +795,11 @@ fn prune_repository(
             errors.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
         }
     }
+    for worktree in &check.merged {
+        if let Err(error) = finish_merged_worktree(main_checkout, worktree, view, log) {
+            errors.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
+        }
+    }
     Some(check.without_pull_request)
 }
 
@@ -808,36 +816,13 @@ fn finish_worktree(
     view: &Mutex<PruneView>,
     log: &Log,
 ) -> Result<(), Error> {
-    let agents = lock(view).agents_in(&worktree.path);
-    let decision = agent_decision(&agents, &worktree.path);
-    if decision == AgentDecision::Wait {
-        return Ok(());
-    }
-    // Check the branch and the changes before an agent closes: if the
-    // worktree must stay, its agents stay too.
-    let current_commit = git::branch_commit(main_checkout, &worktree.branch);
-    if !worktree.is_unchanged(current_commit.as_deref()) || !git::is_clean(&worktree.path) {
-        return Ok(());
-    }
-    match decision {
-        AgentDecision::Wait | AgentDecision::Remove => {}
-        AgentDecision::CloseThenRemove => {
-            for agent in &agents {
-                herdr::close_pane(&agent.pane_id)?;
-                log.write(&format!(
-                    "closed the idle agent of {} (pane {}): {}",
-                    worktree.branch,
-                    agent.pane_id,
-                    resume_command(agent)
-                ));
-            }
-            if !wait_for_no_agent(view, &worktree.path) {
-                return Ok(());
-            }
-        }
-    }
-    let current_commit = git::branch_commit(main_checkout, &worktree.branch);
-    if !worktree.is_unchanged(current_commit.as_deref()) {
+    let target = Target {
+        main_checkout,
+        path: &worktree.path,
+        branch: &worktree.branch,
+        commit: &worktree.commit,
+    };
+    if !prepare_removal(&target, view, log, |_| true)? {
         return Ok(());
     }
     wt::remove_finished(main_checkout, &worktree.path)?;
@@ -853,6 +838,118 @@ fn finish_worktree(
     };
     log.write(&message);
     Ok(())
+}
+
+/// Remove one worktree whose branch is in the default branch, if the rule
+/// `leftover::merged_branch` allows it: with its own commits, at once
+/// (idle agents close first). Without own commit, only without agent, after
+/// 1 day without activity. wt deletes the branch only if it sees it merged.
+fn finish_merged_worktree(
+    main_checkout: &Path,
+    worktree: &MergedWorktree,
+    view: &Mutex<PruneView>,
+    log: &Log,
+) -> Result<(), Error> {
+    let target = Target {
+        main_checkout,
+        path: &worktree.path,
+        branch: &worktree.branch,
+        commit: &worktree.commit,
+    };
+    // The facts of the rule cost 1 to 3 calls to git: the thread reads
+    // them only after the cheap checks, and only once.
+    let history = OnceCell::new();
+    let may_remove = |agents| {
+        let history = *history.get_or_init(|| {
+            leftover::History::of(git::has_own_commits(main_checkout, &worktree.branch))
+        });
+        let days = match history {
+            leftover::History::OwnCommits => None,
+            _ => {
+                git::last_activity(&worktree.path).map(|time| stale::days_since(time, stale::now()))
+            }
+        };
+        leftover::merged_branch(history, days, agents) == Some(leftover::Reason::BranchMerged)
+    };
+    if !prepare_removal(&target, view, log, may_remove)? {
+        return Ok(());
+    }
+    wt::remove_quietly(main_checkout, &worktree.path)?;
+    let why = match history.get() {
+        Some(leftover::History::OwnCommits) => "its commits",
+        _ => "its commit, and the worktree had no use for 1 day",
+    };
+    let kept_branch = if git::branch_commit(main_checkout, &worktree.branch).is_some() {
+        ". wt kept the branch: it does not see it merged"
+    } else {
+        ""
+    };
+    log.write(&format!(
+        "removed the worktree of {}: {} contains {why}{kept_branch}",
+        worktree.branch, worktree.default_branch
+    ));
+    Ok(())
+}
+
+/// A worktree that the thread can remove, with the commit of its branch
+/// at the check.
+struct Target<'a> {
+    main_checkout: &'a Path,
+    path: &'a Path,
+    branch: &'a str,
+    commit: &'a str,
+}
+
+impl Target<'_> {
+    /// Return true if the branch still has the checked commit.
+    fn is_unchanged(&self) -> bool {
+        git::branch_commit(self.main_checkout, self.branch).as_deref() == Some(self.commit)
+    }
+}
+
+/// Prepare the removal of a worktree: return true if the thread can
+/// remove it now.
+///
+/// The thread reads the view and the commit of the branch just before the
+/// removal: during the calls to the forge, an agent can enter the
+/// worktree, or a commit can change the branch. The worktree stays if an
+/// agent must stay, if the branch has another commit, if the worktree has
+/// changes, or if `may_remove` refuses the state of its agents. Else the
+/// idle agents close first, then the thread checks the branch and the
+/// changes again: an agent can write as it closes.
+fn prepare_removal(
+    target: &Target,
+    view: &Mutex<PruneView>,
+    log: &Log,
+    may_remove: impl Fn(leftover::Agents) -> bool,
+) -> Result<bool, Error> {
+    let agents = lock(view).agents_in(target.path);
+    let state = match agent_decision(&agents, target.path) {
+        AgentDecision::Wait => return Ok(false),
+        AgentDecision::Remove => leftover::Agents::None,
+        AgentDecision::CloseThenRemove => leftover::Agents::Idle,
+    };
+    // Check the branch and the changes before an agent closes: if the
+    // worktree must stay, its agents stay too. The cheap checks first.
+    if !target.is_unchanged() || !git::is_clean(target.path) || !may_remove(state) {
+        return Ok(false);
+    }
+    if state == leftover::Agents::Idle {
+        for agent in &agents {
+            herdr::close_pane(&agent.pane_id)?;
+            log.write(&format!(
+                "closed the idle agent of {} (pane {}): {}",
+                target.branch,
+                agent.pane_id,
+                resume_command(agent)
+            ));
+        }
+        if !wait_for_no_agent(view, target.path) {
+            return Ok(false);
+        }
+        return Ok(target.is_unchanged() && git::is_clean(target.path));
+    }
+    Ok(true)
 }
 
 /// Wait until the view shows no agent in `checkout`, for 10 seconds at
@@ -1166,7 +1263,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::test_folder;
+    use crate::test_support::{git_in, git_output, test_folder};
 
     fn checkout(root: &str) -> Checkout {
         Checkout {
@@ -1651,5 +1748,30 @@ mod tests {
         fs::write(wanted_binary_path(&folder), "").unwrap();
         assert_eq!(read_wanted_binary(&folder), None);
         fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn a_target_is_unchanged_only_with_the_checked_commit() {
+        let folder = test_folder("target-commit");
+        git_in(&folder, &["init", "-q", "-b", "main"]);
+        git_in(&folder, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        git_in(&folder, &["branch", "feat"]);
+        let checked = git_output(&folder, &["rev-parse", "feat"]);
+        let target = Target {
+            main_checkout: &folder,
+            path: &folder,
+            branch: "feat",
+            commit: &checked,
+        };
+
+        assert!(target.is_unchanged());
+
+        git_in(&folder, &["switch", "-q", "feat"]);
+        git_in(&folder, &["commit", "-q", "--allow-empty", "-m", "new"]);
+        assert!(!target.is_unchanged(), "a new commit");
+
+        git_in(&folder, &["switch", "-q", "main"]);
+        git_in(&folder, &["branch", "-q", "-D", "feat"]);
+        assert!(!target.is_unchanged(), "a deleted branch");
     }
 }

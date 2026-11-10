@@ -791,7 +791,16 @@ pub fn merger() -> Result<(), Error> {
     })?;
     let workspace_id = env::var(WORKSPACE_VARIABLE).ok();
     let result = wt::merge(&checkout.root)
-        .and_then(|()| wt::remove(&checkout.main_checkout(), &checkout.root))
+        .and_then(|()| {
+            // The observer can remove the merged worktree first.
+            if !checkout.root.exists() {
+                return Ok(());
+            }
+            match wt::remove(&checkout.main_checkout(), &checkout.root) {
+                Err(_) if !checkout.root.exists() => Ok(()),
+                other => other,
+            }
+        })
         .and_then(|()| match &workspace_id {
             Some(workspace_id) => close_after_removal(workspace_id, &checkout),
             None => Ok(()),

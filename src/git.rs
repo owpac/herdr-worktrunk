@@ -293,9 +293,147 @@ pub fn is_ancestor(main_checkout: &Path, commit: &str, branch: &str) -> bool {
     .is_ok()
 }
 
+/// Return the name of the local default branch (`main`), without network:
+/// the cache of wt (`worktrunk.default-branch` in the git config), else the
+/// default branch of `origin` without its remote.
+pub fn local_default_branch(main_checkout: &Path) -> Option<String> {
+    run_in(
+        main_checkout,
+        &["config", "--get", "worktrunk.default-branch"],
+    )
+    .ok()
+    .filter(|name| !name.is_empty())
+    .or_else(|| {
+        default_branch(main_checkout)
+            .and_then(|remote| remote.strip_prefix("origin/").map(str::to_owned))
+    })
+}
+
+/// Return true if a commit was made on the local branch `branch` since
+/// the last start of a new work: its reflog has a commit, a cherry-pick or
+/// a revert. A branch that only moved (creation, fast-forward, pull, rebase
+/// without commit) has no own commit. Without a reflog, the function
+/// returns false: git expires the entries after 90 days.
+pub fn has_own_commits(main_checkout: &Path, branch: &str) -> bool {
+    let reference = format!("refs/heads/{branch}");
+    run_in(
+        main_checkout,
+        &["reflog", "show", "--format=%gs", &reference, "--"],
+    )
+    .is_ok_and(|messages| own_commit_since_new_work(&messages))
+}
+
+/// Return true if the messages of the reflog of a branch, the newest
+/// first, have an own commit after the last start of a new work.
+///
+/// A reset (`git reset`, `git branch -f`, `git switch -C`), a pull or a
+/// merge can start a new work in an old worktree, for example after the
+/// merge of its first work: the commits before it prove nothing about this
+/// work. `wt step squash` resets, then commits: its commit counts. A
+/// rebase does not start a new work: `wt merge` rebases the commits of the
+/// branch.
+fn own_commit_since_new_work(messages: &str) -> bool {
+    for message in messages.lines() {
+        if starts_new_work(message) {
+            return false;
+        }
+        if is_own_commit(message) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return true if a message of the reflog of a branch tells about a reset
+/// of the branch, or about the work of another branch: a pull or a merge.
+fn starts_new_work(message: &str) -> bool {
+    [
+        "reset:",
+        "branch: Reset",
+        "pull",
+        "merge ",
+        "commit (merge)",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
+/// Return true if a message of the reflog of a branch tells about a new
+/// commit on this branch. A merge commit (`commit (merge)`) brings the
+/// work of another branch: it is not an own commit.
+fn is_own_commit(message: &str) -> bool {
+    (message.starts_with("commit") && !message.starts_with("commit (merge)"))
+        || message.starts_with("cherry-pick")
+        || message.starts_with("revert")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, test_folder};
+
+    #[test]
+    fn the_reflog_tells_the_own_commits_of_a_branch() {
+        assert!(is_own_commit("commit: add the parser"));
+        assert!(is_own_commit("commit (amend): add the parser"));
+        assert!(is_own_commit("commit (initial): first"));
+        assert!(is_own_commit("cherry-pick: fix the parser"));
+        assert!(is_own_commit("revert: Revert \"add the parser\""));
+        assert!(!is_own_commit("branch: Created from main"));
+        assert!(!is_own_commit(
+            "commit (merge): Merge branch 'main' into feat"
+        ));
+        assert!(!is_own_commit("merge main: Fast-forward"));
+        assert!(!is_own_commit("pull: Fast-forward"));
+        assert!(!is_own_commit("reset: moving to HEAD~1"));
+        assert!(!is_own_commit("rebase (finish): refs/heads/feat onto 1234"));
+    }
+
+    #[test]
+    fn a_reset_a_pull_or_a_merge_hides_the_older_commits_of_a_branch() {
+        // The newest message first.
+        let squashed =
+            "commit: one commit\nreset: moving to main\ncommit: work\nbranch: Created from main";
+        let reused = "reset: moving to origin/main\ncommit: work\nbranch: Created from main";
+        let recreated = "branch: Reset to main\ncommit: work";
+        let rebased =
+            "rebase (finish): refs/heads/feat onto 1234\ncommit: work\nbranch: Created from main";
+
+        let pulled = "pull origin main: Fast-forward\ncommit: work";
+        let merged = "merge main: Merge made by the 'ort' strategy.\ncommit: work";
+        let work_after_pull = "commit: more work\npull: Fast-forward\ncommit: work";
+
+        assert!(own_commit_since_new_work(squashed));
+        assert!(!own_commit_since_new_work(reused));
+        assert!(!own_commit_since_new_work(recreated));
+        assert!(own_commit_since_new_work(rebased));
+        assert!(!own_commit_since_new_work(pulled));
+        assert!(!own_commit_since_new_work(merged));
+        assert!(own_commit_since_new_work(work_after_pull));
+        assert!(!own_commit_since_new_work(""));
+    }
+
+    #[test]
+    fn a_new_branch_has_no_own_commit_until_a_commit() {
+        let folder = test_folder("own-commits");
+        let repository = folder.join("repo");
+        git_in(&folder, &["init", "-q", "-b", "main", "repo"]);
+        git_in(&repository, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git_in(&repository, &["branch", "feat"]);
+        git_in(&repository, &["config", "worktrunk.default-branch", "main"]);
+
+        assert!(!has_own_commits(&repository, "feat"));
+        assert!(!has_own_commits(&repository, "missing"));
+        assert_eq!(local_default_branch(&repository).as_deref(), Some("main"));
+
+        git_in(&repository, &["switch", "-q", "feat"]);
+        git_in(
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        );
+
+        assert!(has_own_commits(&repository, "feat"));
+    }
 
     #[test]
     fn the_main_checkout_is_the_parent_of_the_common_folder() {

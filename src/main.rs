@@ -6,7 +6,7 @@
 //!   herdr-worktrunk observe --run              the observer itself
 //!   herdr-worktrunk open picker|remover|merger|cleaner  an action: open a popup
 //!   herdr-worktrunk pick|confirm|merger|cleaner|message  the command of a popup
-//!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the merged or closed pull requests
+//!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the finished pull requests and of the merged branches
 //!   herdr-worktrunk list-stale [<folder>]      list the old worktrees without pull request
 //!   herdr-worktrunk clean [<folder>]           open the popup cleaner from a shell
 
@@ -92,11 +92,14 @@ fn observe(is_observer: bool) -> Result<(), Error> {
 }
 
 /// Print the worktrees of the merged or closed pull requests in the
-/// repository of `folder`: the worktrees that the observer removes with
-/// `prune_merged`.
-/// Remove no worktree. This command does not know the agents of herdr.
+/// repository of `folder`, then the worktrees whose branch is in the
+/// default branch, with what the observer does with them (`prune_merged`).
+/// Remove no worktree. This command does not know the agents of herdr: an
+/// agent that works keeps any worktree.
 fn list_merged(folder: &Path) -> Result<(), Error> {
-    for worktree in prune::check_worktrees(&main_checkout_of(folder)?, |_| false)?.finished {
+    let main_checkout = main_checkout_of(folder)?;
+    let check = prune::check_worktrees(&main_checkout, |_| false)?;
+    for worktree in check.finished {
         let state = match worktree.pull_request.state {
             forge::PullRequestState::Closed => "closed",
             _ => "merged",
@@ -106,6 +109,27 @@ fn list_merged(folder: &Path) -> Result<(), Error> {
             worktree.path.display(),
             worktree.branch,
             worktree.reference
+        );
+    }
+    for worktree in check.merged {
+        let history = leftover::History::of(git::has_own_commits(&main_checkout, &worktree.branch));
+        let days =
+            git::last_activity(&worktree.path).map(|time| stale::days_since(time, stale::now()));
+        let removed = leftover::merged_branch(history, days, leftover::Agents::None)
+            == Some(leftover::Reason::BranchMerged);
+        let fate = match (git::is_clean(&worktree.path), history, removed) {
+            (false, _, _) => "kept: changes not committed",
+            (true, leftover::History::OwnCommits, _) => {
+                "own commits: removed, idle agents close first"
+            }
+            (true, _, true) => "no own commit: removed if no agent is in it",
+            (true, _, false) => "no own commit: kept, activity less than 1 day ago",
+        };
+        println!(
+            "{} ({}, in {}, {fate})",
+            worktree.path.display(),
+            worktree.branch,
+            worktree.default_branch
         );
     }
     Ok(())

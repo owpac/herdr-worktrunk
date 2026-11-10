@@ -14,7 +14,7 @@ command = ["sh", "scripts/install.sh"]
 
 # The observer: it moves the pane of an agent to the workspace of its worktree, and closes the
 # workspace of a removed worktree. With `prune_merged = true`, it also removes the worktree of
-# each merged or closed pull request. `observe = false` in config.toml stops it. config.toml is also read by
+# each merged or closed pull request, and of each merged branch. `observe = false` in config.toml stops it. config.toml is also read by
 # the agents (agent_mode): see the README.
 # `observe` starts the observer in the background and returns. herdr runs [[startup]] when the
 # server starts, but not when the plugin is installed or linked: the event pane.agent_detected
