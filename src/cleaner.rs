@@ -255,11 +255,8 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
             })?;
         repositories = vec![main];
     }
-    // A worktree without agent, then and now, keeps its last result.
     let known: HashMap<&Path, &Entry> = previous
         .iter()
-        .filter(|entry| entry.facts.agent == Agents::None)
-        .filter(|entry| !matches!(entry.reason, Reason::Checking | Reason::Unknown))
         .map(|entry| (entry.path.as_path(), entry))
         .collect();
     let listed: Vec<(PathBuf, Vec<git::LinkedWorktree>)> = thread::scope(|scope| {
@@ -285,20 +282,40 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
             let workspace_id = workspace_of_checkout.get(&path).map(String::as_str);
             let agents =
                 leftover::agents_state(&leftover::agents_of(&snapshot, &path, workspace_id));
-            match known.get(path.as_path()) {
-                Some(entry) if entry.branch == worktree.branch && agents == Agents::None => {
-                    entries.push((*entry).clone())
-                }
-                _ => entries.push(Entry::new(
-                    path,
-                    worktree.branch,
-                    repository.clone(),
-                    agents,
-                )),
-            }
+            let previous = known.get(path.as_path()).copied();
+            entries.push(entry_of(
+                previous,
+                path,
+                worktree.branch,
+                repository.clone(),
+                agents,
+            ));
         }
     }
     Ok(entries)
+}
+
+/// The entry of a listed worktree. It keeps its last result if it had no
+/// agent then and has none now, on the same branch, and if its check gave
+/// an answer. Else it gets a new check.
+fn entry_of(
+    previous: Option<&Entry>,
+    path: PathBuf,
+    branch: String,
+    main_checkout: PathBuf,
+    agents: Agents,
+) -> Entry {
+    match previous {
+        Some(entry)
+            if entry.facts.agent == Agents::None
+                && agents == Agents::None
+                && entry.branch == branch
+                && !matches!(entry.reason, Reason::Checking | Reason::Unknown) =>
+        {
+            entry.clone()
+        }
+        _ => Entry::new(path, branch, main_checkout, agents),
+    }
 }
 
 /// What a repository gives to the checks of its worktrees: one call to
@@ -1281,6 +1298,50 @@ mod tests {
 
         list.push(entry("b", "zeta", Reason::Old, Some(9)));
         assert_eq!(scope_of(&list), "2 repositories");
+    }
+
+    #[test]
+    fn a_worktree_keeps_its_last_result_only_without_agent() {
+        let path = PathBuf::from("/work/app.feat");
+        let main = PathBuf::from("/work/app");
+        let mut checked = Entry::new(path.clone(), "feat".to_owned(), main.clone(), Agents::None);
+        checked.reason = Reason::Old;
+        let entry = |previous: &Entry, branch: &str, agents: Agents| {
+            entry_of(
+                Some(previous),
+                path.clone(),
+                branch.to_owned(),
+                main.clone(),
+                agents,
+            )
+            .reason
+        };
+
+        assert_eq!(entry(&checked, "feat", Agents::None), Reason::Old);
+        // An agent now, another branch, or a check without answer: check
+        // again.
+        assert_eq!(entry(&checked, "feat", Agents::Idle), Reason::Checking);
+        assert_eq!(entry(&checked, "other", Agents::None), Reason::Checking);
+        let unknown = Entry {
+            reason: Reason::Unknown,
+            ..checked.clone()
+        };
+        assert_eq!(entry(&unknown, "feat", Agents::None), Reason::Checking);
+        // An agent then: check again.
+        let mut with_agent = checked.clone();
+        with_agent.facts.agent = Agents::Idle;
+        assert_eq!(entry(&with_agent, "feat", Agents::None), Reason::Checking);
+        assert_eq!(
+            entry_of(
+                None,
+                path.clone(),
+                "feat".to_owned(),
+                main.clone(),
+                Agents::Busy
+            )
+            .reason,
+            Reason::Agent
+        );
     }
 
     #[test]
