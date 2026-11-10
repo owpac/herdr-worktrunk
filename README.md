@@ -167,7 +167,10 @@ The plugin starts an observer with herdr. Every 2 seconds, it reads the state of
 <details>
 <summary>The rules of <code>prune_merged</code></summary>
 
-The thread removes the worktree of a branch only if the branch has no open pull request, if the default branch does not contain the local commit, and if a merged or closed pull request contains the local commit (its last commit, or a later commit after "Update branch" on GitHub). The forge keeps each local commit: in the default branch after a merge, and in the ref of the pull request after a close. After the removal of a closed pull request, the log gives the command that gets the branch back: `git fetch origin pull/<number>/head:<branch>` on GitHub, `git fetch origin merge-requests/<iid>/head:<branch>` on GitLab.
+The thread removes the worktree of a branch only if the branch has no open pull request, if the default branch does not contain the local commit, and if a merged or closed pull request contains the local commit (its last commit, or a later commit after "Update branch" on GitHub). The forge keeps each local commit: in the default branch after a merge, and with the pull request after a close. After the removal of a closed pull request, the log gives the command that gets the branch back:
+
+- GitHub: `git fetch origin pull/<number>/head:<branch>`.
+- GitLab: `git fetch origin <commit>:refs/heads/<branch>`. GitLab deletes the ref of a merge request 14 days after its close, but keeps its commits.
 
 The agents of a finished worktree:
 

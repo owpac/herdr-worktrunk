@@ -39,6 +39,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::forge::Provider;
 use crate::git;
 use crate::herdr::Snapshot;
 use crate::prune::{BranchStatus, KeptWhy};
@@ -273,6 +274,40 @@ impl Facts {
             .as_deref()
             .unwrap_or("the default branch")
     }
+
+    /// Return true if the pull requests come from GitLab, which has merge
+    /// requests.
+    fn is_gitlab(&self) -> bool {
+        self.forge == Provider::GitLab.name()
+    }
+
+    /// The number of a pull request as the forge writes it: `!3` on
+    /// GitLab (`#3` is an issue there), `#3` elsewhere.
+    fn number_text(&self, number: u64) -> String {
+        if self.is_gitlab() {
+            format!("!{number}")
+        } else {
+            format!("#{number}")
+        }
+    }
+
+    /// The short name of a pull request: `MR` on GitLab, `PR` elsewhere.
+    fn short_name(&self) -> &'static str {
+        if self.is_gitlab() {
+            "MR"
+        } else {
+            "PR"
+        }
+    }
+
+    /// The name of a pull request, for the questions.
+    fn long_name(&self) -> &'static str {
+        if self.is_gitlab() {
+            "merge request"
+        } else {
+            "pull request"
+        }
+    }
 }
 
 /// The verdict of the cleaner for a worktree.
@@ -417,13 +452,14 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
     let number = facts
         .pull_requests
         .number()
-        .map(|number| format!("#{number}"))
+        .map(|number| facts.number_text(number))
         .unwrap_or_default();
+    let short = facts.short_name();
     let never_pushed = matches!(facts.push, Push::Never);
     let text = match reason {
         Reason::Checking => "checking…".to_owned(),
-        Reason::Merged => format!("PR {number} merged"),
-        Reason::Closed => format!("PR {number} closed"),
+        Reason::Merged => format!("{short} {number} merged"),
+        Reason::Closed => format!("{short} {number} closed"),
         Reason::Integrated => match &facts.integration {
             Integration::Integrated(how) => {
                 format!("merged: {}", integration_words(how, facts.main()))
@@ -431,18 +467,18 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
             _ => format!("merged into {}", facts.main()),
         },
         Reason::Old if never_pushed => "never pushed, no recent activity".to_owned(),
-        Reason::Old => "no PR, no recent activity".to_owned(),
-        Reason::Open => format!("PR {number} open"),
+        Reason::Old => format!("no {short}, no recent activity"),
+        Reason::Open => format!("{short} {number} open"),
         Reason::Recent if matches!(facts.integration, Integration::Integrated(_)) => {
             "merged, activity today".to_owned()
         }
         Reason::Recent if never_pushed => "never pushed, recent activity".to_owned(),
-        Reason::Recent => "no PR, recent activity".to_owned(),
+        Reason::Recent => format!("no {short}, recent activity"),
         Reason::Changes => "changes not committed".to_owned(),
         Reason::Agent => "an agent works here".to_owned(),
         Reason::IdleAgent => "an idle agent, no proof of the end".to_owned(),
-        Reason::WorkAfter => format!("work after PR {number}"),
-        Reason::InDefault => format!("PR {number} finished, commit in the default branch"),
+        Reason::WorkAfter => format!("work after {short} {number}"),
+        Reason::InDefault => format!("{short} {number} finished, commit in the default branch"),
         Reason::Unknown => format!("not checked: {}", unknown_detail(facts)),
     };
     if reason.is_leftover() && facts.agent == Agents::Idle {
@@ -457,15 +493,16 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
     let number = facts
         .pull_requests
         .number()
-        .map(|number| format!("#{number}"))
+        .map(|number| facts.number_text(number))
         .unwrap_or_default();
+    let name = facts.long_name();
     let days = facts.days.unwrap_or(0);
     match reason {
-        Reason::Merged => format!("Its pull request {number} is merged."),
-        Reason::Closed => format!("Its pull request {number} is closed."),
+        Reason::Merged => format!("Its {name} {number} is merged."),
+        Reason::Closed => format!("Its {name} {number} is closed."),
         Reason::Integrated => format!("{} contains its content.", facts.main()),
-        Reason::Old => format!("No pull request, and no change for {days} days."),
-        Reason::Open => format!("Careful: its pull request {number} is open."),
+        Reason::Old => format!("No {name}, and no change for {days} days."),
+        Reason::Open => format!("Careful: its {name} {number} is open."),
         Reason::Recent => format!("No proof that it is finished, and a change {days} days ago."),
         Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
         Reason::Agent => "Careful: an agent works in it.".to_owned(),
@@ -473,9 +510,9 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
             "Careful: an idle agent is in it, and no proof shows the end of its work.".to_owned()
         }
         Reason::WorkAfter => format!("Careful: the branch has work after {number}."),
-        Reason::InDefault => format!(
-            "Its pull request {number} is finished, and the default branch contains its commit."
-        ),
+        Reason::InDefault => {
+            format!("Its {name} {number} is finished, and the default branch contains its commit.")
+        }
         Reason::Checking | Reason::Unknown => "The cleaner did not check it.".to_owned(),
     }
 }
@@ -628,7 +665,8 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
             Mark::Pass,
             "Pull requests",
             format!(
-                "#{number} {}, with the last commit",
+                "{} {}, with the last commit",
+                facts.number_text(*number),
                 if *merged { "merged" } else { "closed" }
             ),
             &forge,
@@ -636,25 +674,34 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
         PullRequests::Open(number) => line(
             Mark::Fail,
             "Pull requests",
-            format!("#{number} open"),
+            format!("{} open", facts.number_text(*number)),
             &forge,
         ),
         PullRequests::WorkAfter(number) => line(
             Mark::Fail,
             "Pull requests",
-            format!("#{number} finished, but the branch has commits after it"),
+            format!(
+                "{} finished, but the branch has commits after it",
+                facts.number_text(*number)
+            ),
             &forge,
         ),
         PullRequests::InDefault(number) => line(
             Mark::Info,
             "Pull requests",
-            format!("#{number} finished, the default branch has the commit"),
+            format!(
+                "{} finished, the default branch has the commit",
+                facts.number_text(*number)
+            ),
             &forge,
         ),
         PullRequests::NoLocalCommit(number) => line(
             Mark::Unknown,
             "Pull requests",
-            format!("#{number} finished, but no local commit"),
+            format!(
+                "{} finished, but no local commit",
+                facts.number_text(*number)
+            ),
             &forge,
         ),
         PullRequests::NotNeeded(why) => line(
@@ -1088,6 +1135,39 @@ mod tests {
         let text = serde_json::to_string(&facts).unwrap();
 
         assert_eq!(serde_json::from_str::<Facts>(&text).unwrap(), facts);
+    }
+
+    #[test]
+    fn gitlab_gets_the_words_of_its_merge_requests() {
+        let gitlab = |pull_requests| Facts {
+            pull_requests,
+            forge: "GitLab".to_owned(),
+            ..facts()
+        };
+        let merged = gitlab(PullRequests::Finished {
+            number: 12,
+            merged: true,
+        });
+
+        assert_eq!(reason_text(Reason::Merged, &merged), "MR !12 merged");
+        assert_eq!(
+            question(Reason::Merged, &merged),
+            "Its merge request !12 is merged."
+        );
+        assert_eq!(
+            lines(&merged, Reason::Merged, 7)[4].text,
+            "!12 merged, with the last commit"
+        );
+        assert_eq!(
+            reason_text(Reason::Old, &gitlab(PullRequests::None)),
+            "no MR, no recent activity"
+        );
+        // GitHub keeps its words.
+        let github = Facts {
+            forge: "GitHub".to_owned(),
+            ..merged
+        };
+        assert_eq!(reason_text(Reason::Merged, &github), "PR #12 merged");
     }
 
     #[test]

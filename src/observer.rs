@@ -849,15 +849,14 @@ fn finish_worktree(
         return Ok(());
     }
     wt::remove_finished(main_checkout, &worktree.path)?;
-    let number = worktree.pull_request.number;
     let message = match worktree.pull_request.state {
         PullRequestState::Closed => format!(
-            "removed the worktree of {}: its pull request #{number} is closed. To get the branch back: {}",
-            worktree.branch, worktree.recover_command
+            "removed the worktree of {}: its {} is closed. To get the branch back: {}",
+            worktree.branch, worktree.reference, worktree.recover_command
         ),
         _ => format!(
-            "removed the worktree of {}: its pull request #{number} is merged",
-            worktree.branch
+            "removed the worktree of {}: its {} is merged",
+            worktree.branch, worktree.reference
         ),
     };
     log.write(&message);

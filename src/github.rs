@@ -34,29 +34,33 @@ impl Backend for GitHub {
     }
 
     /// GitHub keeps the commits of a closed pull request in
-    /// `refs/pull/<number>/head`.
-    fn recover_command(&self, number: u64, branch: &str) -> String {
-        format!("git fetch origin pull/{number}/head:{branch}")
+    /// `refs/pull/<number>/head`, without a time limit.
+    fn recover_command(&self, pull_request: &PullRequest, _commit: &str, branch: &str) -> String {
+        format!(
+            "git fetch origin pull/{}/head:{branch}",
+            pull_request.number
+        )
+    }
+
+    fn reference(&self, number: u64) -> String {
+        format!("pull request #{number}")
     }
 }
 
 /// Run gh without a terminal, and return its output.
 fn run(arguments: &[&str], limit: Duration) -> Result<String, Error> {
-    let label = arguments
-        .iter()
-        .take(2)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let label = format!(
+        "gh {}",
+        arguments
+            .iter()
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let mut command = Command::new("gh");
     command.args(arguments).env("GH_PROMPT_DISABLED", "1");
-    let output = process::output_with_limit(&mut command, limit)
-        .map_err(|error| Error::Command(format!("gh {label}: {error}")))?;
-    if !output.status.success() {
-        let details = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::Command(format!("gh {label}: {}", details.trim())));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    process::run_cli(&mut command, &label, limit)
 }
 
 /// Return the pull requests of `branch` of the repository itself, in all

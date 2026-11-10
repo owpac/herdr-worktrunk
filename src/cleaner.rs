@@ -334,10 +334,7 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
                 .map(|branch| branch.trim_start_matches("origin/").to_owned())
         });
     // wt knows the forge, also a self-hosted one in its config.
-    let forge = match listed.as_ref().and_then(forge::from_worktrunk) {
-        Some(forge) => Ok(forge),
-        None => forge::from_origin(main_checkout),
-    };
+    let forge = forge::resolve(main_checkout, listed.as_ref());
     RepositoryFacts {
         forge,
         default_branch,

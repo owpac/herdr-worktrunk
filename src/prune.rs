@@ -16,9 +16,10 @@
 //!   branch does not have.
 //!
 //! Thus the forge keeps each local commit of a finished worktree: in the
-//! default branch after a merge, and in the ref of the pull request after a
-//! close (`refs/pull/<number>/head` on GitHub,
-//! `refs/merge-requests/<iid>/head` on GitLab).
+//! default branch after a merge, and with the pull request after a close.
+//! GitHub keeps `refs/pull/<number>/head`. GitLab deletes
+//! `refs/merge-requests/<iid>/head` 14 days after the close, but keeps the
+//! commits: a fetch of the commit itself gets the branch back.
 //!
 //! A local commit in the default branch is not work of the branch: a new
 //! worktree starts there. Thus a new worktree stays, also on the name of
@@ -50,6 +51,8 @@ pub struct FinishedWorktree {
     /// The command that gets back the branch after the removal of a closed
     /// pull request.
     pub recover_command: String,
+    /// The pull request as the forge writes it: `pull request #3`.
+    pub reference: String,
 }
 
 impl FinishedWorktree {
@@ -238,7 +241,8 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
                 pull_request,
                 commit,
             } => check.finished.push(FinishedWorktree {
-                recover_command: backend.recover_command(pull_request.number, &worktree.branch),
+                recover_command: backend.recover_command(&pull_request, &commit, &worktree.branch),
+                reference: backend.reference(pull_request.number),
                 path: worktree.path,
                 branch: worktree.branch,
                 pull_request,
@@ -380,6 +384,7 @@ mod tests {
             commit: "aaa".to_owned(),
             pull_request: pull_request(1, MERGED, "aaa"),
             recover_command: "git fetch origin pull/1/head:feature".to_owned(),
+            reference: "pull request #1".to_owned(),
         }
     }
 
@@ -401,8 +406,17 @@ mod tests {
                 .any(|(known_head, known_commit)| known_head == head && known_commit == commit)
         }
 
-        fn recover_command(&self, number: u64, branch: &str) -> String {
-            format!("fetch {number} {branch}")
+        fn recover_command(
+            &self,
+            pull_request: &PullRequest,
+            commit: &str,
+            branch: &str,
+        ) -> String {
+            format!("fetch {} {commit} {branch}", pull_request.number)
+        }
+
+        fn reference(&self, number: u64) -> String {
+            format!("request {number}")
         }
     }
 

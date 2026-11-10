@@ -10,7 +10,6 @@
 //!   `projects/<project>/repository/merge_base` of the commit and of the
 //!   head. The merge base is the commit itself if the head contains it.
 
-use std::io::ErrorKind;
 use std::process::Command;
 use std::time::Duration;
 
@@ -51,18 +50,7 @@ impl GitLab {
             .env("GLAB_NO_PROMPT", "1")
             .env("GLAB_CHECK_UPDATE", "false")
             .env("NO_COLOR", "1");
-        let output = process::output_with_limit(&mut command, self.limit).map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                Error::Command("glab is not installed".to_owned())
-            } else {
-                Error::Command(format!("glab api: {error}"))
-            }
-        })?;
-        if !output.status.success() {
-            let details = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Command(format!("glab api: {}", details.trim())));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        process::run_cli(&mut command, "glab api", self.limit)
     }
 
     /// The path of the API of the project, with its encoded path.
@@ -84,6 +72,9 @@ impl Backend for GitLab {
     /// GitLab does not know a commit that was never pushed: the call then
     /// fails, and the function returns false.
     fn contains(&self, head: &str, commit: &str) -> bool {
+        if head.is_empty() {
+            return false;
+        }
         let endpoint = format!(
             "{}/repository/merge_base?refs[]={}&refs[]={}",
             self.project_endpoint(),
@@ -94,10 +85,15 @@ impl Backend for GitLab {
             .is_ok_and(|text| merge_base_is(&text, commit))
     }
 
-    /// GitLab keeps the commits of a merge request in
-    /// `refs/merge-requests/<iid>/head`.
-    fn recover_command(&self, number: u64, branch: &str) -> String {
-        format!("git fetch origin merge-requests/{number}/head:{branch}")
+    /// GitLab deletes `refs/merge-requests/<iid>/head` 14 days after the
+    /// end of a merge request, but keeps its commits: a fetch of the
+    /// commit itself works.
+    fn recover_command(&self, _pull_request: &PullRequest, commit: &str, branch: &str) -> String {
+        format!("git fetch origin {commit}:refs/heads/{branch}")
+    }
+
+    fn reference(&self, number: u64) -> String {
+        format!("merge request !{number}")
     }
 }
 
@@ -229,17 +225,32 @@ mod tests {
         assert_eq!(encode("é"), "%C3%A9");
     }
 
-    #[test]
-    fn the_branch_of_a_closed_merge_request_comes_back_with_its_ref() {
-        let gitlab = GitLab::new(
+    fn gitlab() -> GitLab {
+        GitLab::new(
             "gitlab.com".to_owned(),
             "team/app".to_owned(),
             Duration::from_secs(1),
-        );
+        )
+    }
+
+    #[test]
+    fn the_branch_of_a_closed_merge_request_comes_back_with_its_commit() {
+        let closed = PullRequest {
+            number: 12,
+            state: PullRequestState::Closed,
+            head: "bbb".to_owned(),
+        };
 
         assert_eq!(
-            gitlab.recover_command(12, "feat/x"),
-            "git fetch origin merge-requests/12/head:feat/x"
+            gitlab().recover_command(&closed, "aaa", "feat/x"),
+            "git fetch origin aaa:refs/heads/feat/x"
         );
+        assert_eq!(gitlab().reference(12), "merge request !12");
+    }
+
+    #[test]
+    fn a_merge_request_without_commit_needs_no_call() {
+        // An empty head returns at once: no glab, no time limit.
+        assert!(!gitlab().contains("", "aaa"));
     }
 }

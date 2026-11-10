@@ -98,10 +98,10 @@ fn list_merged(folder: &Path) -> Result<(), Error> {
             _ => "merged",
         };
         println!(
-            "{} ({}, pull request #{} {state})",
+            "{} ({}, {} {state})",
             worktree.path.display(),
             worktree.branch,
-            worktree.pull_request.number
+            worktree.reference
         );
     }
     Ok(())

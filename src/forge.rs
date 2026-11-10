@@ -10,9 +10,11 @@
 //! without backend give "no backend": the cleaner keeps their worktrees,
 //! except the leftovers that git proves.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -64,8 +66,17 @@ pub trait Backend {
     fn contains(&self, head: &str, commit: &str) -> bool;
 
     /// The command that gets back the branch of a closed pull request.
-    fn recover_command(&self, number: u64, branch: &str) -> String;
+    /// `commit` is the local commit that the pull request contains.
+    fn recover_command(&self, pull_request: &PullRequest, commit: &str, branch: &str) -> String;
+
+    /// The name and the number of a pull request, as the forge writes them:
+    /// `pull request #3`, or `merge request !3` on GitLab.
+    fn reference(&self, number: u64) -> String;
 }
+
+/// How long the observer keeps the forge of a repository: `wt list` reads
+/// git for each worktree.
+const OBSERVER_FORGE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// The provider of a forge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,10 +141,16 @@ impl Provider {
 /// gives `github.com` and `owner/name.git`.
 pub fn split_remote(url: &str) -> Option<(&str, &str)> {
     match SCHEMES.iter().find_map(|scheme| url.strip_prefix(scheme)) {
-        // `[user@]host[:port]/owner/name`
+        // `[user@]host[:port]/owner/name`. The port of ssh is not the port
+        // of the web: only an URL of the web keeps its port.
         Some(rest) => {
             let (host_and_port, path) = without_user(rest).split_once('/')?;
-            let host = host_and_port.split(':').next().unwrap_or_default();
+            let is_web = url.starts_with("https://") || url.starts_with("http://");
+            let host = if is_web {
+                host_and_port
+            } else {
+                host_and_port.split(':').next().unwrap_or_default()
+            };
             Some((host, path))
         }
         // `[user@]host:owner/name`
@@ -207,23 +224,63 @@ fn from_remote(url: &str) -> Option<RepositoryForge> {
 /// have no pull request.
 pub const NO_REMOTE: &str = "no remote origin";
 
-/// The forge of a repository, for the observer: from the host of `origin`
-/// first. If the host has an unknown name, wt gives the forge, with the
-/// forge config of the user (`forge.platform` for a self-hosted host).
-pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
-    let forge = from_origin(main_checkout)?;
-    if forge.provider != Provider::Unknown {
-        return Ok(forge);
+/// The forge of a repository: from the JSON of `wt list` first, with the
+/// forge config of the user (`forge.platform` for a self-hosted host),
+/// else from the host of `origin`. The cleaner and the observer use this
+/// order.
+pub fn resolve(main_checkout: &Path, listed: Option<&Value>) -> Result<RepositoryForge, String> {
+    match listed.and_then(from_worktrunk) {
+        Some(forge) => Ok(forge),
+        None => from_origin(main_checkout),
     }
-    Ok(wt::list_json(main_checkout)
-        .as_ref()
-        .and_then(from_worktrunk)
-        .unwrap_or(forge))
+}
+
+/// The forge of a repository, for the observer: as `resolve`, with one
+/// call to wt for each repository in one hour at most.
+pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
+    type Known = HashMap<PathBuf, (Instant, Result<RepositoryForge, String>)>;
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Mutex::default);
+    if let Some((time, forge)) = known
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(main_checkout)
+    {
+        if time.elapsed() < OBSERVER_FORGE_LIFETIME {
+            return forge.clone();
+        }
+    }
+    let forge = resolve(main_checkout, wt::list_json(main_checkout).as_ref());
+    known
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(main_checkout.to_owned(), (Instant::now(), forge.clone()));
+    forge
 }
 
 /// The host behind an ssh alias (`Host github-work` in `~/.ssh/config`),
-/// from `ssh -G`. The host itself if ssh does not know it.
+/// from `ssh -G`. The host itself if ssh does not know it. The process
+/// keeps each answer: the config of ssh rarely changes.
 fn real_host(host: &str) -> String {
+    static KNOWN: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Mutex::default);
+    if let Some(real) = known
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(host)
+    {
+        return real.clone();
+    }
+    let real = host_from_ssh(host);
+    known
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(host.to_owned(), real.clone());
+    real
+}
+
+/// The `hostname` that `ssh -G` gives for `host`.
+fn host_from_ssh(host: &str) -> String {
     let mut command = Command::new("ssh");
     command.args(["-G", host]);
     process::output_with_limit(&mut command, SSH_CONFIG_TIME_LIMIT)
@@ -267,7 +324,13 @@ pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backe
             if host != "github.com" {
                 return Err(format!("GitHub on {host} has no backend yet"));
             }
-            Ok(Box::new(GitHub::new(repository()?, limit)))
+            let repository = repository()?;
+            if repository.matches('/').count() != 1 {
+                return Err(format!(
+                    "no owner and name for the repository on GitHub: {repository}"
+                ));
+            }
+            Ok(Box::new(GitHub::new(repository, limit)))
         }
         Provider::GitLab => Ok(Box::new(GitLab::new(
             api_host(forge, "gitlab.com")?,
@@ -342,6 +405,11 @@ mod tests {
                 ("github.com", "owner/name@v2.git"),
             ),
             ("https://example.org/team/a@b", ("example.org", "team/a@b")),
+            // The web keeps its port, ssh does not.
+            (
+                "https://gitlab.example.com:8443/group/app.git",
+                ("gitlab.example.com:8443", "group/app.git"),
+            ),
         ];
         for (url, expected) in cases {
             assert_eq!(split_remote(url), Some(expected), "{url}");
@@ -442,11 +510,20 @@ mod tests {
         };
         let limit = Duration::from_secs(1);
 
-        assert!(backend(&forge(Provider::GitHub, "github.com"), limit).is_ok());
+        let github = RepositoryForge {
+            repository: Some("owner/name".to_owned()),
+            ..forge(Provider::GitHub, "github.com")
+        };
+        assert!(backend(&github, limit).is_ok());
         assert!(backend(&forge(Provider::GitLab, "gitlab.com"), limit).is_ok());
         assert_eq!(
             backend(&forge(Provider::GitLab, ""), limit).err(),
             Some("no host for GitLab".to_owned())
+        );
+        // GitHub has no subgroups.
+        assert_eq!(
+            backend(&forge(Provider::GitHub, "github.com"), limit).err(),
+            Some("no owner and name for the repository on GitHub: group/sub/app".to_owned())
         );
         let without_path = RepositoryForge {
             repository: None,
