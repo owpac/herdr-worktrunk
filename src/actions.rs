@@ -461,6 +461,15 @@ fn ask_and_run() -> Result<(), Error> {
     Ok(())
 }
 
+/// A number of worktrees: `1 worktree`, `3 worktrees`.
+fn worktrees_text(count: usize) -> String {
+    if count == 1 {
+        "1 worktree".to_owned()
+    } else {
+        format!("{count} worktrees")
+    }
+}
+
 /// The question before the deletion of all the old worktrees of the list
 /// of the cleaner, then the deletions and a summary.
 fn delete_all() -> Result<(), Error> {
@@ -485,8 +494,8 @@ fn delete_all() -> Result<(), Error> {
         String::new()
     };
     let question = format!(
-        "Delete the {} worktrees of the group To delete?\n{}{more}\nwt keeps a branch that is not merged.",
-        old.len(),
+        "Delete {} of the group To delete?\n{}{more}\nwt keeps a branch that is not merged.",
+        worktrees_text(old.len()),
         shown.join("\n")
     );
     if !ui::confirm("Clean the worktrees", &question, "Delete all", true) {
@@ -545,7 +554,7 @@ fn delete_all() -> Result<(), Error> {
             Err(_) => kept.push(format!("{}: wt refused it", worktree.branch)),
         }
     }
-    let mut summary = format!("Deleted {deleted} worktrees.");
+    let mut summary = format!("Deleted {}.", worktrees_text(deleted));
     if !closed.is_empty() {
         summary.push_str(&format!(
             "\nClosed idle agents, to resume:\n{}",
