@@ -42,9 +42,9 @@ const TITLE_VARIABLE: &str = "TRUNK_MESSAGE_TITLE";
 const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 /// The reason of a question that the observer asks (an old worktree).
 const REASON_VARIABLE: &str = "TRUNK_REASON";
-/// A deletion of the popup cleaner: the idle agents of the worktree close
-/// first. The cleaner gives it only to a worktree with a proof of the end.
-const CLOSE_IDLE_VARIABLE: &str = "TRUNK_CLOSE_IDLE_AGENTS";
+/// A deletion that the user chose in the popup cleaner: the agents of the
+/// worktree close first, after the question.
+const CLOSE_AGENTS_VARIABLE: &str = "TRUNK_CLOSE_AGENTS";
 /// The state file of the popup cleaner: the results of its checks. The
 /// cleaner comes back after a question with these results.
 const STATE_VARIABLE: &str = "TRUNK_CLEANER_STATE";
@@ -300,7 +300,7 @@ fn agents_to_close(
     }
 }
 
-/// Close the panes of idle agents, then wait until herdr shows no agent in
+/// Close the panes of the agents, then wait until herdr shows no agent in
 /// the worktree, for 10 seconds at most. The conversations stay on the
 /// disk.
 fn close_agents(agents: &[WorktreeAgent], checkout: &Path) -> Result<(), Error> {
@@ -314,7 +314,7 @@ fn close_agents(agents: &[WorktreeAgent], checkout: &Path) -> Result<(), Error> 
         thread::sleep(Duration::from_millis(500));
     }
     Err(Error::Command(
-        "The idle agent of this worktree did not close.".to_owned(),
+        "The agent of this worktree did not close.".to_owned(),
     ))
 }
 
@@ -394,11 +394,21 @@ fn ask_and_run() -> Result<(), Error> {
         Some(workspace_id) => Some(workspace_id.clone()),
         None => herdr::workspace_of_checkout(&checkout.root)?,
     };
-    // A deletion of the cleaner closes the idle agents of a worktree with a
-    // proof of the end. Any other agent stops the deletion.
-    let close_idle = operation != MERGE && env::var_os(CLOSE_IDLE_VARIABLE).is_some();
-    let idle_agents = if close_idle {
-        agents_to_close(&checkout.root, workspace_id.as_deref())?
+    // A deletion that the user chose in the cleaner closes the agents of
+    // the worktree first. The actions remove and merge refuse an agent.
+    let close_agents_first = operation != MERGE && env::var_os(CLOSE_AGENTS_VARIABLE).is_some();
+    let agents = if close_agents_first {
+        let snapshot = herdr::snapshot()?;
+        let agents = leftover::agents_of(&snapshot, &checkout.root, workspace_id.as_deref());
+        // wt refuses changes that are not committed: the agents must not
+        // close for nothing.
+        if !agents.is_empty() && !git::is_clean(&checkout.root) {
+            return Err(Error::Command(
+                "This worktree has changes that are not committed. Commit or delete them first: its agent stays."
+                    .to_owned(),
+            ));
+        }
+        agents
     } else {
         if let Some(workspace_id) = &workspace_id {
             refuse_if_agent(workspace_id)?;
@@ -432,11 +442,8 @@ fn ask_and_run() -> Result<(), Error> {
     if let Ok(reason) = env::var(REASON_VARIABLE) {
         question = format!("{reason}\n{question}");
     }
-    if let Some(agent) = idle_agents.first() {
-        question.push_str(&format!(
-            "\nIts idle agent closes first. To resume it: {}",
-            agent.resume_command()
-        ));
+    if !agents.is_empty() {
+        question.push_str(&agents_text(&agents));
     }
     if !ui::confirm("Delete the worktree", &question, "Delete", true) {
         return Ok(());
@@ -445,14 +452,29 @@ fn ask_and_run() -> Result<(), Error> {
         "Delete the worktree",
         &format!("Deleting the worktree of {branch}…"),
     );
-    if !idle_agents.is_empty() {
-        close_agents(&idle_agents, &checkout.root)?;
+    if !agents.is_empty() {
+        close_agents(&agents, &checkout.root)?;
     }
     wt::remove_quietly(&checkout.main_checkout(), &checkout.root)?;
     if let Some(workspace_id) = &workspace_id {
         close_after_removal(workspace_id, &checkout)?;
     }
     Ok(())
+}
+
+/// The lines of the question about the agents that the deletion closes:
+/// a warning for an agent that works, then the command that resumes each
+/// agent.
+fn agents_text(agents: &[WorktreeAgent]) -> String {
+    let mut text = if agents.iter().all(WorktreeAgent::is_idle) {
+        "\nIts idle agent closes first.".to_owned()
+    } else {
+        "\nCareful: an agent works in it now. The deletion closes it.".to_owned()
+    };
+    for agent in agents {
+        text.push_str(&format!("\nTo resume it: {}", agent.resume_command()));
+    }
+    text
 }
 
 /// A number of worktrees: `1 worktree`, `3 worktrees`.
@@ -718,9 +740,7 @@ pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
             environment.push((OPERATION_VARIABLE, DELETE));
             environment.push((CHECKOUT_VARIABLE, checkout_text.as_ref()));
             environment.push((REASON_VARIABLE, reason.as_str()));
-            if leftover::closes_idle_agents(entry.reason, &entry.facts) {
-                environment.push((CLOSE_IDLE_VARIABLE, "1"));
-            }
+            environment.push((CLOSE_AGENTS_VARIABLE, "1"));
             open_after_this_popup("confirm", &folder, &environment)
         }
     }
@@ -822,6 +842,28 @@ mod tests {
         assert_eq!(
             name_lines(&["a".repeat(70), "b".to_owned()], 58, 1),
             ["… and 2 more"]
+        );
+    }
+
+    #[test]
+    fn the_question_tells_which_agents_the_deletion_closes() {
+        let agent = |status: &str, session: &str| WorktreeAgent {
+            pane_id: "w1:p1".to_owned(),
+            kind: "claude".to_owned(),
+            session: Some(session.to_owned()),
+            status: Some(status.to_owned()),
+            works_in_folder: true,
+            in_own_workspace: true,
+            workspace_focused: false,
+        };
+
+        assert_eq!(
+            agents_text(&[agent("idle", "s1")]),
+            "\nIts idle agent closes first.\nTo resume it: claude --resume s1"
+        );
+        assert_eq!(
+            agents_text(&[agent("idle", "s1"), agent("working", "s2")]),
+            "\nCareful: an agent works in it now. The deletion closes it.\nTo resume it: claude --resume s1\nTo resume it: claude --resume s2"
         );
     }
 }

@@ -52,7 +52,7 @@ The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a term
 | Key | Result |
 |-----|--------|
 | `↑` `↓` | Move to the next worktree, over the titles of the groups. |
-| `Enter` | Asks to delete the worktree. The question gives its reason, for example an open pull request. |
+| `Enter` | Asks to delete the worktree. The question gives its reason, for example an open pull request. If an agent is in the worktree, the question tells it, and the deletion closes the agent first. |
 | `ctrl-a` | Asks to delete the worktrees of the group To delete that the filter shows. A worktree of another group never goes. |
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes`, and `checks`: the verdict and the result of each layer. |
 | `Esc` | Quits. |
@@ -105,6 +105,8 @@ The agents follow the rules of the observer:
 - An idle agent (`idle` or `done`) does not keep a worktree with a proof of the end: a finished pull request, or a merged branch with its own commits. The deletion closes the agent first, and gives the command that resumes it, for example `claude --resume <session>`.
 - An idle agent keeps a worktree without a proof of the end: an old worktree, or a merged branch without own commit.
 - An open pull request keeps the worktree, with or without an agent.
+
+These rules give the verdict and the group. `Enter` can still delete a kept worktree with an agent: after the question, the deletion closes its agents, also an agent that works. A worktree with changes that are not committed stays, and its agents too.
 
 ### The forges
 
