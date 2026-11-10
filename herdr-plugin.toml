@@ -101,7 +101,7 @@ id = "confirm"
 title = "Worktrunk"
 placement = "popup"
 width = 64
-height = 12
+height = 14
 command = ["bin/herdr-worktrunk", "confirm"]
 
 # The output of wt merge.

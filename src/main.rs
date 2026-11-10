@@ -57,7 +57,7 @@ fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
 }
 
 /// The state folder of the plugin: the observer writes its files there.
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     herdr_folder(
         "HERDR_PLUGIN_STATE_DIR",
         &[".local", "state", "herdr", "plugins", herdr::PLUGIN_ID],
@@ -191,8 +191,8 @@ fn main() -> ExitCode {
             cleaner::print_enter(kind);
             return ExitCode::SUCCESS;
         }
-        ["cleaner-delete-all", state] => {
-            cleaner::print_delete_all(Path::new(state));
+        ["cleaner-delete-all", state, visible] => {
+            cleaner::print_delete_all(Path::new(state), Path::new(visible));
             return ExitCode::SUCCESS;
         }
         ["cleaner-preview", state, stale_days, id, branch, main_checkout, kind] => {
