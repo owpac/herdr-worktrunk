@@ -38,7 +38,7 @@ use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Merge, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
-use crate::stale::{self, OldWorktree};
+use crate::stale;
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
@@ -139,16 +139,6 @@ impl Entry {
     pub fn question(&self) -> String {
         leftover::question(self.reason, &self.facts)
     }
-
-    fn as_old_worktree(&self) -> OldWorktree {
-        OldWorktree {
-            main_checkout: self.main_checkout.clone(),
-            path: self.path.clone(),
-            branch: self.branch.clone(),
-            days: self.facts.days.unwrap_or(0),
-            close_idle_agents: leftover::closes_idle_agents(self.reason, &self.facts),
-        }
-    }
 }
 
 /// Write the state file in one rename, one JSON line for each entry: fzf
@@ -168,6 +158,18 @@ pub fn read_state(path: &Path) -> Vec<Entry> {
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The leftovers of the state file: the group To delete, for "delete all".
+pub fn leftovers(state_path: &Path) -> Vec<Entry> {
+    leftover_entries(read_state(state_path))
+}
+
+fn leftover_entries(entries: Vec<Entry>) -> Vec<Entry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.reason.is_leftover())
         .collect()
 }
 
@@ -253,11 +255,8 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
             })?;
         repositories = vec![main];
     }
-    // A worktree without agent, then and now, keeps its last result.
     let known: HashMap<&Path, &Entry> = previous
         .iter()
-        .filter(|entry| entry.facts.agent == Agents::None)
-        .filter(|entry| !matches!(entry.reason, Reason::Checking | Reason::Unknown))
         .map(|entry| (entry.path.as_path(), entry))
         .collect();
     let listed: Vec<(PathBuf, Vec<git::LinkedWorktree>)> = thread::scope(|scope| {
@@ -283,20 +282,40 @@ pub fn list_worktrees(scope: Option<&Path>, previous: &[Entry]) -> Result<Vec<En
             let workspace_id = workspace_of_checkout.get(&path).map(String::as_str);
             let agents =
                 leftover::agents_state(&leftover::agents_of(&snapshot, &path, workspace_id));
-            match known.get(path.as_path()) {
-                Some(entry) if entry.branch == worktree.branch && agents == Agents::None => {
-                    entries.push((*entry).clone())
-                }
-                _ => entries.push(Entry::new(
-                    path,
-                    worktree.branch,
-                    repository.clone(),
-                    agents,
-                )),
-            }
+            let previous = known.get(path.as_path()).copied();
+            entries.push(entry_of(
+                previous,
+                path,
+                worktree.branch,
+                repository.clone(),
+                agents,
+            ));
         }
     }
     Ok(entries)
+}
+
+/// The entry of a listed worktree. It keeps its last result if it had no
+/// agent then and has none now, on the same branch, and if its check gave
+/// an answer. Else it gets a new check.
+fn entry_of(
+    previous: Option<&Entry>,
+    path: PathBuf,
+    branch: String,
+    main_checkout: PathBuf,
+    agents: Agents,
+) -> Entry {
+    match previous {
+        Some(entry)
+            if entry.facts.agent == Agents::None
+                && agents == Agents::None
+                && entry.branch == branch
+                && !matches!(entry.reason, Reason::Checking | Reason::Unknown) =>
+        {
+            entry.clone()
+        }
+        _ => Entry::new(path, branch, main_checkout, agents),
+    }
 }
 
 /// What a repository gives to the checks of its worktrees: one call to
@@ -942,8 +961,8 @@ fn scope_of(entries: &[Entry]) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Choice {
     Delete(Box<Entry>),
-    /// The worktrees of the group "To delete".
-    DeleteAll(Vec<OldWorktree>),
+    /// Delete the group To delete: `leftovers` reads it in the state file.
+    DeleteAll,
 }
 
 /// Show the list in fzf, start the checks, and return the choice of the
@@ -1070,12 +1089,10 @@ pub fn choose(
 fn parse_choice(text: &str, entries: &[Entry]) -> Option<Choice> {
     let first = text.lines().next()?;
     if first == DELETE_ALL_REQUEST {
-        let leftovers: Vec<OldWorktree> = entries
+        return entries
             .iter()
-            .filter(|entry| entry.reason.is_leftover())
-            .map(Entry::as_old_worktree)
-            .collect();
-        return (!leftovers.is_empty()).then_some(Choice::DeleteAll(leftovers));
+            .any(|entry| entry.reason.is_leftover())
+            .then_some(Choice::DeleteAll);
     }
     let path = first.split('\t').next()?;
     entries
@@ -1283,19 +1300,64 @@ mod tests {
     }
 
     #[test]
+    fn a_worktree_keeps_its_last_result_only_without_agent() {
+        let path = PathBuf::from("/work/app.feat");
+        let main = PathBuf::from("/work/app");
+        let mut checked = Entry::new(path.clone(), "feat".to_owned(), main.clone(), Agents::None);
+        checked.reason = Reason::Old;
+        let entry = |previous: &Entry, branch: &str, agents: Agents| {
+            entry_of(
+                Some(previous),
+                path.clone(),
+                branch.to_owned(),
+                main.clone(),
+                agents,
+            )
+            .reason
+        };
+
+        assert_eq!(entry(&checked, "feat", Agents::None), Reason::Old);
+        // An agent now, another branch, or a check without answer: check
+        // again.
+        assert_eq!(entry(&checked, "feat", Agents::Idle), Reason::Checking);
+        assert_eq!(entry(&checked, "other", Agents::None), Reason::Checking);
+        let unknown = Entry {
+            reason: Reason::Unknown,
+            ..checked.clone()
+        };
+        assert_eq!(entry(&unknown, "feat", Agents::None), Reason::Checking);
+        // An agent then: check again.
+        let mut with_agent = checked.clone();
+        with_agent.facts.agent = Agents::Idle;
+        assert_eq!(entry(&with_agent, "feat", Agents::None), Reason::Checking);
+        assert_eq!(
+            entry_of(
+                None,
+                path.clone(),
+                "feat".to_owned(),
+                main.clone(),
+                Agents::Busy
+            )
+            .reason,
+            Reason::Agent
+        );
+    }
+
+    #[test]
     fn delete_all_takes_the_leftovers_only() {
         let entries = entries();
 
         let choice = parse_choice("delete-all\n", &entries);
+        let old = leftover_entries(entries.clone());
 
-        let Some(Choice::DeleteAll(old)) = choice else {
-            panic!("no choice");
-        };
-        let branches: Vec<&str> = old
-            .iter()
-            .map(|worktree| worktree.branch.as_str())
-            .collect();
+        assert_eq!(choice, Some(Choice::DeleteAll));
+        let branches: Vec<&str> = old.iter().map(|entry| entry.branch.as_str()).collect();
         assert_eq!(branches, ["a-old", "d-merged"]);
+        let kept_only: Vec<Entry> = entries
+            .into_iter()
+            .filter(|entry| !entry.reason.is_leftover())
+            .collect();
+        assert_eq!(parse_choice("delete-all\n", &kept_only), None);
     }
 
     #[test]

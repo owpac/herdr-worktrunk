@@ -56,6 +56,10 @@ pub enum Flavor {
     Forgejo,
 }
 
+/// A call of the API on an endpoint: `tea api` in the plugin, fixed
+/// answers in the tests.
+type Call = Box<dyn Fn(&str) -> Result<Response, Error> + Send + Sync>;
+
 /// The backend of a repository on a Gitea or Forgejo host.
 pub struct Gitea {
     /// The host of the API, with its port: `codeberg.org`.
@@ -63,18 +67,20 @@ pub struct Gitea {
     /// The repository: `owner/name`.
     repository: String,
     flavor: Flavor,
-    /// The time limit of each call to tea.
-    limit: Duration,
+    call: Call,
     /// The default branch of the repository, from the forge.
     default_branch: Mutex<Option<String>>,
     /// The open pull requests of the repository, on Gitea: one read for
-    /// all the branches.
+    /// all the branches of a check. Never kept longer: a new pull request
+    /// must keep its worktree.
     open: Mutex<Option<Vec<Listed>>>,
-    /// The commits of each finished pull request, by its last commit.
+    /// The commits of each finished pull request, by its last commit, for
+    /// `contains`.
     commits: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// An answer of the API.
+#[derive(Clone, Debug)]
 struct Response {
     /// The body, or None for the status 404.
     body: Option<String>,
@@ -100,52 +106,29 @@ impl Gitea {
     }
 
     pub fn new(host: String, repository: String, flavor: Flavor, limit: Duration) -> Gitea {
+        let tea_host = host.clone();
+        Gitea::with_call(
+            host,
+            repository,
+            flavor,
+            Box::new(move |endpoint| tea_api(&tea_host, endpoint, limit)),
+        )
+    }
+
+    fn with_call(host: String, repository: String, flavor: Flavor, call: Call) -> Gitea {
         Gitea {
             host,
             repository,
             flavor,
-            limit,
+            call,
             default_branch: Mutex::default(),
             open: Mutex::default(),
             commits: Mutex::default(),
         }
     }
 
-    /// Run `tea api` on `endpoint` with the login of the host.
     fn api(&self, endpoint: &str) -> Result<Response, Error> {
-        let login = login_of_host(&self.host, self.limit)?;
-        let mut command = Command::new("tea");
-        command
-            .args(["api", "--login", &login, "-i", endpoint])
-            .env("NO_COLOR", "1")
-            // Not in a repository: tea must not read the remotes of a
-            // checkout. A shim of mise then finds only its global version.
-            .current_dir(env::temp_dir());
-        let output = process::cli_output(&mut command, "tea api", self.limit)?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let body = String::from_utf8_lossy(&output.stdout).into_owned();
-        // The status line decides, also if tea ends with an error code.
-        match status_code(&stderr) {
-            Some(200..=299) => Ok(Response {
-                body: Some(body),
-                total: total_count(&stderr),
-            }),
-            Some(404) => Ok(Response {
-                body: None,
-                total: None,
-            }),
-            Some(code) => Err(Error::Command(format!(
-                "tea api: HTTP {code}: {}",
-                error_message(&body)
-            ))),
-            None => Err(Error::Command(format!(
-                "tea api: {}",
-                stderr
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("no HTTP status")
-            ))),
-        }
+        (self.call)(endpoint)
     }
 
     /// The body of `endpoint`. A 404 is an error.
@@ -184,7 +167,9 @@ impl Gitea {
         format!("/repos/{}", self.repository)
     }
 
-    /// The default branch of the repository. The backend reads it once.
+    /// The default branch of the repository. The backend reads it once: a
+    /// new backend (a new pass of the observer) reads it again, also after
+    /// a rename.
     fn default_branch(&self) -> Result<String, Error> {
         let mut known = lock(&self.default_branch);
         if let Some(branch) = known.as_ref() {
@@ -271,15 +256,32 @@ impl Gitea {
         })
     }
 
-    /// The commits of a pull request, the newest first. A list that is not
-    /// complete keeps its newest commits: the proof can then miss an old
-    /// commit, and the worktree stays.
-    fn pull_request_commits(&self, number: u64) -> Result<Vec<String>, Error> {
+    /// The commits of a finished pull request, the newest first. A list
+    /// that is not complete keeps its newest commits: the proof can then
+    /// miss an old commit, and the worktree stays.
+    ///
+    /// The process keeps the commits of a merged pull request: they never
+    /// change, and the pull request cannot open again. A closed pull request
+    /// can open again and get new commits: the backend reads it each time.
+    fn pull_request_commits(&self, number: u64, merged: bool) -> Result<Vec<String>, Error> {
+        type Known = HashMap<(String, String, u64), Vec<String>>;
+        static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+        let known = KNOWN.get_or_init(Mutex::default);
+        let key = (self.host.clone(), self.repository.clone(), number);
+        if merged {
+            if let Some(commits) = lock(known).get(&key) {
+                return Ok(commits.clone());
+            }
+        }
         let endpoint = format!(
             "{}/pulls/{number}/commits?files=false&verification=false",
             self.repository_endpoint()
         );
-        Ok(self.read_list(&endpoint, parse_commits)?.0)
+        let (commits, _) = self.read_list(&endpoint, parse_commits)?;
+        if merged {
+            lock(known).insert(key, commits.clone());
+        }
+        Ok(commits)
     }
 }
 
@@ -302,7 +304,8 @@ impl Backend for Gitea {
             } else {
                 // The commit of the branch now is not the last commit of a
                 // finished pull request.
-                let commits = self.pull_request_commits(pull.number)?;
+                let merged = state == PullRequestState::Merged;
+                let commits = self.pull_request_commits(pull.number, merged)?;
                 let head = commits.first().cloned().unwrap_or_default();
                 lock(&self.commits).insert(head.clone(), commits);
                 head
@@ -338,6 +341,43 @@ impl Backend for Gitea {
             Flavor::Gitea => Provider::Gitea,
             Flavor::Forgejo => Provider::Forgejo,
         }
+    }
+}
+
+/// Run `tea api` on `endpoint` with the login of `host`.
+fn tea_api(host: &str, endpoint: &str, limit: Duration) -> Result<Response, Error> {
+    let login = login_of_host(host, limit)?;
+    let mut command = Command::new("tea");
+    command
+        .args(["api", "--login", &login, "-i", endpoint])
+        .env("NO_COLOR", "1")
+        // Not in a repository: tea must not read the remotes of a
+        // checkout. A shim of mise then finds only its global version.
+        .current_dir(env::temp_dir());
+    let output = process::cli_output(&mut command, "tea api", limit)?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let body = String::from_utf8_lossy(&output.stdout).into_owned();
+    // The status line decides, also if tea ends with an error code.
+    match status_code(&stderr) {
+        Some(200..=299) => Ok(Response {
+            body: Some(body),
+            total: total_count(&stderr),
+        }),
+        Some(404) => Ok(Response {
+            body: None,
+            total: None,
+        }),
+        Some(code) => Err(Error::Command(format!(
+            "tea api: HTTP {code}: {}",
+            error_message(&body)
+        ))),
+        None => Err(Error::Command(format!(
+            "tea api: {}",
+            stderr
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("no HTTP status")
+        ))),
     }
 }
 
@@ -717,5 +757,279 @@ mod tests {
         assert!(gitea.contains("head", "local"));
         assert!(!gitea.contains("head", "other"));
         assert!(!gitea.contains("unknown", "local"));
+    }
+
+    /// A backend with fixed answers. Each call counts, and an unknown
+    /// endpoint gives an error.
+    struct Fake {
+        gitea: Gitea,
+        calls: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    fn fake(host: &str, flavor: Flavor, answers: Vec<(String, Response)>) -> Fake {
+        let answers: HashMap<String, Response> = answers.into_iter().collect();
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&calls);
+        let gitea = Gitea::with_call(
+            host.to_owned(),
+            "team/app".to_owned(),
+            flavor,
+            Box::new(move |endpoint| {
+                lock(&seen).push(endpoint.to_owned());
+                answers
+                    .get(endpoint)
+                    .cloned()
+                    .ok_or_else(|| Error::Command(format!("unexpected call: {endpoint}")))
+            }),
+        );
+        Fake { gitea, calls }
+    }
+
+    fn ok(body: serde_json::Value, total: Option<usize>) -> Response {
+        Response {
+            body: Some(body.to_string()),
+            total,
+        }
+    }
+
+    fn not_found() -> Response {
+        Response {
+            body: None,
+            total: None,
+        }
+    }
+
+    fn pull(number: u64, state: &str, merged: bool, branch: &str, sha: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "state": state,
+            "merged": merged,
+            "head": {"label": branch, "ref": branch, "sha": sha, "repo_id": 1},
+            "base": {"label": "main", "ref": "main", "repo_id": 1},
+        })
+    }
+
+    fn commits(shas: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            shas.iter()
+                .map(|sha| serde_json::json!({"sha": sha}))
+                .collect(),
+        )
+    }
+
+    const PULLS_OF_X: &str = "/repos/team/app/pulls?state=all&head=feat%2Fx&limit=50&page=1";
+
+    fn commits_page(number: u64, page: u32) -> String {
+        format!("/repos/team/app/pulls/{number}/commits?files=false&verification=false&limit=50&page={page}")
+    }
+
+    #[test]
+    fn forgejo_reads_the_pages_of_the_commits_until_the_total() {
+        let fake = fake(
+            "pages.example",
+            Flavor::Forgejo,
+            vec![
+                (
+                    PULLS_OF_X.to_owned(),
+                    ok(
+                        serde_json::json!([pull(7, "closed", true, "feat/x", "now")]),
+                        Some(1),
+                    ),
+                ),
+                (commits_page(7, 1), ok(commits(&["c3", "c2"]), Some(3))),
+                (commits_page(7, 2), ok(commits(&["c1"]), Some(3))),
+            ],
+        );
+
+        let pull_requests = fake.gitea.pull_requests("feat/x").unwrap();
+
+        assert_eq!(
+            pull_requests,
+            [PullRequest {
+                number: 7,
+                state: PullRequestState::Merged,
+                head: "c3".to_owned(),
+            }]
+        );
+        assert!(fake.gitea.contains("c3", "c1"));
+        assert_eq!(lock(&fake.calls).len(), 3);
+    }
+
+    #[test]
+    fn a_list_without_total_ends_with_an_empty_page() {
+        let fake = fake(
+            "empty-page.example",
+            Flavor::Forgejo,
+            vec![
+                (
+                    PULLS_OF_X.to_owned(),
+                    ok(
+                        serde_json::json!([pull(8, "closed", false, "feat/x", "now")]),
+                        None,
+                    ),
+                ),
+                (
+                    "/repos/team/app/pulls?state=all&head=feat%2Fx&limit=50&page=2".to_owned(),
+                    ok(serde_json::json!([]), None),
+                ),
+                (commits_page(8, 1), ok(commits(&["c2", "c1"]), Some(2))),
+            ],
+        );
+
+        let pull_requests = fake.gitea.pull_requests("feat/x").unwrap();
+
+        assert_eq!(pull_requests[0].state, PullRequestState::Closed);
+        assert_eq!(pull_requests[0].head, "c2");
+    }
+
+    #[test]
+    fn a_forgejo_that_ignores_the_filter_gives_an_error() {
+        let fake = fake(
+            "old-forgejo.example",
+            Flavor::Forgejo,
+            vec![(
+                PULLS_OF_X.to_owned(),
+                ok(
+                    serde_json::json!([pull(9, "open", false, "other", "aaa")]),
+                    Some(1),
+                ),
+            )],
+        );
+
+        let error = fake.gitea.pull_requests("feat/x").unwrap_err().to_string();
+
+        assert!(error.contains("ignores the filter"), "{error}");
+    }
+
+    #[test]
+    fn gitea_reads_its_open_pull_requests_once_and_needs_nothing_else() {
+        let open_page = "/repos/team/app/pulls?state=open&limit=50&page=1".to_owned();
+        let fake = fake(
+            "open.example",
+            Flavor::Gitea,
+            vec![(
+                open_page,
+                ok(
+                    serde_json::json!([
+                        pull(3, "open", false, "feat/x", "aaa"),
+                        pull(4, "open", false, "feat/y", "bbb")
+                    ]),
+                    Some(2),
+                ),
+            )],
+        );
+
+        let x = fake.gitea.pull_requests("feat/x").unwrap();
+        let y = fake.gitea.pull_requests("feat/y").unwrap();
+
+        assert_eq!((x[0].number, x[0].state), (3, PullRequestState::Open));
+        assert_eq!((y[0].number, y[0].state), (4, PullRequestState::Open));
+        // One call for the 2 branches: no default branch, no commits.
+        assert_eq!(lock(&fake.calls).len(), 1);
+    }
+
+    #[test]
+    fn gitea_asks_the_pull_request_of_the_branch_into_the_default_branch() {
+        let fake = fake(
+            "fallback.example",
+            Flavor::Gitea,
+            vec![
+                (
+                    "/repos/team/app/pulls?state=open&limit=50&page=1".to_owned(),
+                    ok(serde_json::json!([]), Some(0)),
+                ),
+                (
+                    "/repos/team/app".to_owned(),
+                    ok(serde_json::json!({"default_branch": "main"}), None),
+                ),
+                (
+                    "/repos/team/app/pulls/main/feat%2Fx".to_owned(),
+                    ok(pull(5, "closed", true, "feat/x", "now"), None),
+                ),
+                (
+                    "/repos/team/app/pulls/main/feat%2Fz".to_owned(),
+                    not_found(),
+                ),
+                (commits_page(5, 1), ok(commits(&["c1"]), Some(1))),
+            ],
+        );
+
+        let x = fake.gitea.pull_requests("feat/x").unwrap();
+        let z = fake.gitea.pull_requests("feat/z").unwrap();
+
+        assert_eq!(
+            (x[0].number, x[0].state, x[0].head.as_str()),
+            (5, PullRequestState::Merged, "c1")
+        );
+        assert!(z.is_empty());
+    }
+
+    #[test]
+    fn too_many_open_pull_requests_give_an_error() {
+        let page: Vec<serde_json::Value> = (1..=50)
+            .map(|number| pull(number, "open", false, "other", "aaa"))
+            .collect();
+        let answers = (1..=5)
+            .map(|page_number| {
+                (
+                    format!("/repos/team/app/pulls?state=open&limit=50&page={page_number}"),
+                    ok(serde_json::Value::Array(page.clone()), Some(300)),
+                )
+            })
+            .collect();
+        let fake = fake("many.example", Flavor::Gitea, answers);
+
+        let error = fake.gitea.pull_requests("feat/x").unwrap_err().to_string();
+
+        assert_eq!(error, "more than 250 open pull requests");
+    }
+
+    #[test]
+    fn the_process_keeps_the_commits_of_a_finished_pull_request() {
+        let answers = || {
+            vec![
+                (
+                    PULLS_OF_X.to_owned(),
+                    ok(
+                        serde_json::json!([pull(6, "closed", true, "feat/x", "now")]),
+                        Some(1),
+                    ),
+                ),
+                (commits_page(6, 1), ok(commits(&["c1"]), Some(1))),
+            ]
+        };
+        let first = fake("kept.example", Flavor::Forgejo, answers());
+        let second = fake("kept.example", Flavor::Forgejo, answers());
+
+        first.gitea.pull_requests("feat/x").unwrap();
+        second.gitea.pull_requests("feat/x").unwrap();
+
+        // The second backend (the next pass of the observer) reads only the list.
+        assert_eq!(lock(&second.calls).as_slice(), [PULLS_OF_X]);
+        assert!(second.gitea.contains("c1", "c1"));
+    }
+
+    #[test]
+    fn the_commits_of_a_closed_pull_request_are_read_each_time() {
+        let answers = || {
+            vec![
+                (
+                    PULLS_OF_X.to_owned(),
+                    ok(
+                        serde_json::json!([pull(11, "closed", false, "feat/x", "now")]),
+                        Some(1),
+                    ),
+                ),
+                (commits_page(11, 1), ok(commits(&["c1"]), Some(1))),
+            ]
+        };
+        let first = fake("closed.example", Flavor::Forgejo, answers());
+        let second = fake("closed.example", Flavor::Forgejo, answers());
+
+        first.gitea.pull_requests("feat/x").unwrap();
+        second.gitea.pull_requests("feat/x").unwrap();
+
+        // It can open again and get new commits: no cache.
+        assert_eq!(lock(&second.calls).len(), 2);
     }
 }

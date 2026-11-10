@@ -121,9 +121,6 @@ pub struct OldWorktree {
     pub branch: String,
     /// The days without activity.
     pub days: u64,
-    /// The worktree has a proof of the end (a finished pull request or a
-    /// merge): the deletion closes its idle agents first.
-    pub close_idle_agents: bool,
 }
 
 /// Select the old worktrees among the worktrees without pull request of
@@ -160,30 +157,9 @@ pub fn select_old(
                 path,
                 branch: worktree.branch,
                 days: days_since(activity, now),
-                close_idle_agents: false,
             })
         })
         .collect()
-}
-
-/// Write a list of old worktrees: one line for each worktree,
-/// `<path>\t<branch>\t<main checkout>\t<days>`. The popup cleaner reads
-/// this file.
-pub fn write_list(path: &Path, old: &[OldWorktree]) -> Result<(), std::io::Error> {
-    let text: String = old
-        .iter()
-        .map(|worktree| {
-            format!(
-                "{}\t{}\t{}\t{}\t{}\n",
-                worktree.path.display(),
-                worktree.branch,
-                worktree.main_checkout.display(),
-                worktree.days,
-                u8::from(worktree.close_idle_agents)
-            )
-        })
-        .collect();
-    write_atomically(path, &text)
 }
 
 /// Write a file in one rename: a reader never sees a part of it, also if
@@ -199,52 +175,9 @@ pub fn write_atomically(path: &Path, text: &str) -> Result<(), std::io::Error> {
     fs::rename(&new_path, path)
 }
 
-/// Read a list of old worktrees, without the worktrees that do not exist
-/// anymore (a deletion since the list was written).
-pub fn read_list(path: &Path) -> Vec<OldWorktree> {
-    fs::read_to_string(path)
-        .map(|text| parse_list(&text))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|worktree| worktree.path.exists())
-        .collect()
-}
-
-fn parse_list(text: &str) -> Vec<OldWorktree> {
-    text.lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            Some(OldWorktree {
-                path: PathBuf::from(fields.next()?),
-                branch: fields.next()?.to_owned(),
-                main_checkout: PathBuf::from(fields.next()?),
-                days: fields.next()?.parse().ok()?,
-                // A list of an older version has 4 fields.
-                close_idle_agents: fields.next() == Some("1"),
-            })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_list_of_old_worktrees_is_read_back() {
-        let old = vec![OldWorktree {
-            main_checkout: PathBuf::from("/work/repo"),
-            path: PathBuf::from("/work/repo.old"),
-            branch: "feature/old".to_owned(),
-            days: 12,
-            close_idle_agents: false,
-        }];
-        let text = "/work/repo.old\tfeature/old\t/work/repo\t12\nbad line\n";
-
-        assert_eq!(parse_list(text), old);
-        let with_agents = "/work/repo.old\tfeature/old\t/work/repo\t12\t1\n";
-        assert!(parse_list(with_agents)[0].close_idle_agents);
-    }
 
     const NOW: u64 = 1_800_000_000;
 
