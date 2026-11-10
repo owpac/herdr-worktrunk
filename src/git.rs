@@ -222,7 +222,25 @@ pub fn remote_branches(main_checkout: &Path) -> Option<String> {
 /// Fetch `origin` and remove the remote branches that it does not have
 /// anymore. The fetch can ask the ssh agent for a key.
 pub fn fetch_prune(main_checkout: &Path) -> Result<(), Error> {
-    run_in(main_checkout, &["fetch", "--prune", "--quiet", "origin"]).map(|_| ())
+    // The popup shows fzf: git and ssh must not ask a question in the
+    // terminal. An ssh agent (1Password) can still give the key.
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(main_checkout)
+        .args(["fetch", "--prune", "--quiet", "origin"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    let output = process::output_with_limit(&mut command, GIT_TIME_LIMIT)
+        .map_err(|error| Error::Command(format!("git fetch: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Command(format!(
+            "git fetch: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
 }
 
 /// Return true if the checkout has no change that is not committed, or

@@ -130,7 +130,7 @@ sequenceDiagram
     Popup->>User: the question (popup confirm)
 ```
 
-- The list shows before any check. One call to wt and to git gives the facts of all the branches of a repository.
+- The list shows before any check. One call to wt (30 s at most) gives the integration of each worktree and the forge of a repository, with the forge config of worktrunk.
 - `every(0.1)` of fzf turns the spinners without a process. The cursor stays on its worktree when the list reloads.
 - After a question, the list comes back with the results of the last checks. A failed check runs again.
 - With `fetch_before_check = true`, the cleaner fetches `origin` first. Off by default: a fetch can ask the ssh agent (for example 1Password) for a key.
@@ -302,7 +302,7 @@ cargo test --locked
 shellcheck scripts/*.sh
 ```
 
-The images of this README come from `docs/make-images`: it records the popups with [VHS](https://github.com/charmbracelet/vhs) and [freeze](https://github.com/charmbracelet/freeze).
+The images of this README come from `docs/make-images`: it makes a demo repository, then records the popups with [VHS](https://github.com/charmbracelet/vhs).
 
 ## Release
 

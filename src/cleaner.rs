@@ -30,6 +30,7 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::forge;
 use crate::fzf;
@@ -38,6 +39,7 @@ use crate::github;
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
+use crate::process;
 use crate::stale::{self, OldWorktree, DAY};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
@@ -70,6 +72,8 @@ const WORKERS: usize = 8;
 /// Set when the popup closes without a choice: the checks stop writing
 /// the state file, so the plugin can remove it.
 static CHECKS_STOPPED: AtomicBool = AtomicBool::new(false);
+/// The time limit of the call to wt for the facts of a repository.
+const WT_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// The threads that list the checkouts of the workspaces.
 const LIST_THREADS: usize = 4;
 /// The id of the title of the group "To delete".
@@ -307,30 +311,44 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         (Some(branches), Some(remotes)) => leftover::parse_pushes(&branches, &remotes),
         _ => HashMap::new(),
     };
+    let listed = wt_list(main_checkout);
+    let integrations = listed
+        .as_ref()
+        .map(leftover::parse_integrations)
+        .unwrap_or_default();
+    // wt knows the forge, also a self-hosted one in its config.
+    let forge = match listed.as_ref().and_then(forge::from_worktrunk) {
+        Some(forge) => Ok(forge),
+        None => forge::from_origin(main_checkout),
+    };
     RepositoryFacts {
-        forge: forge::detect(main_checkout),
+        forge,
         default_branch: git::default_branch(main_checkout),
-        integrations: wt_integrations(main_checkout),
+        integrations,
         pushes,
     }
 }
 
-/// The integration of each branch, from one call to wt. If wt fails, each
-/// branch is undetermined.
-fn wt_integrations(main_checkout: &Path) -> HashMap<String, Integration> {
-    let output = Command::new("wt")
-        .arg("-C")
-        .arg(main_checkout)
-        .args(["list", "--format", "json", "--branches"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    match output {
-        Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout)
-            .map(|json| leftover::parse_integrations(&json))
-            .unwrap_or_default(),
-        _ => HashMap::new(),
+/// The JSON of `wt list` for the worktrees of a repository: the
+/// integration of each branch, and the forge. None if wt fails or takes
+/// more than 30 s. The config of the user must not change the JSON: schema
+/// 2, and no `--full` (no network, no summary by an LLM).
+fn wt_list(main_checkout: &Path) -> Option<Value> {
+    let mut command = Command::new("wt");
+    command.arg("-C").arg(main_checkout).args([
+        "--config-set",
+        "list.json-schema=2",
+        "--config-set",
+        "list.full=false",
+        "list",
+        "--format",
+        "json",
+    ]);
+    let output = process::output_with_limit(&mut command, WT_TIME_LIMIT).ok()?;
+    if !output.status.success() {
+        return None;
     }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Check one worktree, layer by layer, then give the verdict.
@@ -358,12 +376,12 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
         Ok(forge) => forge.provider.name().to_owned(),
         Err(_) => "no forge".to_owned(),
     };
-    facts.pull_requests = if facts.changes != Changes::None {
-        PullRequests::NotNeeded("the changes keep the worktree".to_owned())
-    } else if facts.push == Push::Never {
-        PullRequests::NotNeeded("never pushed".to_owned())
-    } else {
-        match &repository.forge {
+    facts.pull_requests = match facts.changes {
+        Changes::Some => PullRequests::NotNeeded("the changes keep the worktree".to_owned()),
+        Changes::Failed => PullRequests::NotNeeded("git status failed".to_owned()),
+        _ => match &repository.forge {
+            // A repository without a remote has no pull request.
+            Err(error) if error == forge::NO_REMOTE => PullRequests::NotNeeded(error.clone()),
             Err(error) => PullRequests::Failed(error.clone()),
             // A forge that does not answer gives "no answer" after 15 s:
             // the worktree stays, and the spinner stops.
@@ -374,7 +392,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
                 &entry.branch,
                 github::POPUP_TIME_LIMIT,
             )),
-        }
+        },
     };
     result.reason = leftover::verdict(&result.facts, stale_days);
     result
@@ -391,17 +409,14 @@ fn start_checks(
     stale_days: u32,
     fetch: bool,
 ) {
-    let todo: VecDeque<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.reason == Reason::Checking)
-        .map(|(index, _)| index)
-        .collect();
+    let todo = interleave(&entries);
     if todo.is_empty() {
         return;
     }
     // The facts of each repository, read once, by the first worker that
-    // needs them: the workers of the other repositories do not wait.
+    // needs them. The order of todo takes one worktree of each repository
+    // in turn: the first workers read the facts of several repositories at
+    // the same time.
     let repositories: Arc<HashMap<PathBuf, OnceLock<RepositoryFacts>>> = Arc::new(
         todo.iter()
             .map(|index| (entries[*index].main_checkout.clone(), OnceLock::new()))
@@ -443,6 +458,32 @@ fn start_checks(
     }
     drop(sender);
     thread::spawn(move || notify_fzf(&receiver, &socket, &reload_action));
+}
+
+/// The entries in check, one of each repository in turn.
+fn interleave(entries: &[Entry]) -> VecDeque<usize> {
+    let mut groups: Vec<(&Path, VecDeque<usize>)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.reason != Reason::Checking {
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|(main, _)| *main == entry.main_checkout.as_path())
+        {
+            Some((_, group)) => group.push_back(index),
+            None => groups.push((entry.main_checkout.as_path(), VecDeque::from([index]))),
+        }
+    }
+    let mut todo = VecDeque::new();
+    while groups.iter().any(|(_, group)| !group.is_empty()) {
+        for (_, group) in &mut groups {
+            if let Some(index) = group.pop_front() {
+                todo.push_back(index);
+            }
+        }
+    }
+    todo
 }
 
 /// Stop the checks: they do not write the state file anymore. The threads
@@ -1203,6 +1244,19 @@ mod tests {
     }
 
     #[test]
+    fn the_checks_take_one_worktree_of_each_repository_in_turn() {
+        let list = vec![
+            entry("a1", "alpha", Reason::Checking, None),
+            entry("a2", "alpha", Reason::Checking, None),
+            entry("a3", "alpha", Reason::Checking, None),
+            entry("done", "alpha", Reason::Old, Some(9)),
+            entry("z1", "zeta", Reason::Checking, None),
+        ];
+
+        assert_eq!(interleave(&list), [0, 4, 1, 2]);
+    }
+
+    #[test]
     fn the_state_file_keeps_each_entry() {
         let mut merged = entry("feat/a", "alpha", Reason::Merged, Some(3));
         merged.facts.pull_requests = PullRequests::Finished {
@@ -1320,7 +1374,7 @@ mod tests {
         assert_eq!(result.facts.push, Push::Never);
         assert_eq!(
             result.facts.pull_requests,
-            PullRequests::NotNeeded("never pushed".to_owned())
+            PullRequests::NotNeeded("no remote origin".to_owned())
         );
         assert_eq!(result.facts.changes, Changes::None);
         assert_eq!(result.reason, Reason::Recent);

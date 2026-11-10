@@ -211,8 +211,15 @@ pub fn verdict(facts: &Facts, stale_days: u32) -> Reason {
     if is_integrated && facts.days.is_some_and(|days| days >= INTEGRATED_MIN_DAYS) {
         return Reason::Integrated;
     }
-    let has_no_pull_request =
-        matches!(facts.pull_requests, PullRequests::None) || matches!(facts.push, Push::Never);
+    // A branch that was never pushed has no pull request, but only if the
+    // forge gives no answer: a push without -u, or to another name, can
+    // leave no remote branch here.
+    let forge_is_silent = matches!(
+        facts.pull_requests,
+        PullRequests::Failed(_) | PullRequests::NotChecked | PullRequests::NotNeeded(_)
+    );
+    let has_no_pull_request = matches!(facts.pull_requests, PullRequests::None)
+        || (matches!(facts.push, Push::Never) && forge_is_silent);
     if has_no_pull_request {
         return match facts.days {
             Some(days) if days >= u64::from(stale_days) => Reason::Old,
@@ -223,7 +230,7 @@ pub fn verdict(facts: &Facts, stale_days: u32) -> Reason {
     match facts.pull_requests {
         PullRequests::WorkAfter(_) => Reason::WorkAfter,
         PullRequests::InDefault(_) => Reason::InDefault,
-        _ if is_integrated => Reason::Recent,
+        _ if is_integrated && facts.days.is_some() => Reason::Recent,
         _ => Reason::Unknown,
     }
 }
@@ -292,7 +299,7 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
         Reason::Changes => "changes not committed".to_owned(),
         Reason::Agent => "an agent works here".to_owned(),
         Reason::WorkAfter => format!("work after PR {number}"),
-        Reason::InDefault => format!("PR {number} finished, activity today"),
+        Reason::InDefault => format!("PR {number} finished, commit in the default branch"),
         Reason::Unknown => format!("not checked: {}", unknown_detail(facts)),
     }
 }
@@ -475,7 +482,8 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
     };
     let activity = match facts.days {
         Some(days) => {
-            let limit = if matches!(reason, Reason::Integrated) {
+            // The rule of the integration has its own limit.
+            let limit = if matches!(facts.integration, Integration::Integrated(_)) {
                 INTEGRATED_MIN_DAYS
             } else {
                 u64::from(stale_days)
@@ -653,7 +661,7 @@ mod tests {
                 "a new worktree is integrated today: kept",
                 Facts {
                     integration: Integration::Integrated("same_commit".to_owned()),
-                    pull_requests: PullRequests::NotNeeded("never pushed".to_owned()),
+                    pull_requests: PullRequests::NotNeeded("no remote origin".to_owned()),
                     push: Push::Never,
                     days: Some(0),
                     ..facts()
@@ -670,13 +678,50 @@ mod tests {
                 Reason::Recent,
             ),
             (
-                "never pushed and old",
+                "never pushed, no remote, and old",
                 Facts {
                     push: Push::Never,
-                    pull_requests: PullRequests::NotNeeded("never pushed".to_owned()),
+                    pull_requests: PullRequests::NotNeeded("no remote origin".to_owned()),
                     ..facts()
                 },
                 Reason::Old,
+            ),
+            (
+                "never pushed here, but the forge has an open PR",
+                Facts {
+                    push: Push::Never,
+                    pull_requests: PullRequests::Open(5),
+                    ..facts()
+                },
+                Reason::Open,
+            ),
+            (
+                "never pushed and the forge failed: the age decides",
+                Facts {
+                    push: Push::Never,
+                    pull_requests: PullRequests::Failed("no backend for GitLab yet".to_owned()),
+                    ..facts()
+                },
+                Reason::Old,
+            ),
+            (
+                "the commit is in the default branch, but wt failed",
+                Facts {
+                    integration: Integration::Undetermined,
+                    pull_requests: PullRequests::InDefault(4),
+                    ..facts()
+                },
+                Reason::InDefault,
+            ),
+            (
+                "integrated without a date of activity",
+                Facts {
+                    integration: Integration::Integrated("ancestor".to_owned()),
+                    pull_requests: PullRequests::WorkAfter(4),
+                    days: None,
+                    ..facts()
+                },
+                Reason::WorkAfter,
             ),
             (
                 "the forge failed: not checked",
@@ -782,6 +827,30 @@ mod tests {
         assert_eq!(shown[4].source, "GitHub");
         assert_eq!(shown[5].text, "2 days without activity (limit: 1 day)");
         assert_eq!(shown[5].mark, Mark::Pass);
+    }
+
+    #[test]
+    fn an_integrated_worktree_kept_today_shows_the_limit_of_1_day() {
+        let kept = Facts {
+            integration: Integration::Integrated("same_commit".to_owned()),
+            days: Some(0),
+            ..facts()
+        };
+
+        let activity = &lines(&kept, Reason::Recent, 7)[5];
+
+        assert_eq!(activity.text, "0 days without activity (limit: 1 day)");
+        assert_eq!(activity.mark, Mark::Fail);
+        assert_eq!(
+            reason_text(
+                Reason::InDefault,
+                &Facts {
+                    pull_requests: PullRequests::InDefault(4),
+                    ..facts()
+                }
+            ),
+            "PR #4 finished, commit in the default branch"
+        );
     }
 
     #[test]

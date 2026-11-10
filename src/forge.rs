@@ -1,31 +1,30 @@
 //! The forge of a repository: its provider, and the backend that reads the
 //! pull requests of a branch.
 //!
-//! The provider comes from the host of the remote `origin`: a host with
-//! github, gitlab, gitea, forgejo or codeberg in its name, or Azure DevOps.
-//! A self-hosted host without such a name needs the forge config of
-//! worktrunk: `[forge] platform` in the project config (`.config/wt.toml`),
-//! or `forge.platform` in a `[projects."<host>/*"]` table of the user
-//! config of worktrunk. The plugin reads both with
-//! `wt config show --format json`.
+//! worktrunk knows the forge: `wt list --format json` gives `repo.forge`
+//! (provider, host, owner, name), with the forge config of the user
+//! (`forge.platform` for a self-hosted host). Without wt, the provider
+//! comes from the name of the host of `origin`.
 //!
 //! This version has a backend for GitHub only. The other providers give
 //! "no backend": the cleaner keeps their worktrees, except the leftovers
 //! that git proves.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::git;
-use crate::github;
+use crate::process;
 use crate::prune::{self, BranchStatus};
 
 /// The URL schemes of a remote. A remote without scheme has the form
 /// `[user@]host:owner/name`.
 const SCHEMES: [&str; 4] = ["ssh://", "https://", "http://", "git://"];
+/// The time limit of `ssh -G`, which reads only the config of ssh.
+const SSH_CONFIG_TIME_LIMIT: Duration = Duration::from_secs(5);
 
 /// The provider of a forge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,18 +50,19 @@ impl Provider {
         }
     }
 
-    /// The provider of a `forge.platform` value of worktrunk.
-    fn from_platform(platform: &str) -> Option<Provider> {
-        match platform {
-            "github" => Some(Provider::GitHub),
-            "gitlab" => Some(Provider::GitLab),
-            "gitea" | "forgejo" => Some(Provider::Gitea),
-            "azure-devops" => Some(Provider::AzureDevOps),
-            _ => None,
+    /// The provider of a `provider` value of worktrunk.
+    fn from_worktrunk(provider: &str) -> Provider {
+        match provider {
+            "github" => Provider::GitHub,
+            "gitlab" => Provider::GitLab,
+            "gitea" | "forgejo" => Provider::Gitea,
+            "azure-devops" => Provider::AzureDevOps,
+            _ => Provider::Unknown,
         }
     }
 
-    /// The provider of a host, from its name, as worktrunk does.
+    /// The provider of a host, from its name: the rule of worktrunk, and
+    /// the hosts of Forgejo and Codeberg.
     pub fn from_host(host: &str) -> Provider {
         let host = host.to_ascii_lowercase();
         if host.contains("github") {
@@ -100,40 +100,14 @@ pub fn split_remote(url: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// The address without its user: `git@github.com` gives `github.com`.
+/// The address without its user: `git@github.com:a/b` gives
+/// `github.com:a/b`. Only the host part can have a user: a `@` in the path
+/// stays.
 fn without_user(address: &str) -> &str {
-    match address.split_once('@') {
-        Some((_, rest)) => rest,
+    let host_end = address.find(['/', ':']).unwrap_or(address.len());
+    match address[..host_end].rfind('@') {
+        Some(at) => &address[at + 1..],
         None => address,
-    }
-}
-
-/// The provider that the forge config of worktrunk gives, from the JSON
-/// of `wt config show --format json`: the project config first, then the
-/// most specific `[projects."…"]` table of the user config that matches
-/// the identifier of the project (`<host>/<owner>/<repo>`).
-pub fn configured_provider(config: &Value) -> Option<Provider> {
-    let platform_of = |table: &Value| table["forge"]["platform"].as_str().map(str::to_owned);
-    if let Some(platform) = platform_of(&config["project"]["config"]) {
-        return Provider::from_platform(&platform);
-    }
-    let identifier = config["project"]["identifier"].as_str()?;
-    let projects = config["user"]["config"]["projects"].as_object()?;
-    projects
-        .iter()
-        .filter(|(pattern, _)| matches_identifier(pattern, identifier))
-        // The most specific pattern wins: the most characters that are not *.
-        .max_by_key(|(pattern, _)| pattern.chars().filter(|c| *c != '*').count())
-        .and_then(|(_, table)| platform_of(table))
-        .and_then(|platform| Provider::from_platform(&platform))
-}
-
-/// Return true if a key of `[projects."…"]` matches an identifier: the same
-/// text, or a prefix that ends with `*`.
-fn matches_identifier(pattern: &str, identifier: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => identifier.starts_with(prefix),
-        None => pattern == identifier,
     }
 }
 
@@ -141,42 +115,62 @@ fn matches_identifier(pattern: &str, identifier: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryForge {
     pub provider: Provider,
-    /// The repository on the forge (`owner/name`), when the backend needs
-    /// it.
+    /// The host of the forge, after the ssh aliases.
+    pub host: String,
+    /// The repository on the forge: `owner/name`.
     pub repository: Option<String>,
 }
 
-/// Find the forge of the repository of `main_checkout`. An error tells
-/// why the cleaner cannot ask a forge (no remote `origin`).
-pub fn detect(main_checkout: &Path) -> Result<RepositoryForge, String> {
-    let url = git::origin_url(main_checkout).ok_or_else(|| "no remote origin".to_owned())?;
-    let host = split_remote(&url)
-        .map(|(host, _)| host.to_owned())
-        .ok_or_else(|| format!("cannot read the remote {url}"))?;
-    let provider = worktrunk_config(main_checkout)
-        .as_ref()
-        .and_then(configured_provider)
-        .unwrap_or_else(|| Provider::from_host(&host));
-    Ok(RepositoryForge {
+/// The forge that `wt list --format json` gives in `repo.forge`.
+pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
+    let forge = &json["repo"]["forge"];
+    let provider = Provider::from_worktrunk(forge["provider"].as_str()?);
+    let host = forge["host"].as_str().unwrap_or_default().to_owned();
+    let repository = match (forge["owner"].as_str(), forge["name"].as_str()) {
+        (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
+            Some(format!("{owner}/{name}"))
+        }
+        _ => None,
+    };
+    Some(RepositoryForge {
         provider,
-        repository: github::repository_of(&url),
+        host,
+        repository,
     })
 }
 
-/// The JSON of `wt config show`, in the repository. None if wt fails.
-fn worktrunk_config(main_checkout: &Path) -> Option<Value> {
-    let output = Command::new("wt")
-        .arg("-C")
-        .arg(main_checkout)
-        .args(["config", "show", "--format", "json"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
+/// The forge of the remote `origin`, without wt: the provider from the
+/// name of the host. An error tells why the checks cannot ask a forge.
+pub fn from_origin(main_checkout: &Path) -> Result<RepositoryForge, String> {
+    let url = git::origin_url(main_checkout).ok_or_else(|| NO_REMOTE.to_owned())?;
+    let (host, path) = split_remote(&url).ok_or_else(|| format!("cannot read the remote {url}"))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    Ok(RepositoryForge {
+        provider: Provider::from_host(host),
+        host: host.to_owned(),
+        repository: Some(path.to_owned()).filter(|path| path.contains('/')),
+    })
+}
+
+/// The error of a repository without a remote `origin`: its branches can
+/// have no pull request.
+pub const NO_REMOTE: &str = "no remote origin";
+
+/// The host behind an ssh alias (`Host github-work` in `~/.ssh/config`),
+/// from `ssh -G`. The host itself if ssh does not know it.
+fn real_host(host: &str) -> String {
+    let mut command = Command::new("ssh");
+    command.args(["-G", host]);
+    process::output_with_limit(&mut command, SSH_CONFIG_TIME_LIMIT)
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix("hostname ").map(str::to_owned))
+        })
+        .unwrap_or_else(|| host.to_owned())
 }
 
 /// The status of the pull requests of `branch`, from the backend of the
@@ -191,10 +185,18 @@ pub fn branch_status(
 ) -> Result<BranchStatus, String> {
     match forge.provider {
         Provider::GitHub => {
+            let host = if forge.host == "github.com" {
+                forge.host.clone()
+            } else {
+                real_host(&forge.host)
+            };
+            if host != "github.com" {
+                return Err(format!("GitHub on {host} has no backend yet"));
+            }
             let repository = forge
                 .repository
                 .as_deref()
-                .ok_or_else(|| "GitHub Enterprise has no backend yet".to_owned())?;
+                .ok_or_else(|| "no owner and name for the repository on GitHub".to_owned())?;
             prune::branch_status(main_checkout, repository, default_branch, branch, limit)
                 .map_err(|error| error.to_string().replace('\n', " "))
         }
@@ -210,7 +212,7 @@ mod tests {
     fn the_provider_comes_from_the_name_of_the_host() {
         let cases = [
             ("github.com", Provider::GitHub),
-            ("github.example.com", Provider::GitHub),
+            ("github-work", Provider::GitHub),
             ("gitlab.com", Provider::GitLab),
             ("gitlab.company.example", Provider::GitLab),
             ("gitea.com", Provider::Gitea),
@@ -245,6 +247,12 @@ mod tests {
                 "https://user@codeberg.org/owner/name",
                 ("codeberg.org", "owner/name"),
             ),
+            // A @ in the path is not a user.
+            (
+                "git@github.com:owner/name@v2.git",
+                ("github.com", "owner/name@v2.git"),
+            ),
+            ("https://example.org/team/a@b", ("example.org", "team/a@b")),
         ];
         for (url, expected) in cases {
             assert_eq!(split_remote(url), Some(expected), "{url}");
@@ -252,44 +260,28 @@ mod tests {
         assert_eq!(split_remote("/local/path"), None);
     }
 
-    fn config(project: Value, projects: Value) -> Value {
-        serde_json::json!({
-            "project": { "identifier": "git.company.example/platform/app", "config": project },
-            "user": { "config": { "projects": projects } },
-        })
-    }
-
     #[test]
-    fn the_config_of_worktrunk_gives_the_provider_of_a_self_hosted_forge() {
-        let projects = serde_json::json!({
-            "git.company.example/*": { "forge": { "platform": "gitlab" } },
-            "git.company.example/platform/*": { "forge": { "platform": "gitea" } },
-            "other.example/*": { "forge": { "platform": "github" } },
-        });
+    fn the_json_of_wt_gives_the_forge() {
+        let json: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/wt-list.json")).unwrap();
 
-        // The most specific table wins.
         assert_eq!(
-            configured_provider(&config(Value::Null, projects.clone())),
-            Some(Provider::Gitea)
+            from_worktrunk(&json),
+            Some(RepositoryForge {
+                provider: Provider::GitLab,
+                host: "git.company.example".to_owned(),
+                repository: Some("team/app".to_owned()),
+            })
         );
-        // The project config wins over the user config.
-        let project = serde_json::json!({ "forge": { "platform": "azure-devops" } });
-        assert_eq!(
-            configured_provider(&config(project, projects)),
-            Some(Provider::AzureDevOps)
-        );
-        // No table: the host decides.
-        assert_eq!(
-            configured_provider(&config(Value::Null, serde_json::json!({}))),
-            None
-        );
+        assert_eq!(from_worktrunk(&serde_json::json!({ "repo": {} })), None);
     }
 
     #[test]
     fn a_provider_without_backend_gives_an_error() {
         let forge = RepositoryForge {
             provider: Provider::GitLab,
-            repository: None,
+            host: "gitlab.com".to_owned(),
+            repository: Some("team/app".to_owned()),
         };
 
         let status = branch_status(

@@ -9,8 +9,9 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
-binary=$(realpath "${1:-$root/target/release/herdr-worktrunk}")
+binary=${1:-$root/target/release/herdr-worktrunk}
 [ -x "$binary" ] || { echo "no binary at $binary: run cargo build --release" >&2; exit 1; }
+binary=$(realpath "$binary")
 command -v vhs >/dev/null || { echo "VHS is necessary: brew install vhs" >&2; exit 1; }
 
 demo=$(mktemp -d "${TMPDIR:-/tmp}/herdr-worktrunk-demo.XXXXXX")
