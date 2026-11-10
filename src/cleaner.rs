@@ -961,7 +961,6 @@ fn scope_of(entries: &[Entry]) -> String {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Choice {
     Delete(Box<Entry>),
-    /// The worktrees of the group "To delete".
     /// Delete the group To delete: `leftovers` reads it in the state file.
     DeleteAll,
 }

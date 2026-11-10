@@ -42,7 +42,6 @@ const TITLE_VARIABLE: &str = "TRUNK_MESSAGE_TITLE";
 const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 /// The reason of a question that the observer asks (an old worktree).
 const REASON_VARIABLE: &str = "TRUNK_REASON";
-/// The file of the worktrees that the popup confirm deletes together.
 /// A deletion of the popup cleaner: the idle agents of the worktree close
 /// first. The cleaner gives it only to a worktree with a proof of the end.
 const CLOSE_IDLE_VARIABLE: &str = "TRUNK_CLOSE_IDLE_AGENTS";
@@ -639,6 +638,9 @@ pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
             Ok(())
         }
         Some(cleaner::Choice::DeleteAll) => {
+            // The group To delete stays as the user saw it: the checks write
+            // the state file no more.
+            cleaner::stop_checks();
             environment.push((OPERATION_VARIABLE, DELETE_ALL));
             open_after_this_popup("confirm", &folder, &environment)
         }

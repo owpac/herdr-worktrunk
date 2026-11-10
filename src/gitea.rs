@@ -60,9 +60,6 @@ pub enum Flavor {
 /// answers in the tests.
 type Call = Box<dyn Fn(&str) -> Result<Response, Error> + Send + Sync>;
 
-/// How long the process keeps the default branch of a repository.
-const DEFAULT_BRANCH_LIFETIME: Duration = Duration::from_secs(60 * 60);
-
 /// The backend of a repository on a Gitea or Forgejo host.
 pub struct Gitea {
     /// The host of the API, with its port: `codeberg.org`.
@@ -71,6 +68,8 @@ pub struct Gitea {
     repository: String,
     flavor: Flavor,
     call: Call,
+    /// The default branch of the repository, from the forge.
+    default_branch: Mutex<Option<String>>,
     /// The open pull requests of the repository, on Gitea: one read for
     /// all the branches of a check. Never kept longer: a new pull request
     /// must keep its worktree.
@@ -122,6 +121,7 @@ impl Gitea {
             repository,
             flavor,
             call,
+            default_branch: Mutex::default(),
             open: Mutex::default(),
             commits: Mutex::default(),
         }
@@ -167,21 +167,17 @@ impl Gitea {
         format!("/repos/{}", self.repository)
     }
 
-    /// The default branch of the repository. The process keeps it for one
-    /// hour: the observer makes a new backend at each pass.
+    /// The default branch of the repository. The backend reads it once: a
+    /// new backend (a new pass of the observer) reads it again, also after
+    /// a rename.
     fn default_branch(&self) -> Result<String, Error> {
-        type Known = HashMap<(String, String), (Instant, String)>;
-        static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
-        let known = KNOWN.get_or_init(Mutex::default);
-        let key = (self.host.clone(), self.repository.clone());
-        if let Some((time, branch)) = lock(known).get(&key) {
-            if time.elapsed() < DEFAULT_BRANCH_LIFETIME {
-                return Ok(branch.clone());
-            }
+        let mut known = lock(&self.default_branch);
+        if let Some(branch) = known.as_ref() {
+            return Ok(branch.clone());
         }
         let (body, _) = self.found(&self.repository_endpoint())?;
         let branch = parse_default_branch(&body)?;
-        lock(known).insert(key, (Instant::now(), branch.clone()));
+        *known = Some(branch.clone());
         Ok(branch)
     }
 
@@ -264,29 +260,27 @@ impl Gitea {
     /// that is not complete keeps its newest commits: the proof can then
     /// miss an old commit, and the worktree stays.
     ///
-    /// The process keeps the list: the commits of a finished pull request
-    /// do not change. `listed_head` (the commit of the branch in the list)
-    /// is in the key: a pull request that opens again, and gets new
-    /// commits, gets a new key.
-    fn pull_request_commits(&self, number: u64, listed_head: &str) -> Result<Vec<String>, Error> {
-        type Known = HashMap<(String, String, u64, String), Vec<String>>;
+    /// The process keeps the commits of a merged pull request: they never
+    /// change, and the pull request cannot open again. A closed pull request
+    /// can open again and get new commits: the backend reads it each time.
+    fn pull_request_commits(&self, number: u64, merged: bool) -> Result<Vec<String>, Error> {
+        type Known = HashMap<(String, String, u64), Vec<String>>;
         static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
         let known = KNOWN.get_or_init(Mutex::default);
-        let key = (
-            self.host.clone(),
-            self.repository.clone(),
-            number,
-            listed_head.to_owned(),
-        );
-        if let Some(commits) = lock(known).get(&key) {
-            return Ok(commits.clone());
+        let key = (self.host.clone(), self.repository.clone(), number);
+        if merged {
+            if let Some(commits) = lock(known).get(&key) {
+                return Ok(commits.clone());
+            }
         }
         let endpoint = format!(
             "{}/pulls/{number}/commits?files=false&verification=false",
             self.repository_endpoint()
         );
         let (commits, _) = self.read_list(&endpoint, parse_commits)?;
-        lock(known).insert(key, commits.clone());
+        if merged {
+            lock(known).insert(key, commits.clone());
+        }
         Ok(commits)
     }
 }
@@ -310,8 +304,8 @@ impl Backend for Gitea {
             } else {
                 // The commit of the branch now is not the last commit of a
                 // finished pull request.
-                let listed_head = pull.head.sha.clone().unwrap_or_default();
-                let commits = self.pull_request_commits(pull.number, &listed_head)?;
+                let merged = state == PullRequestState::Merged;
+                let commits = self.pull_request_commits(pull.number, merged)?;
                 let head = commits.first().cloned().unwrap_or_default();
                 lock(&self.commits).insert(head.clone(), commits);
                 head
@@ -1013,5 +1007,29 @@ mod tests {
         // The second backend (the next pass of the observer) reads only the list.
         assert_eq!(lock(&second.calls).as_slice(), [PULLS_OF_X]);
         assert!(second.gitea.contains("c1", "c1"));
+    }
+
+    #[test]
+    fn the_commits_of_a_closed_pull_request_are_read_each_time() {
+        let answers = || {
+            vec![
+                (
+                    PULLS_OF_X.to_owned(),
+                    ok(
+                        serde_json::json!([pull(11, "closed", false, "feat/x", "now")]),
+                        Some(1),
+                    ),
+                ),
+                (commits_page(11, 1), ok(commits(&["c1"]), Some(1))),
+            ]
+        };
+        let first = fake("closed.example", Flavor::Forgejo, answers());
+        let second = fake("closed.example", Flavor::Forgejo, answers());
+
+        first.gitea.pull_requests("feat/x").unwrap();
+        second.gitea.pull_requests("feat/x").unwrap();
+
+        // It can open again and get new commits: no cache.
+        assert_eq!(lock(&second.calls).len(), 2);
     }
 }
