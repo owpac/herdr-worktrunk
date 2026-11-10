@@ -1,0 +1,18 @@
+{
+  "number": 1117,
+  "title": "chore(deps): pin dependencies",
+  "state": "closed",
+  "merged": true,
+  "html_url": "https://gitea.com/gitea/runner/pulls/1117",
+  "head": {
+    "label": "renovate/dependencies",
+    "ref": "refs/pull/1117/head",
+    "sha": "ad7b5b0b346be79a511f251852884f38ac25cc33",
+    "repo_id": 35024
+  },
+  "base": {
+    "label": "main",
+    "ref": "main",
+    "repo_id": 35024
+  }
+}

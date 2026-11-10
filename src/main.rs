@@ -16,6 +16,7 @@ mod config;
 mod forge;
 mod fzf;
 mod git;
+mod gitea;
 mod github;
 mod gitlab;
 mod herdr;

@@ -1,0 +1,128 @@
+[
+  {
+    "number": 1407,
+    "title": "refactor!: remove the builtin actions",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1407",
+    "head": {
+      "label": "remove-builtin-actions",
+      "ref": "remove-builtin-actions",
+      "sha": "ad7d453053e6da95dd70e875fb4a36681fc2d745",
+      "repo_id": 128211
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  },
+  {
+    "number": 1402,
+    "title": "enhance: add host.stable_workdir for predictable host job paths",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1402",
+    "head": {
+      "label": "enhance/stable-host-workdir",
+      "ref": "enhance/stable-host-workdir",
+      "sha": "835b43f8c53b0fa2e2d5f9ad0fc5099cacac6e32",
+      "repo_id": 128211
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  },
+  {
+    "number": 1401,
+    "title": "enhance: add per_slot tool cache mode",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1401",
+    "head": {
+      "label": "enhance/tool-cache-per-slot",
+      "ref": "enhance/tool-cache-per-slot",
+      "sha": "b67ea49abc010d6d427707b0727eed22accf4903",
+      "repo_id": 128211
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  },
+  {
+    "number": 1400,
+    "title": "enhance: run JavaScript actions from a host Node with container.node_dir",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1400",
+    "head": {
+      "label": "enhance/host-node-dir",
+      "ref": "enhance/host-node-dir",
+      "sha": "fee3de3a5bdb165261febd021d8af8f7c33d7117",
+      "repo_id": 128211
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  },
+  {
+    "number": 1395,
+    "title": "fix!: remove the dbfs log workaround and require Gitea 1.26.2",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1395",
+    "head": {
+      "label": "fix/remove-dbfs-workaround",
+      "ref": "fix/remove-dbfs-workaround",
+      "sha": "fa09cc518ad1e5e6cc5d2836e4b0aad700560f03",
+      "repo_id": 128211
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  },
+  {
+    "number": 1246,
+    "title": "WIP: feat: Container hooks: delegate container lifecycle to an external entrypoint (K8s and other backends)",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1246",
+    "head": {
+      "label": "feature/1245-container-hooks",
+      "ref": "feature/1245-container-hooks",
+      "sha": "9b12ba05f80af72ec6073bd5820630b6e45d38cc",
+      "repo_id": 144600
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  },
+  {
+    "number": 1210,
+    "title": "WIP: enhance: add macOS VM executor backend",
+    "state": "open",
+    "merged": false,
+    "html_url": "https://gitea.com/gitea/runner/pulls/1210",
+    "head": {
+      "label": "enhance/macos-vm-executor",
+      "ref": "enhance/macos-vm-executor",
+      "sha": "de9db9c0fad931bc0d2dced7de1651f418657eff",
+      "repo_id": 35024
+    },
+    "base": {
+      "label": "main",
+      "ref": "main",
+      "repo_id": 35024
+    }
+  }
+]

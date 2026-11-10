@@ -1,0 +1,35 @@
+[
+  {
+    "sha": "4e4a0632a2a8b133eadef6cc6f6ab0dceed395f2",
+    "commit": {
+      "message": "commit 1 of the pull request"
+    },
+    "parents": [
+      {
+        "sha": "50dd30d8502f3938fa17b353a598d9f4ed7c62ae"
+      }
+    ]
+  },
+  {
+    "sha": "50dd30d8502f3938fa17b353a598d9f4ed7c62ae",
+    "commit": {
+      "message": "commit 2 of the pull request"
+    },
+    "parents": [
+      {
+        "sha": "afec2b0640db9faba069d57a3c17a73eed1a70af"
+      }
+    ]
+  },
+  {
+    "sha": "afec2b0640db9faba069d57a3c17a73eed1a70af",
+    "commit": {
+      "message": "commit 3 of the pull request"
+    },
+    "parents": [
+      {
+        "sha": "d1174b5eeb4844bdc97f71763a0cfb07c99d41ec"
+      }
+    ]
+  }
+]

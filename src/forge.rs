@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::git;
+use crate::gitea::{Flavor, Gitea};
 use crate::github::GitHub;
 use crate::gitlab::GitLab;
 use crate::herdr::Error;
 use crate::process;
-use crate::prune::{self, BranchStatus};
 use crate::wt;
 
 /// The URL schemes of a remote. A remote without scheme has the form
@@ -55,8 +55,9 @@ pub struct PullRequest {
     pub head: String,
 }
 
-/// The calls to one forge, for one repository.
-pub trait Backend {
+/// The calls to one forge, for one repository. The threads of the cleaner
+/// share one backend for each repository.
+pub trait Backend: Send + Sync {
     /// The pull requests of `branch` in the repository itself, in all the
     /// states, the newest first. A pull request from a fork does not count.
     fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error>;
@@ -83,8 +84,9 @@ const OBSERVER_FORGE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 pub enum Provider {
     GitHub,
     GitLab,
-    /// Gitea, Forgejo and Codeberg.
     Gitea,
+    /// Forgejo, and Codeberg, its public host.
+    Forgejo,
     AzureDevOps,
     /// A host that the plugin does not know.
     Unknown,
@@ -97,6 +99,7 @@ impl Provider {
             Provider::GitHub => "GitHub",
             Provider::GitLab => "GitLab",
             Provider::Gitea => "Gitea",
+            Provider::Forgejo => "Forgejo",
             Provider::AzureDevOps => "Azure DevOps",
             Provider::Unknown => "an unknown forge",
         }
@@ -107,7 +110,8 @@ impl Provider {
         match provider {
             "github" => Provider::GitHub,
             "gitlab" => Provider::GitLab,
-            "gitea" | "forgejo" => Provider::Gitea,
+            "gitea" => Provider::Gitea,
+            "forgejo" => Provider::Forgejo,
             "azure-devops" => Provider::AzureDevOps,
             _ => Provider::Unknown,
         }
@@ -121,10 +125,9 @@ impl Provider {
             Provider::GitHub
         } else if host.contains("gitlab") {
             Provider::GitLab
-        } else if ["gitea", "forgejo", "codeberg"]
-            .iter()
-            .any(|name| host.contains(name))
-        {
+        } else if host.contains("forgejo") || host.contains("codeberg") {
+            Provider::Forgejo
+        } else if host.contains("gitea") {
             Provider::Gitea
         } else if host == "dev.azure.com"
             || host == "ssh.dev.azure.com"
@@ -182,8 +185,13 @@ pub struct RepositoryForge {
 /// The forge that `wt list --format json` gives in `repo.forge`.
 pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
     let forge = &json["repo"]["forge"];
-    let provider = Provider::from_worktrunk(forge["provider"].as_str()?);
     let host = forge["host"].as_str().unwrap_or_default().to_owned();
+    // wt does not know some hosts, for example codeberg.org: their name
+    // then gives the provider.
+    let provider = match Provider::from_worktrunk(forge["provider"].as_str()?) {
+        Provider::Unknown => Provider::from_host(&host),
+        provider => provider,
+    };
     let repository = match (forge["owner"].as_str(), forge["name"].as_str()) {
         (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
             Some(format!("{owner}/{name}"))
@@ -337,23 +345,42 @@ pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backe
             repository()?,
             limit,
         ))),
+        Provider::Gitea | Provider::Forgejo => {
+            let (flavor, public_host) = if forge.provider == Provider::Gitea {
+                (Flavor::Gitea, "gitea.com")
+            } else {
+                (Flavor::Forgejo, "codeberg.org")
+            };
+            let repository = repository()?;
+            if repository.matches('/').count() != 1 {
+                return Err(format!(
+                    "no owner and name for the repository on {provider}: {repository}"
+                ));
+            }
+            Ok(Box::new(Gitea::new(
+                api_host(forge, public_host)?,
+                repository,
+                flavor,
+                limit,
+            )))
+        }
         _ => Err(format!("no backend for {provider} yet")),
     }
 }
 
-/// The status of the pull requests of `branch`, from the backend of the
-/// provider. An error tells why the forge gave no answer: no backend, the
-/// CLI failed, a time limit.
-pub fn branch_status(
-    forge: &RepositoryForge,
-    main_checkout: &Path,
-    default_branch: Option<&str>,
-    branch: &str,
-    limit: Duration,
-) -> Result<BranchStatus, String> {
-    let backend = backend(forge, limit)?;
-    prune::branch_status(main_checkout, backend.as_ref(), default_branch, branch)
-        .map_err(|error| error.to_string().replace('\n', " "))
+/// Encode a value for a path segment or a query of a URL: each byte
+/// outside the unreserved characters of RFC 3986 becomes `%XX`. The braces
+/// get encoded too: tea replaces `{owner}`, `{repo}` and `{branch}`.
+pub fn encode_url_part(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -368,8 +395,8 @@ mod tests {
             ("gitlab.com", Provider::GitLab),
             ("gitlab.company.example", Provider::GitLab),
             ("gitea.com", Provider::Gitea),
-            ("codeberg.org", Provider::Gitea),
-            ("forgejo.example.org", Provider::Gitea),
+            ("codeberg.org", Provider::Forgejo),
+            ("forgejo.example.org", Provider::Forgejo),
             ("dev.azure.com", Provider::AzureDevOps),
             ("ssh.dev.azure.com", Provider::AzureDevOps),
             ("team.visualstudio.com", Provider::AzureDevOps),
@@ -467,6 +494,28 @@ mod tests {
     }
 
     #[test]
+    fn a_host_that_wt_does_not_know_gets_the_provider_of_its_name() {
+        // The answer of wt for a remote on codeberg.org.
+        let json = serde_json::json!({ "repo": { "forge": {
+            "url": "https://codeberg.org/forgejo/forgejo",
+            "provider": "unknown",
+            "host": "codeberg.org",
+            "owner": "forgejo",
+            "name": "forgejo",
+            "remote": "origin"
+        } } });
+
+        assert_eq!(
+            from_worktrunk(&json),
+            Some(RepositoryForge {
+                provider: Provider::Forgejo,
+                host: "codeberg.org".to_owned(),
+                repository: Some("forgejo/forgejo".to_owned()),
+            })
+        );
+    }
+
+    #[test]
     fn the_json_of_wt_gives_the_forge() {
         let json: Value =
             serde_json::from_str(include_str!("../tests/fixtures/wt-list.json")).unwrap();
@@ -485,20 +534,25 @@ mod tests {
     #[test]
     fn a_provider_without_backend_gives_an_error() {
         let forge = RepositoryForge {
-            provider: Provider::Gitea,
-            host: "codeberg.org".to_owned(),
+            provider: Provider::AzureDevOps,
+            host: "dev.azure.com".to_owned(),
             repository: Some("team/app".to_owned()),
         };
 
-        let status = branch_status(
-            &forge,
-            Path::new("/work/app"),
-            None,
-            "feat",
-            Duration::from_secs(1),
+        assert_eq!(
+            backend(&forge, Duration::from_secs(1)).err(),
+            Some("no backend for Azure DevOps yet".to_owned())
         );
+    }
 
-        assert_eq!(status, Err("no backend for Gitea yet".to_owned()));
+    #[test]
+    fn encode_url_part_keeps_only_the_unreserved_characters() {
+        assert_eq!(encode_url_part("group/sub/app"), "group%2Fsub%2Fapp");
+        assert_eq!(encode_url_part("feat/forge-layers"), "feat%2Fforge-layers");
+        assert_eq!(encode_url_part("v1.2_x~y"), "v1.2_x~y");
+        assert_eq!(encode_url_part("a+b c&d=e#f"), "a%2Bb%20c%26d%3De%23f");
+        assert_eq!(encode_url_part("é"), "%C3%A9");
+        assert_eq!(encode_url_part("feat/{branch}"), "feat%2F%7Bbranch%7D");
     }
 
     #[test]
@@ -516,6 +570,16 @@ mod tests {
         };
         assert!(backend(&github, limit).is_ok());
         assert!(backend(&forge(Provider::GitLab, "gitlab.com"), limit).is_ok());
+        let codeberg = RepositoryForge {
+            repository: Some("forgejo/forgejo".to_owned()),
+            ..forge(Provider::Forgejo, "codeberg.org")
+        };
+        assert!(backend(&codeberg, limit).is_ok());
+        // Gitea has no subgroups.
+        assert_eq!(
+            backend(&forge(Provider::Gitea, "gitea.com"), limit).err(),
+            Some("no owner and name for the repository on Gitea: group/sub/app".to_owned())
+        );
         assert_eq!(
             backend(&forge(Provider::GitLab, ""), limit).err(),
             Some("no host for GitLab".to_owned())
