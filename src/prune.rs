@@ -32,7 +32,6 @@ use std::path::{Path, PathBuf};
 
 use crate::forge::{self, Backend, PullRequest, PullRequestState};
 use crate::git::{self, LinkedWorktree};
-use crate::github::{self, GitHub};
 use crate::herdr::Error;
 use crate::stale::OldWorktree;
 
@@ -118,13 +117,11 @@ pub fn finished_pull_request<'a>(
     finished.find(|pull_request| head_contains(&pull_request.head))
 }
 
-/// The repository on GitHub of the remote `origin` of `main_checkout`,
-/// as `owner/name`.
-pub fn github_repository(main_checkout: &Path) -> Result<String, Error> {
-    let origin_url = git::origin_url(main_checkout)
-        .ok_or_else(|| Error::Command("no remote origin".to_owned()))?;
-    github::repository_of(&origin_url)
-        .ok_or_else(|| Error::Command(format!("origin is not on github.com: {origin_url}")))
+/// The backend of the forge of `main_checkout`, for the observer.
+fn repository_backend(main_checkout: &Path) -> Result<Box<dyn Backend>, Error> {
+    forge::of_repository(main_checkout)
+        .and_then(|forge| forge::backend(&forge, forge::BACKGROUND_TIME_LIMIT))
+        .map_err(Error::Command)
 }
 
 /// The pull requests of a branch, as the observer and the cleaner see
@@ -225,16 +222,13 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
     if worktrees.is_empty() {
         return Ok(Check::default());
     }
-    let backend = GitHub::new(
-        github_repository(main_checkout)?,
-        forge::BACKGROUND_TIME_LIMIT,
-    );
+    let backend = repository_backend(main_checkout)?;
     let default_branch = git::default_branch(main_checkout);
     let mut check = Check::default();
     for worktree in worktrees {
         match branch_status(
             main_checkout,
-            &backend,
+            backend.as_ref(),
             default_branch.as_deref(),
             &worktree.branch,
         )? {
@@ -268,10 +262,7 @@ pub fn without_pull_request(
     if old.is_empty() {
         return Ok(old);
     }
-    let backend = GitHub::new(
-        github_repository(main_checkout)?,
-        forge::BACKGROUND_TIME_LIMIT,
-    );
+    let backend = repository_backend(main_checkout)?;
     let mut kept = Vec::new();
     for worktree in old {
         if backend.pull_requests(&worktree.branch)?.is_empty() {

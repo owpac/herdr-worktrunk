@@ -3,10 +3,37 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::herdr::Error;
+use crate::process;
+
+/// The time limit of `wt list`: it reads git for each worktree.
+const LIST_TIME_LIMIT: Duration = Duration::from_secs(30);
+
+/// The JSON of `wt list` for the worktrees of a repository: the merge of
+/// each branch, and the forge. None if wt fails or takes more than 30 s.
+/// The config of the user must not change the JSON: schema 2, and no
+/// `--full` (no network, no summary by an LLM).
+pub fn list_json(main_checkout: &Path) -> Option<Value> {
+    let mut command = Command::new("wt");
+    command.arg("-C").arg(main_checkout).args([
+        "--config-set",
+        "list.json-schema=2",
+        "--config-set",
+        "list.full=false",
+        "list",
+        "--format",
+        "json",
+    ]);
+    let output = process::output_with_limit(&mut command, LIST_TIME_LIMIT).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
 
 /// Open the worktree of `branch` with wt (wt creates it if necessary),
 /// and return its path. With `is_new_branch`, wt also creates the branch

@@ -30,7 +30,6 @@ use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::forge;
 use crate::fzf;
@@ -38,11 +37,11 @@ use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
-use crate::process;
 use crate::stale::{self, OldWorktree, DAY};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
+use crate::wt;
 
 const DELETE_ALL_REQUEST: &str = "delete-all";
 const GHOST: &str = "worktree — type to filter";
@@ -71,8 +70,6 @@ const WORKERS: usize = 8;
 /// Set when the popup closes without a choice: the checks stop writing
 /// the state file, so the plugin can remove it.
 static CHECKS_STOPPED: AtomicBool = AtomicBool::new(false);
-/// The time limit of the call to wt for the facts of a repository.
-const WT_TIME_LIMIT: Duration = Duration::from_secs(30);
 /// The threads that list the checkouts of the workspaces.
 const LIST_THREADS: usize = 4;
 /// The id of the title of the group "To delete".
@@ -325,7 +322,7 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         (Some(branches), Some(remotes)) => leftover::parse_pushes(&branches, &remotes),
         _ => HashMap::new(),
     };
-    let listed = wt_list(main_checkout);
+    let listed = wt::list_json(main_checkout);
     let integrations = listed.as_ref().map(leftover::parse_integrations);
     let default_branch = git::default_branch(main_checkout);
     let main_name = listed
@@ -348,28 +345,6 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
         integrations,
         pushes,
     }
-}
-
-/// The JSON of `wt list` for the worktrees of a repository: the
-/// integration of each branch, and the forge. None if wt fails or takes
-/// more than 30 s. The config of the user must not change the JSON: schema
-/// 2, and no `--full` (no network, no summary by an LLM).
-fn wt_list(main_checkout: &Path) -> Option<Value> {
-    let mut command = Command::new("wt");
-    command.arg("-C").arg(main_checkout).args([
-        "--config-set",
-        "list.json-schema=2",
-        "--config-set",
-        "list.full=false",
-        "list",
-        "--format",
-        "json",
-    ]);
-    let output = process::output_with_limit(&mut command, WT_TIME_LIMIT).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Check one worktree, layer by layer, then give the verdict.

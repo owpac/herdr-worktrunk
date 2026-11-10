@@ -18,9 +18,11 @@ use serde_json::Value;
 
 use crate::git;
 use crate::github::GitHub;
+use crate::gitlab::GitLab;
 use crate::herdr::Error;
 use crate::process;
 use crate::prune::{self, BranchStatus};
+use crate::wt;
 
 /// The URL schemes of a remote. A remote without scheme has the form
 /// `[user@]host:owner/name`.
@@ -182,19 +184,42 @@ pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
 /// name of the host. An error tells why the checks cannot ask a forge.
 pub fn from_origin(main_checkout: &Path) -> Result<RepositoryForge, String> {
     let url = git::origin_url(main_checkout).ok_or_else(|| NO_REMOTE.to_owned())?;
-    let (host, path) = split_remote(&url).ok_or_else(|| format!("cannot read the remote {url}"))?;
+    from_remote(&url).ok_or_else(|| format!("cannot read the remote {url}"))
+}
+
+/// The forge of a remote URL, from the name of its host. None for a local
+/// path.
+fn from_remote(url: &str) -> Option<RepositoryForge> {
+    let (host, path) = split_remote(url)?;
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
-    Ok(RepositoryForge {
+    let has_owner_and_name = path
+        .split_once('/')
+        .is_some_and(|(owner, name)| !owner.is_empty() && !name.is_empty());
+    Some(RepositoryForge {
         provider: Provider::from_host(host),
         host: host.to_owned(),
-        repository: Some(path.to_owned()).filter(|path| path.contains('/')),
+        repository: has_owner_and_name.then(|| path.to_owned()),
     })
 }
 
 /// The error of a repository without a remote `origin`: its branches can
 /// have no pull request.
 pub const NO_REMOTE: &str = "no remote origin";
+
+/// The forge of a repository, for the observer: from the host of `origin`
+/// first. If the host has an unknown name, wt gives the forge, with the
+/// forge config of the user (`forge.platform` for a self-hosted host).
+pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
+    let forge = from_origin(main_checkout)?;
+    if forge.provider != Provider::Unknown {
+        return Ok(forge);
+    }
+    Ok(wt::list_json(main_checkout)
+        .as_ref()
+        .and_then(from_worktrunk)
+        .unwrap_or(forge))
+}
 
 /// The host behind an ssh alias (`Host github-work` in `~/.ssh/config`),
 /// from `ssh -G`. The host itself if ssh does not know it.
@@ -212,26 +237,44 @@ fn real_host(host: &str) -> String {
         .unwrap_or_else(|| host.to_owned())
 }
 
+/// The host of the API of a forge: the host of the remote, or the host
+/// behind its ssh alias. The public host of the provider needs no call to
+/// ssh.
+fn api_host(forge: &RepositoryForge, public_host: &str) -> Result<String, String> {
+    if forge.host.is_empty() {
+        return Err(format!("no host for {}", forge.provider.name()));
+    }
+    Ok(if forge.host == public_host {
+        forge.host.clone()
+    } else {
+        real_host(&forge.host)
+    })
+}
+
 /// The backend of the provider of `forge`. An error tells why the plugin
 /// cannot ask the forge: no backend, no repository.
 pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backend>, String> {
+    let provider = forge.provider.name();
+    let repository = || {
+        forge
+            .repository
+            .clone()
+            .ok_or_else(|| format!("no path for the repository on {provider}"))
+    };
     match forge.provider {
         Provider::GitHub => {
-            let host = if forge.host == "github.com" {
-                forge.host.clone()
-            } else {
-                real_host(&forge.host)
-            };
+            let host = api_host(forge, "github.com")?;
             if host != "github.com" {
                 return Err(format!("GitHub on {host} has no backend yet"));
             }
-            let repository = forge
-                .repository
-                .clone()
-                .ok_or_else(|| "no owner and name for the repository on GitHub".to_owned())?;
-            Ok(Box::new(GitHub::new(repository, limit)))
+            Ok(Box::new(GitHub::new(repository()?, limit)))
         }
-        provider => Err(format!("no backend for {} yet", provider.name())),
+        Provider::GitLab => Ok(Box::new(GitLab::new(
+            api_host(forge, "gitlab.com")?,
+            repository()?,
+            limit,
+        ))),
+        _ => Err(format!("no backend for {provider} yet")),
     }
 }
 
@@ -307,6 +350,55 @@ mod tests {
     }
 
     #[test]
+    fn the_forms_of_a_github_url_give_the_repository() {
+        for url in [
+            "git@github.com:owpac/herdr-worktrunk.git",
+            "github.com:owpac/herdr-worktrunk",
+            "ssh://git@github.com/owpac/herdr-worktrunk.git",
+            "ssh://git@github.com:22/owpac/herdr-worktrunk.git",
+            "https://github.com/owpac/herdr-worktrunk",
+            "https://user@github.com/owpac/herdr-worktrunk.git/",
+            "git://github.com/owpac/herdr-worktrunk.git",
+        ] {
+            assert_eq!(
+                from_remote(url),
+                Some(RepositoryForge {
+                    provider: Provider::GitHub,
+                    host: "github.com".to_owned(),
+                    repository: Some("owpac/herdr-worktrunk".to_owned()),
+                }),
+                "{url}"
+            );
+        }
+        // A numeric owner is not a port.
+        assert_eq!(
+            from_remote("git@github.com:1234/repo.git").and_then(|forge| forge.repository),
+            Some("1234/repo".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_gitlab_url_keeps_its_subgroups() {
+        assert_eq!(
+            from_remote("git@gitlab.com:group/sub/app.git"),
+            Some(RepositoryForge {
+                provider: Provider::GitLab,
+                host: "gitlab.com".to_owned(),
+                repository: Some("group/sub/app".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_remote_without_owner_or_name_has_no_repository() {
+        assert_eq!(
+            from_remote("https://github.com/owpac").and_then(|forge| forge.repository),
+            None
+        );
+        assert_eq!(from_remote("/work/bare-repo.git"), None);
+    }
+
+    #[test]
     fn the_json_of_wt_gives_the_forge() {
         let json: Value =
             serde_json::from_str(include_str!("../tests/fixtures/wt-list.json")).unwrap();
@@ -325,8 +417,8 @@ mod tests {
     #[test]
     fn a_provider_without_backend_gives_an_error() {
         let forge = RepositoryForge {
-            provider: Provider::GitLab,
-            host: "gitlab.com".to_owned(),
+            provider: Provider::Gitea,
+            host: "codeberg.org".to_owned(),
             repository: Some("team/app".to_owned()),
         };
 
@@ -338,6 +430,31 @@ mod tests {
             Duration::from_secs(1),
         );
 
-        assert_eq!(status, Err("no backend for GitLab yet".to_owned()));
+        assert_eq!(status, Err("no backend for Gitea yet".to_owned()));
+    }
+
+    #[test]
+    fn github_and_gitlab_have_a_backend() {
+        let forge = |provider, host: &str| RepositoryForge {
+            provider,
+            host: host.to_owned(),
+            repository: Some("group/sub/app".to_owned()),
+        };
+        let limit = Duration::from_secs(1);
+
+        assert!(backend(&forge(Provider::GitHub, "github.com"), limit).is_ok());
+        assert!(backend(&forge(Provider::GitLab, "gitlab.com"), limit).is_ok());
+        assert_eq!(
+            backend(&forge(Provider::GitLab, ""), limit).err(),
+            Some("no host for GitLab".to_owned())
+        );
+        let without_path = RepositoryForge {
+            repository: None,
+            ..forge(Provider::GitLab, "gitlab.com")
+        };
+        assert_eq!(
+            backend(&without_path, limit).err(),
+            Some("no path for the repository on GitLab".to_owned())
+        );
     }
 }

@@ -40,23 +40,6 @@ impl Backend for GitHub {
     }
 }
 
-/// Return the GitHub repository (`owner/name`) of a remote URL, or None if
-/// the host of the remote is not `github.com`. An ssh alias of the host
-/// (`Host` in `~/.ssh/config`) gives None.
-pub fn repository_of(url: &str) -> Option<String> {
-    let (host, path) = crate::forge::split_remote(url)?;
-    if host != "github.com" {
-        return None;
-    }
-    let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, name) = path.split_once('/')?;
-    if owner.is_empty() || name.is_empty() || name.contains('/') {
-        return None;
-    }
-    Some(path.to_owned())
-}
-
 /// Run gh without a terminal, and return its output.
 fn run(arguments: &[&str], limit: Duration) -> Result<String, Error> {
     let label = arguments
@@ -175,46 +158,5 @@ mod tests {
             ]
         );
         assert_eq!(pull_requests[0].head, "3541f65");
-    }
-
-    #[test]
-    fn the_forms_of_a_github_url_give_the_repository() {
-        for url in [
-            "git@github.com:owpac/herdr-worktrunk.git",
-            "github.com:owpac/herdr-worktrunk",
-            "ssh://git@github.com/owpac/herdr-worktrunk.git",
-            "ssh://git@github.com:22/owpac/herdr-worktrunk.git",
-            "https://github.com/owpac/herdr-worktrunk",
-            "https://user@github.com/owpac/herdr-worktrunk.git/",
-            "git://github.com/owpac/herdr-worktrunk.git",
-        ] {
-            assert_eq!(
-                repository_of(url).as_deref(),
-                Some("owpac/herdr-worktrunk"),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_numeric_owner_is_not_a_port() {
-        assert_eq!(
-            repository_of("git@github.com:1234/repo.git").as_deref(),
-            Some("1234/repo")
-        );
-    }
-
-    #[test]
-    fn a_remote_outside_github_has_no_repository() {
-        for url in [
-            "git@gitlab.com:owpac/prompts.git",
-            "git@github-work:owpac/prompts.git",
-            "https://github.example.com/owpac/prompts",
-            "/work/bare-repo.git",
-            "file:///work/bare-repo.git",
-            "https://github.com/owpac",
-        ] {
-            assert_eq!(repository_of(url), None, "{url}");
-        }
     }
 }

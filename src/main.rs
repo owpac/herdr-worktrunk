@@ -17,6 +17,7 @@ mod forge;
 mod fzf;
 mod git;
 mod github;
+mod gitlab;
 mod herdr;
 mod leftover;
 mod observer;
