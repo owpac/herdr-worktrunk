@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Make the images of the README: docs/cleaner.gif, docs/cleaner-checks.png and docs/picker.png.
+#
+# The script makes a demo repository in a temporary folder, with worktrees of each kind, then
+# records the popups with VHS (brew install vhs). Run it from a herdr pane: the cleaner reads the
+# state of herdr. The demo repository has no remote, so the images show no real project.
+#
+#   docs/make-images [<binary>]   default: target/release/herdr-worktrunk
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+binary=${1:-$root/target/release/herdr-worktrunk}
+[ -x "$binary" ] || { echo "no binary at $binary: run cargo build --release" >&2; exit 1; }
+binary=$(realpath "$binary")
+command -v vhs >/dev/null || { echo "VHS is necessary: brew install vhs" >&2; exit 1; }
+
+demo=$(mktemp -d "${TMPDIR:-/tmp}/herdr-worktrunk-demo.XXXXXX")
+# KEEP_DEMO=1 keeps the demo repository and the tapes, to debug.
+[ -n "${KEEP_DEMO:-}" ] || trap 'rm -rf "$demo"' EXIT
+main="$demo/shop"
+
+# git without the config of the user (a signature with an agent, for example).
+g() { GIT_CONFIG_GLOBAL=/dev/null git -c user.name=Demo -c user.email=demo@example.com "$@"; }
+
+# Commit in the folder $1 with the date $2 (ISO), and give the date to the activity of the
+# worktree: its reflog and its git folder.
+commit_at() {
+  local folder=$1 date=$2 message=$3
+  GIT_AUTHOR_DATE=$date GIT_COMMITTER_DATE=$date g -C "$folder" commit -q -m "$message"
+  local git_dir stamp
+  git_dir=$(g -C "$folder" rev-parse --absolute-git-dir)
+  stamp=$(date -j -f %Y-%m-%dT%H:%M:%S "$date" +%Y%m%d%H%M 2>/dev/null || date -d "$date" +%Y%m%d%H%M)
+  touch -t "$stamp" "$git_dir/logs/HEAD" "$git_dir"
+}
+
+days_ago() { date -v-"$1"d +%Y-%m-%dT10:00:00 2>/dev/null || date -d "$1 days ago" +%Y-%m-%dT10:00:00; }
+
+mkdir -p "$main"
+g -C "$main" init -q -b main
+printf '# Shop\n' > "$main/README.md"
+g -C "$main" add README.md
+commit_at "$main" "$(days_ago 60)" "Start the shop"
+
+add_worktree() {
+  local branch=$1 folder="$demo/shop.${1//\//-}"
+  g -C "$main" worktree add -q -b "$branch" "$folder" main
+  printf '%s\n' "$folder"
+}
+
+# A branch that was never pushed, without activity for 40 days: To delete.
+folder=$(add_worktree feat/csv-export)
+printf 'export\n' > "$folder/export.py"; g -C "$folder" add .; commit_at "$folder" "$(days_ago 40)" "Export the orders as CSV"
+
+# A branch whose content is in main after a squash merge: To delete.
+folder=$(add_worktree feat/search)
+printf 'search\n' > "$folder/search.py"; g -C "$folder" add .; commit_at "$folder" "$(days_ago 5)" "Search the products"
+g -C "$main" merge -q --squash feat/search >/dev/null; commit_at "$main" "$(days_ago 4)" "Search the products (#12)"
+
+# Recent work: kept.
+folder=$(add_worktree feat/checkout)
+printf 'pay\n' > "$folder/checkout.py"; g -C "$folder" add .; commit_at "$folder" "$(days_ago 1)" "Pay with a card"
+
+# Changes that are not committed: kept.
+folder=$(add_worktree fix/cart-total)
+printf 'total\n' > "$folder/cart.py"
+
+# A branch without activity for 12 days: To delete.
+folder=$(add_worktree docs/api)
+printf 'api\n' > "$folder/API.md"; g -C "$folder" add .; commit_at "$folder" "$(days_ago 12)" "Describe the API"
+
+tapes="$demo/tapes"
+mkdir -p "$tapes"
+cat > "$tapes/settings.tape" <<TAPE
+Set Shell "bash"
+Set FontSize 14
+Set Width 1700
+Set Height 640
+Set Padding 16
+Set Theme "Dracula"
+Set WindowBar Colorful
+Set TypingSpeed 0
+TAPE
+
+# The cleaner: the spinners, the group To delete, then the tab checks.
+cat > "$tapes/cleaner.tape" <<TAPE
+Output "$root/docs/cleaner.gif"
+Source "$tapes/settings.tape"
+Hide
+Type "export PS1='' TRUNK_CLEANER_SCOPE='$main' && cd '$main' && clear && '$binary' cleaner"
+Enter
+Sleep 300ms
+Show
+Sleep 4s
+Down
+Sleep 1s
+Tab
+Sleep 300ms
+Tab
+Sleep 300ms
+Tab
+Sleep 1.5s
+Screenshot "$root/docs/cleaner-checks.png"
+Up
+Sleep 1.5s
+Escape
+Sleep 300ms
+TAPE
+
+# The picker.
+cat > "$tapes/picker.tape" <<TAPE
+Output "$tapes/picker.gif"
+Source "$tapes/settings.tape"
+Hide
+Type "export PS1='' && cd '$main' && clear && '$binary' pick"
+Enter
+Sleep 300ms
+Show
+Sleep 2s
+Down
+Down
+Sleep 1s
+Screenshot "$root/docs/picker.png"
+Sleep 500ms
+Escape
+Sleep 300ms
+TAPE
+
+vhs "$tapes/cleaner.tape"
+vhs "$tapes/picker.tape"
+echo "docs/cleaner.gif, docs/cleaner-checks.png and docs/picker.png are ready."
