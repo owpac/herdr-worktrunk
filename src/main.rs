@@ -32,6 +32,7 @@ mod sync;
 #[cfg(test)]
 mod test_support;
 mod ui;
+mod url;
 mod wt;
 
 use std::env;

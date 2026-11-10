@@ -34,10 +34,13 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::forge::{self, encode_url_part as encode, Backend, PullRequest, PullRequestState};
+use crate::forge::{
+    self, Backend, ForgeError, Provider, PullRequest, PullRequestState, RepositoryForge,
+};
 use crate::herdr::Error;
 use crate::process;
 use crate::sync::lock;
+use crate::url::encode_part as encode;
 
 /// The number of items that one call asks for.
 const PAGE_SIZE: usize = 50;
@@ -80,6 +83,22 @@ struct Response {
 }
 
 impl Gitea {
+    /// The backend of `forge`: Gitea or Forgejo, with an owner and a name.
+    pub fn from_forge(forge: &RepositoryForge, limit: Duration) -> Result<Gitea, ForgeError> {
+        let (flavor, public_host) = if forge.provider == Provider::Gitea {
+            (Flavor::Gitea, "gitea.com")
+        } else {
+            (Flavor::Forgejo, "codeberg.org")
+        };
+        let repository = forge::owner_and_name(forge)?.to_owned();
+        Ok(Gitea::new(
+            forge::api_host(forge, public_host)?,
+            repository,
+            flavor,
+            limit,
+        ))
+    }
+
     pub fn new(host: String, repository: String, flavor: Flavor, limit: Duration) -> Gitea {
         Gitea {
             host,
@@ -100,7 +119,7 @@ impl Gitea {
             .args(["api", "--login", &login, "-i", endpoint])
             .env("NO_COLOR", "1")
             // Not in a repository: tea must not read the remotes of a
-            // checkout.
+            // checkout. A shim of mise then finds only its global version.
             .current_dir(env::temp_dir());
         let output = process::cli_output(&mut command, "tea api", self.limit)?;
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -314,8 +333,11 @@ impl Backend for Gitea {
         )
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("pull request #{number}")
+    fn provider(&self) -> Provider {
+        match self.flavor {
+            Flavor::Gitea => Provider::Gitea,
+            Flavor::Forgejo => Provider::Forgejo,
+        }
     }
 }
 

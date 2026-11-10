@@ -10,15 +10,18 @@
 //! pull request. A commit on the forge after the local commit (for example
 //! a suggestion that a review applies) keeps the worktree.
 
-use std::env;
 use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::{self, Backend, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{
+    self, Backend, ForgeError, Provider, PullRequest, PullRequestState, Repository,
+    RepositoryForge, PAGE_SIZE,
+};
 use crate::herdr::Error;
 use crate::process;
+use crate::url;
 
 /// The backend of a repository on Azure DevOps.
 pub struct AzureDevOps {
@@ -30,7 +33,35 @@ pub struct AzureDevOps {
     limit: Duration,
 }
 
+/// A repository of Azure DevOps. The names are decoded: a project name
+/// can have spaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    pub organization: String,
+    pub project: String,
+    pub name: String,
+}
+
 impl AzureDevOps {
+    /// The backend of `forge`: a repository with its organization, its
+    /// project and its name.
+    pub fn from_forge(forge: &RepositoryForge, limit: Duration) -> Result<AzureDevOps, ForgeError> {
+        match &forge.repository {
+            Some(Repository::Azure(location)) => Ok(AzureDevOps::new(
+                organization_url(&forge.host, &location.organization),
+                location.project.clone(),
+                location.name.clone(),
+                limit,
+            )),
+            Some(Repository::Path(path)) => Err(ForgeError::Unsupported(format!(
+                "no organization, project and name on Azure DevOps: {path}"
+            ))),
+            None => Err(ForgeError::Unsupported(
+                "no path for the repository on Azure DevOps".to_owned(),
+            )),
+        }
+    }
+
     pub fn new(
         organization_url: String,
         project: String,
@@ -46,8 +77,10 @@ impl AzureDevOps {
     }
 }
 
-impl Backend for AzureDevOps {
-    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+impl AzureDevOps {
+    /// Run `az repos pr list` for `branch`, without a terminal, and return
+    /// its output.
+    fn az_pr_list(&self, branch: &str) -> Result<String, Error> {
         let mut command = Command::new("az");
         command
             .args([
@@ -77,10 +110,14 @@ impl Backend for AzureDevOps {
             .env("AZURE_CORE_COLLECT_TELEMETRY", "false")
             // The observer runs in the background: it must not install
             // software.
-            .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no")
-            .current_dir(env::temp_dir());
-        let text = process::run_cli(&mut command, "az repos pr list", self.limit)?;
-        parse_pull_requests(&text, branch)
+            .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no");
+        process::run_cli(&mut command, "az repos pr list", self.limit)
+    }
+}
+
+impl Backend for AzureDevOps {
+    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+        parse_pull_requests(&self.az_pr_list(branch)?, branch)
     }
 
     /// Only the last commit proves a finished pull request.
@@ -95,8 +132,8 @@ impl Backend for AzureDevOps {
         format!("git branch {branch} {commit} || git fetch origin {commit}:refs/heads/{branch}")
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("pull request !{number}")
+    fn provider(&self) -> Provider {
+        Provider::AzureDevOps
     }
 }
 
@@ -140,15 +177,10 @@ fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Err
         .collect())
 }
 
-/// The name of a host, without its port and in lowercase.
-fn host_name(host: &str) -> String {
-    host.split(':').next().unwrap_or(host).to_ascii_lowercase()
-}
-
 /// The URL of the organization (or of the collection, on Azure DevOps
 /// Server) of a host.
 pub fn organization_url(host: &str, organization: &str) -> String {
-    let name = host_name(host);
+    let name = url::host_name(host);
     if name == "dev.azure.com" || name == "ssh.dev.azure.com" {
         format!("https://dev.azure.com/{organization}")
     } else if name.ends_with(".visualstudio.com") {
@@ -171,13 +203,13 @@ pub fn organization_url(host: &str, organization: &str) -> String {
 /// Without a project in the path, the project has the name of the
 /// repository. The names come back decoded: `My%20Project` gives
 /// `My Project`.
-pub fn parse_remote_path(host: &str, path: &str) -> Option<(String, String, String)> {
+pub fn parse_remote_path(host: &str, path: &str) -> Option<Location> {
     let parts: Vec<&str> = path
         .trim_matches('/')
         .split('/')
         .filter(|part| !part.is_empty())
         .collect();
-    let name = host_name(host);
+    let name = url::host_name(host);
     let (organization, project, repository) = if name == "ssh.dev.azure.com"
         || name == "vs-ssh.visualstudio.com"
     {
@@ -214,41 +246,24 @@ pub fn parse_remote_path(host: &str, path: &str) -> Option<(String, String, Stri
         }
     };
     let repository = repository.strip_suffix(".git").unwrap_or(repository);
-    Some((
-        percent_decode(organization),
-        percent_decode(project.unwrap_or(repository)),
-        percent_decode(repository),
-    ))
-}
-
-/// Decode the `%XX` of an URL. A `%` without 2 hexadecimal digits stays.
-pub fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let hex = bytes
-            .get(index + 1..index + 3)
-            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
-            .and_then(|hex| std::str::from_utf8(hex).ok())
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-        match (bytes[index], hex) {
-            (b'%', Some(byte)) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            (byte, _) => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
+    Some(Location {
+        organization: url::decode(organization),
+        project: url::decode(project.unwrap_or(repository)),
+        name: url::decode(repository),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn location(organization: &str, project: &str, name: &str) -> Location {
+        Location {
+            organization: organization.to_owned(),
+            project: project.to_owned(),
+            name: name.to_owned(),
+        }
+    }
 
     #[test]
     fn the_json_of_az_gives_the_pull_requests_of_the_branch() {
@@ -286,11 +301,7 @@ mod tests {
 
     #[test]
     fn each_form_of_remote_gives_the_organization_the_project_and_the_repository() {
-        let expected = Some((
-            "myorg".to_owned(),
-            "My Project".to_owned(),
-            "my-repo".to_owned(),
-        ));
+        let expected = Some(location("myorg", "My Project", "my-repo"));
         assert_eq!(
             parse_remote_path("dev.azure.com", "myorg/My%20Project/_git/my-repo"),
             expected
@@ -329,21 +340,13 @@ mod tests {
         );
         assert_eq!(
             parse_remote_path("dev.azure.com", "myorg/My%20Project/_git/my%20repo"),
-            Some((
-                "myorg".to_owned(),
-                "My Project".to_owned(),
-                "my repo".to_owned()
-            ))
+            Some(location("myorg", "My Project", "my repo"))
         );
     }
 
     #[test]
     fn a_path_without_project_names_the_project_after_the_repository() {
-        let expected = Some((
-            "myorg".to_owned(),
-            "my-repo".to_owned(),
-            "my-repo".to_owned(),
-        ));
+        let expected = Some(location("myorg", "my-repo", "my-repo"));
 
         assert_eq!(
             parse_remote_path("dev.azure.com", "myorg/_git/my-repo"),
@@ -359,11 +362,7 @@ mod tests {
     fn azure_devops_server_has_a_collection() {
         assert_eq!(
             parse_remote_path("tfs.example.com", "DefaultCollection/Project/_git/repo"),
-            Some((
-                "DefaultCollection".to_owned(),
-                "Project".to_owned(),
-                "repo".to_owned()
-            ))
+            Some(location("DefaultCollection", "Project", "repo"))
         );
         assert_eq!(
             organization_url("tfs.example.com:8080", "DefaultCollection"),
@@ -388,15 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn percent_decode_keeps_an_invalid_sequence() {
-        assert_eq!(percent_decode("My%20Project"), "My Project");
-        assert_eq!(percent_decode("%C3%A9t%C3%A9"), "été");
-        assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(percent_decode("%zz"), "%zz");
-        assert_eq!(percent_decode("%+A"), "%+A");
-    }
-
-    #[test]
     fn azure_writes_a_pull_request_with_an_exclamation_mark() {
         let azure = AzureDevOps::new(
             "https://dev.azure.com/myorg".to_owned(),
@@ -410,7 +400,7 @@ mod tests {
             head: "aaa".to_owned(),
         };
 
-        assert_eq!(azure.reference(5), "pull request !5");
+        assert_eq!(azure.provider().reference(5), "pull request !5");
         assert_eq!(
             azure.recover_command(&merged, "aaa", "feat/x"),
             "git branch feat/x aaa || git fetch origin aaa:refs/heads/feat/x"

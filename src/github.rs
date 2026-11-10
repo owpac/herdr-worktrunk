@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::{self, Backend, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{
+    self, Backend, ForgeError, Provider, PullRequest, PullRequestState, RepositoryForge, PAGE_SIZE,
+};
 use crate::herdr::Error;
 use crate::process;
 
@@ -19,18 +21,66 @@ pub struct GitHub {
 }
 
 impl GitHub {
+    /// Run gh without a terminal, and return its output. The arguments
+    /// name the repository: gh reads no remote. gh runs in the folder of the
+    /// process, where a shim of mise finds its version.
+    fn gh(&self, arguments: &[&str]) -> Result<String, Error> {
+        let label = format!(
+            "gh {}",
+            arguments
+                .iter()
+                .take(2)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut command = Command::new("gh");
+        command.args(arguments).env("GH_PROMPT_DISABLED", "1");
+        process::run_cli(&mut command, &label, self.limit)
+    }
+
     pub fn new(repository: String, limit: Duration) -> GitHub {
         GitHub { repository, limit }
+    }
+
+    /// The backend of `forge`: github.com only, with an owner and a name.
+    pub fn from_forge(forge: &RepositoryForge, limit: Duration) -> Result<GitHub, ForgeError> {
+        let host = forge::api_host(forge, "github.com")?;
+        if host != "github.com" {
+            return Err(ForgeError::Unsupported(format!(
+                "GitHub on {host} has no backend yet"
+            )));
+        }
+        Ok(GitHub::new(forge::owner_and_name(forge)?.to_owned(), limit))
     }
 }
 
 impl Backend for GitHub {
     fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
-        pull_requests(&self.repository, branch, self.limit)
+        let text = self.gh(&[
+            "pr",
+            "list",
+            "--repo",
+            &self.repository,
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            &PAGE_SIZE.to_string(),
+            "--json",
+            "number,state,headRefOid,isCrossRepository",
+        ])?;
+        parse_pull_requests(&text)
     }
 
+    /// GitHub compares `commit...head`: the status `ahead` tells that
+    /// `head` contains `commit`. If GitHub does not know `commit` (it is
+    /// not pushed), the call fails and the function returns false.
     fn contains(&self, head: &str, commit: &str) -> bool {
-        contains(&self.repository, head, commit, self.limit)
+        let endpoint = format!("repos/{}/compare/{commit}...{head}", self.repository);
+        self.gh(&["api", &endpoint, "--jq", ".status"])
+            .is_ok_and(|status| status.trim() == "ahead")
     }
 
     /// GitHub keeps the commits of a closed pull request in
@@ -42,52 +92,9 @@ impl Backend for GitHub {
         )
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("pull request #{number}")
+    fn provider(&self) -> Provider {
+        Provider::GitHub
     }
-}
-
-/// Run gh without a terminal, and return its output.
-fn run(arguments: &[&str], limit: Duration) -> Result<String, Error> {
-    let label = format!(
-        "gh {}",
-        arguments
-            .iter()
-            .take(2)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    let mut command = Command::new("gh");
-    command.args(arguments).env("GH_PROMPT_DISABLED", "1");
-    process::run_cli(&mut command, &label, limit)
-}
-
-/// Return the pull requests of `branch` of the repository itself, in all
-/// the states. The list is empty if the branch has no pull request.
-fn pull_requests(
-    repository: &str,
-    branch: &str,
-    limit: Duration,
-) -> Result<Vec<PullRequest>, Error> {
-    let text = run(
-        &[
-            "pr",
-            "list",
-            "--repo",
-            repository,
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            &PAGE_SIZE.to_string(),
-            "--json",
-            "number,state,headRefOid,isCrossRepository",
-        ],
-        limit,
-    )?;
-    parse_pull_requests(&text)
 }
 
 /// Read the JSON of `gh pr list`. `--head` gives also the pull requests of
@@ -123,17 +130,6 @@ fn parse_pull_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
             head: listed.head,
         })
         .collect())
-}
-
-/// Return true if the commit `head` contains the commit `commit`, as
-/// GitHub sees them.
-///
-/// GitHub compares `commit...head`: the status `ahead` tells that `head`
-/// contains `commit`. If GitHub does not know `commit` (it is not
-/// pushed), the call fails and the function returns false.
-fn contains(repository: &str, head: &str, commit: &str, limit: Duration) -> bool {
-    let endpoint = format!("repos/{repository}/compare/{commit}...{head}");
-    run(&["api", &endpoint, "--jq", ".status"], limit).is_ok_and(|status| status.trim() == "ahead")
 }
 
 #[cfg(test)]
