@@ -250,7 +250,7 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
                 commit,
             } => check.finished.push(FinishedWorktree {
                 recover_command: backend.recover_command(&pull_request, &commit, &worktree.branch),
-                reference: backend.reference(pull_request.number),
+                reference: backend.provider().reference(pull_request.number),
                 path: worktree.path,
                 branch: worktree.branch,
                 pull_request,
@@ -288,6 +288,7 @@ pub fn without_pull_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge::Provider;
     use crate::test_support::{git_in, git_output, test_folder};
 
     fn pull_request(number: u64, state: PullRequestState, head: &str) -> PullRequest {
@@ -423,8 +424,8 @@ mod tests {
             format!("fetch {} {commit} {branch}", pull_request.number)
         }
 
-        fn reference(&self, number: u64) -> String {
-            format!("request {number}")
+        fn provider(&self) -> Provider {
+            Provider::GitHub
         }
     }
 

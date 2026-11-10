@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::{self, Backend, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{self, Backend, Provider, PullRequest, PullRequestState, PAGE_SIZE};
 use crate::herdr::Error;
 use crate::process;
 
@@ -95,8 +95,8 @@ impl Backend for AzureDevOps {
         format!("git branch {branch} {commit} || git fetch origin {commit}:refs/heads/{branch}")
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("pull request !{number}")
+    fn provider(&self) -> Provider {
+        Provider::AzureDevOps
     }
 }
 
@@ -410,7 +410,7 @@ mod tests {
             head: "aaa".to_owned(),
         };
 
-        assert_eq!(azure.reference(5), "pull request !5");
+        assert_eq!(azure.provider().reference(5), "pull request !5");
         assert_eq!(
             azure.recover_command(&merged, "aaa", "feat/x"),
             "git branch feat/x aaa || git fetch origin aaa:refs/heads/feat/x"

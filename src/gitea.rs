@@ -34,7 +34,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::forge::{self, encode_url_part as encode, Backend, PullRequest, PullRequestState};
+use crate::forge::{
+    self, encode_url_part as encode, Backend, Provider, PullRequest, PullRequestState,
+};
 use crate::herdr::Error;
 use crate::process;
 use crate::sync::lock;
@@ -314,8 +316,11 @@ impl Backend for Gitea {
         )
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("pull request #{number}")
+    fn provider(&self) -> Provider {
+        match self.flavor {
+            Flavor::Gitea => Provider::Gitea,
+            Flavor::Forgejo => Provider::Forgejo,
+        }
     }
 }
 

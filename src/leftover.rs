@@ -261,8 +261,9 @@ pub struct Facts {
     pub merge: Merge,
     pub push: Push,
     pub pull_requests: PullRequests,
-    /// The forge that gave the pull requests, for the user.
-    pub forge: String,
+    /// The provider of the forge that gave the pull requests.
+    #[serde(default)]
+    pub forge: Option<Provider>,
     /// The name of the default branch of the repository (`main`), for the
     /// user.
     #[serde(default)]
@@ -279,21 +280,14 @@ impl Facts {
             .unwrap_or("the default branch")
     }
 
-    /// Return true if the pull requests come from GitLab, which has merge
-    /// requests.
-    fn is_gitlab(&self) -> bool {
-        self.forge == Provider::GitLab.name()
+    /// The provider of the pull requests, for their words. Without forge,
+    /// the words of an unknown forge: `PR #3`.
+    fn provider(&self) -> Provider {
+        self.forge.unwrap_or(Provider::Unknown)
     }
 
-    /// The number of a pull request as the forge writes it: `!3` on
-    /// GitLab and Azure DevOps (`#3` is an issue or a work item there),
-    /// `#3` elsewhere.
     fn number_text(&self, number: u64) -> String {
-        if self.is_gitlab() || self.forge == Provider::AzureDevOps.name() {
-            format!("!{number}")
-        } else {
-            format!("#{number}")
-        }
+        self.provider().number_text(number)
     }
 
     /// The number of the pull request of the facts, as the forge writes
@@ -305,22 +299,12 @@ impl Facts {
             .unwrap_or_default()
     }
 
-    /// The short name of a pull request: `MR` on GitLab, `PR` elsewhere.
     fn short_name(&self) -> &'static str {
-        if self.is_gitlab() {
-            "MR"
-        } else {
-            "PR"
-        }
+        self.provider().short_name()
     }
 
-    /// The name of a pull request, for the questions.
     fn long_name(&self) -> &'static str {
-        if self.is_gitlab() {
-            "merge request"
-        } else {
-            "pull request"
-        }
+        self.provider().long_name()
     }
 }
 
@@ -736,11 +720,7 @@ fn push_line(facts: &Facts, reason: Reason) -> Line {
 }
 
 fn pull_requests_line(facts: &Facts, reason: Reason) -> Line {
-    let forge = if facts.forge.is_empty() {
-        "forge"
-    } else {
-        facts.forge.as_str()
-    };
+    let forge = facts.forge.map_or("forge", Provider::name);
     let number = facts.pull_request_number_text();
     let pull_requests = |mark: Mark, text: String| line(mark, "Pull requests", text, forge);
     match &facts.pull_requests {
@@ -873,7 +853,7 @@ mod tests {
             merge: Merge::NotMerged(Some(2)),
             push: Push::Pushed("origin/feat".to_owned()),
             pull_requests: PullRequests::NoPullRequest,
-            forge: "GitHub".to_owned(),
+            forge: Some(Provider::GitHub),
             default_branch_name: Some("main".to_owned()),
             days: Some(30),
         }
@@ -1316,7 +1296,7 @@ mod tests {
     fn gitlab_gets_the_words_of_its_merge_requests() {
         let gitlab = |pull_requests| Facts {
             pull_requests,
-            forge: "GitLab".to_owned(),
+            forge: Some(Provider::GitLab),
             ..facts()
         };
         let merged = gitlab(PullRequests::Finished {
@@ -1346,7 +1326,7 @@ mod tests {
         );
         // GitHub keeps its words.
         let github = Facts {
-            forge: "GitHub".to_owned(),
+            forge: Some(Provider::GitHub),
             ..merged
         };
         assert_eq!(
@@ -1355,7 +1335,7 @@ mod tests {
         );
         // Azure DevOps has pull requests, with the mark of GitLab.
         let azure = Facts {
-            forge: "Azure DevOps".to_owned(),
+            forge: Some(Provider::AzureDevOps),
             ..github
         };
         assert_eq!(

@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::azure::{self, AzureDevOps};
@@ -97,9 +98,8 @@ pub trait Backend: Send + Sync {
     /// `commit` is the local commit that the pull request contains.
     fn recover_command(&self, pull_request: &PullRequest, commit: &str, branch: &str) -> String;
 
-    /// The name and the number of a pull request, as the forge writes them:
-    /// `pull request #3`, or `merge request !3` on GitLab.
-    fn reference(&self, number: u64) -> String;
+    /// The provider of the forge, for its words.
+    fn provider(&self) -> Provider;
 }
 
 /// How long the observer keeps the forge of a repository: `wt list` reads
@@ -107,7 +107,8 @@ pub trait Backend: Send + Sync {
 const OBSERVER_FORGE_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// The provider of a forge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Provider {
     GitHub,
     GitLab,
@@ -130,6 +131,38 @@ impl Provider {
             Provider::AzureDevOps => "Azure DevOps",
             Provider::Unknown => "an unknown forge",
         }
+    }
+
+    /// The number of a pull request as the forge writes it: `!3` on GitLab
+    /// and Azure DevOps (`#3` is an issue or a work item there), `#3`
+    /// elsewhere.
+    pub fn number_text(self, number: u64) -> String {
+        match self {
+            Provider::GitLab | Provider::AzureDevOps => format!("!{number}"),
+            _ => format!("#{number}"),
+        }
+    }
+
+    /// The short name of a pull request: `MR` on GitLab, `PR` elsewhere.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Provider::GitLab => "MR",
+            _ => "PR",
+        }
+    }
+
+    /// The name of a pull request: `merge request` on GitLab.
+    pub fn long_name(self) -> &'static str {
+        match self {
+            Provider::GitLab => "merge request",
+            _ => "pull request",
+        }
+    }
+
+    /// The name and the number of a pull request: `pull request #3`,
+    /// `merge request !3`.
+    pub fn reference(self, number: u64) -> String {
+        format!("{} {}", self.long_name(), self.number_text(number))
     }
 
     /// The provider of a `provider` value of worktrunk.

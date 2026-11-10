@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::{self, Backend, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{self, Backend, Provider, PullRequest, PullRequestState, PAGE_SIZE};
 use crate::herdr::Error;
 use crate::process;
 
@@ -42,8 +42,8 @@ impl Backend for GitHub {
         )
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("pull request #{number}")
+    fn provider(&self) -> Provider {
+        Provider::GitHub
     }
 }
 

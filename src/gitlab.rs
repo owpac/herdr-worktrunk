@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::forge::encode_url_part as encode;
-use crate::forge::{self, Backend, PullRequest, PullRequestState, PAGE_SIZE};
+use crate::forge::{self, Backend, Provider, PullRequest, PullRequestState, PAGE_SIZE};
 use crate::herdr::Error;
 use crate::process;
 
@@ -87,8 +87,8 @@ impl Backend for GitLab {
         format!("git fetch origin {commit}:refs/heads/{branch}")
     }
 
-    fn reference(&self, number: u64) -> String {
-        format!("merge request !{number}")
+    fn provider(&self) -> Provider {
+        Provider::GitLab
     }
 }
 
@@ -216,7 +216,7 @@ mod tests {
             gitlab().recover_command(&closed, "aaa", "feat/x"),
             "git fetch origin aaa:refs/heads/feat/x"
         );
-        assert_eq!(gitlab().reference(12), "merge request !12");
+        assert_eq!(gitlab().provider().reference(12), "merge request !12");
     }
 
     #[test]

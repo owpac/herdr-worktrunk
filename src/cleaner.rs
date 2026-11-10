@@ -380,10 +380,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
         .get(&entry.branch)
         .cloned()
         .unwrap_or_default();
-    facts.forge = match &repository.forge {
-        Ok(forge) => forge.provider.name().to_owned(),
-        Err(_) => "no forge".to_owned(),
-    };
+    facts.forge = repository.forge.as_ref().ok().map(|forge| forge.provider);
     facts.pull_requests = match facts.changes {
         Changes::Uncommitted => PullRequests::NotNeeded("the changes keep the worktree".to_owned()),
         Changes::Failed => PullRequests::NotNeeded("git status failed".to_owned()),
