@@ -89,6 +89,12 @@ pub struct Check {
     pub merged: Vec<MergedWorktree>,
     /// The other worktrees whose branch has no pull request.
     pub without_pull_request: Vec<LinkedWorktree>,
+    /// The branches whose check failed, with the error: they stay. An
+    /// error for one branch does not stop the check of the others.
+    pub errors: Vec<(String, Error)>,
+    /// The number of branches with an answer of the forge, or without a
+    /// forge.
+    pub checked: usize,
 }
 
 /// Where the local commit of a branch is, compared with the default branch
@@ -292,26 +298,33 @@ pub fn branch_status(
 /// Sort the linked worktrees of the repository of `main_checkout` by their
 /// pull requests.
 ///
-/// `skip` tells if the thread must keep a worktree without a question to
-/// the forge, for example a worktree where an agent works. A repository
+/// A repository
 /// without the remote `origin` has no pull request: its worktrees are all
 /// without pull request. If the forge of `origin` has no backend, or if
-/// git or the forge fails, the function returns an error and no worktree.
+/// git fails to list the worktrees, the function returns an error and no
+/// worktree. An error of the forge for one branch goes to `Check::errors`.
 ///
 /// A merged worktree (`Check::merged`) has a finished pull request, or a
 /// branch that was never pushed: a local merge, for example `wt merge
 /// --no-remove`. A pushed branch without pull request (`develop`) can be a
 /// long work that the default branch receives from time to time: it stays
 /// without pull request, for the daily question.
-pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Result<Check, Error> {
-    let worktrees: Vec<LinkedWorktree> = git::linked_worktrees(main_checkout)?
-        .into_iter()
-        .filter(|worktree| !skip(&worktree.path))
-        .collect();
+pub fn check_worktrees(main_checkout: &Path) -> Result<Check, Error> {
+    let worktrees = git::linked_worktrees(main_checkout)?;
     if worktrees.is_empty() {
         return Ok(Check::default());
     }
     let backend = repository_backend(main_checkout)?;
+    Ok(sort_worktrees(main_checkout, worktrees, backend.as_deref()))
+}
+
+/// Sort `worktrees` with the backend of the forge, or without a backend
+/// for a repository without the remote `origin`.
+fn sort_worktrees(
+    main_checkout: &Path,
+    worktrees: Vec<LinkedWorktree>,
+    backend: Option<&dyn Backend>,
+) -> Check {
     let origin_default_branch = git::default_branch(main_checkout);
     let default_branches = default_branches(main_checkout);
     let pushes = match (
@@ -323,14 +336,24 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
     };
     let mut check = Check::default();
     for worktree in worktrees {
-        let status = match &backend {
+        let status = match backend {
             Some(backend) => branch_status(
                 main_checkout,
-                backend.as_ref(),
+                backend,
                 origin_default_branch.as_deref(),
                 &worktree.branch,
-            )?,
-            None => BranchStatus::NoPullRequest,
+            ),
+            None => Ok(BranchStatus::NoPullRequest),
+        };
+        let status = match status {
+            Ok(status) => {
+                check.checked += 1;
+                status
+            }
+            Err(error) => {
+                check.errors.push((worktree.branch, error));
+                continue;
+            }
         };
         if is_merge_candidate(&status, pushes.get(&worktree.branch)) {
             if let Some(merged) = merged_worktree(main_checkout, &worktree, &default_branches) {
@@ -345,7 +368,7 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
                 commit,
             } => {
                 // A status of the forge needs a backend.
-                let Some(backend) = &backend else { continue };
+                let Some(backend) = backend else { continue };
                 check.finished.push(FinishedWorktree {
                     recover_command: backend.recover_command(
                         &pull_request,
@@ -362,7 +385,7 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
             BranchStatus::Open(_) | BranchStatus::Kept { .. } => {}
         }
     }
-    Ok(check)
+    check
 }
 
 /// Keep the old worktrees whose branch has no pull request on the forge.
@@ -499,7 +522,10 @@ mod tests {
     }
 
     impl Backend for FakeForge {
-        fn pull_requests(&self, _branch: &str) -> Result<Vec<PullRequest>, Error> {
+        fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+            if branch == "broken" {
+                return Err(Error::Command("gh pr list: HTTP 502".to_owned()));
+            }
             Ok(self.pull_requests.clone())
         }
 
@@ -708,7 +734,7 @@ mod tests {
         let open = worktree("open");
         git_in(&open, &["commit", "-q", "--allow-empty", "-m", "open"]);
 
-        let check = check_worktrees(&repository, |_| false).unwrap();
+        let check = check_worktrees(&repository).unwrap();
 
         let merged: Vec<(&str, &str)> = check
             .merged
@@ -756,5 +782,55 @@ mod tests {
             &BranchStatus::Open(4),
             Some(&Push::Never)
         ));
+    }
+
+    #[test]
+    fn an_error_of_the_forge_for_one_branch_does_not_stop_the_others() {
+        let folder = test_folder("one-forge-error");
+        let repository = folder.join("app");
+        git_in(&folder, &["init", "-q", "-b", "main", "app"]);
+        git_in(
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "start"],
+        );
+        let worktree = |branch: &str| {
+            let path = folder.join(format!("app.{branch}"));
+            git_in(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+            git_in(&path, &["commit", "-q", "--allow-empty", "-m", branch]);
+        };
+        worktree("broken");
+        worktree("other");
+        let forge = FakeForge {
+            pull_requests: vec![],
+            contains: vec![],
+        };
+
+        let worktrees = git::linked_worktrees(&repository).unwrap();
+        let check = sort_worktrees(&repository, worktrees, Some(&forge));
+
+        let errors: Vec<&str> = check
+            .errors
+            .iter()
+            .map(|(branch, _)| branch.as_str())
+            .collect();
+        assert_eq!(errors, ["broken"]);
+        let without: Vec<&str> = check
+            .without_pull_request
+            .iter()
+            .map(|worktree| worktree.branch.as_str())
+            .collect();
+        // The broken branch is not "without pull request": the daily
+        // question does not see it.
+        assert_eq!(without, ["other"]);
     }
 }

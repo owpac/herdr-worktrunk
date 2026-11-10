@@ -447,7 +447,13 @@ pub fn open_plugin_pane(
 /// Show a message to the user in a herdr notification.
 pub fn notify(message: &str) {
     // A failed notification must not hide the first error: ignore it.
-    let _ = run(&["notification", "show", "worktrunk", "--body", message]);
+    let _ = show_notification("worktrunk", message);
+}
+
+/// Show a herdr notification with a title and a body.
+pub fn show_notification(title: &str, body: &str) -> Result<(), Error> {
+    run(&["notification", "show", title, "--body", body])?;
+    Ok(())
 }
 
 #[cfg(test)]
