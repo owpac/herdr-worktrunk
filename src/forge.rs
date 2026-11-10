@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::azure::{self, AzureDevOps};
 use crate::git;
 use crate::gitea::{Flavor, Gitea};
 use crate::github::GitHub;
@@ -178,7 +179,9 @@ pub struct RepositoryForge {
     pub provider: Provider,
     /// The host of the forge, after the ssh aliases.
     pub host: String,
-    /// The repository on the forge: `owner/name`.
+    /// The repository on the forge: `owner/name`. On Azure DevOps:
+    /// `organization/project/repository`, decoded (a project name can have
+    /// spaces, but no `/`).
     pub repository: Option<String>,
 }
 
@@ -194,7 +197,14 @@ pub fn from_worktrunk(json: &Value) -> Option<RepositoryForge> {
     };
     let repository = match (forge["owner"].as_str(), forge["name"].as_str()) {
         (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => {
-            Some(format!("{owner}/{name}"))
+            match (provider, forge["project"].as_str()) {
+                // wt gives the project of Azure DevOps apart, encoded.
+                (Provider::AzureDevOps, Some(project)) => {
+                    Some(format!("{owner}/{}/{name}", azure::percent_decode(project)))
+                }
+                (Provider::AzureDevOps, None) => None,
+                _ => Some(format!("{owner}/{name}")),
+            }
         }
         _ => None,
     };
@@ -216,6 +226,24 @@ pub fn from_origin(main_checkout: &Path) -> Result<RepositoryForge, String> {
 /// path.
 fn from_remote(url: &str) -> Option<RepositoryForge> {
     let (host, path) = split_remote(url)?;
+    let provider = Provider::from_host(host);
+    if provider == Provider::AzureDevOps {
+        let repository =
+            azure::parse_remote_path(host, path).map(|(organization, project, repository)| {
+                format!("{organization}/{project}/{repository}")
+            });
+        // The API of `ssh.dev.azure.com` is on `dev.azure.com`.
+        let host = if host.eq_ignore_ascii_case("ssh.dev.azure.com") {
+            "dev.azure.com"
+        } else {
+            host
+        };
+        return Some(RepositoryForge {
+            provider,
+            host: host.to_owned(),
+            repository,
+        });
+    }
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let has_owner_and_name = path
@@ -345,6 +373,21 @@ pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backe
             repository()?,
             limit,
         ))),
+        Provider::AzureDevOps => {
+            let repository = repository()?;
+            let parts: Vec<&str> = repository.split('/').collect();
+            let [organization, project, name] = parts.as_slice() else {
+                return Err(format!(
+                    "no organization, project and name on Azure DevOps: {repository}"
+                ));
+            };
+            Ok(Box::new(AzureDevOps::new(
+                azure::organization_url(&forge.host, organization),
+                (*project).to_owned(),
+                (*name).to_owned(),
+                limit,
+            )))
+        }
         Provider::Gitea | Provider::Forgejo => {
             let (flavor, public_host) = if forge.provider == Provider::Gitea {
                 (Flavor::Gitea, "gitea.com")
@@ -534,14 +577,14 @@ mod tests {
     #[test]
     fn a_provider_without_backend_gives_an_error() {
         let forge = RepositoryForge {
-            provider: Provider::AzureDevOps,
-            host: "dev.azure.com".to_owned(),
+            provider: Provider::Unknown,
+            host: "git.company.example".to_owned(),
             repository: Some("team/app".to_owned()),
         };
 
         assert_eq!(
             backend(&forge, Duration::from_secs(1)).err(),
-            Some("no backend for Azure DevOps yet".to_owned())
+            Some("no backend for an unknown forge yet".to_owned())
         );
     }
 
@@ -553,6 +596,45 @@ mod tests {
         assert_eq!(encode_url_part("a+b c&d=e#f"), "a%2Bb%20c%26d%3De%23f");
         assert_eq!(encode_url_part("é"), "%C3%A9");
         assert_eq!(encode_url_part("feat/{branch}"), "feat%2F%7Bbranch%7D");
+    }
+
+    #[test]
+    fn azure_devops_keeps_its_project() {
+        // The answer of wt for a remote on dev.azure.com.
+        let json = serde_json::json!({ "repo": { "forge": {
+            "url": "https://dev.azure.com/myorg/My%20Project/_git/my-repo",
+            "provider": "azure-devops",
+            "host": "dev.azure.com",
+            "owner": "myorg",
+            "name": "my-repo",
+            "project": "My%20Project",
+            "remote": "origin"
+        } } });
+        let expected = RepositoryForge {
+            provider: Provider::AzureDevOps,
+            host: "dev.azure.com".to_owned(),
+            repository: Some("myorg/My Project/my-repo".to_owned()),
+        };
+
+        assert_eq!(from_worktrunk(&json).as_ref(), Some(&expected));
+        assert_eq!(
+            from_remote("git@ssh.dev.azure.com:v3/myorg/My%20Project/my-repo").as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            from_remote("https://myorg@dev.azure.com/myorg/My%20Project/_git/my-repo").as_ref(),
+            Some(&expected)
+        );
+        let limit = Duration::from_secs(1);
+        assert!(backend(&expected, limit).is_ok());
+        let without_project = RepositoryForge {
+            repository: Some("myorg/my-repo".to_owned()),
+            ..expected
+        };
+        assert_eq!(
+            backend(&without_project, limit).err(),
+            Some("no organization, project and name on Azure DevOps: myorg/my-repo".to_owned())
+        );
     }
 
     #[test]

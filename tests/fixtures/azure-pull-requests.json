@@ -1,0 +1,94 @@
+[
+  {
+    "pullRequestId": 5,
+    "status": "completed",
+    "title": "A pull request",
+    "sourceRefName": "refs/heads/invBootstrap",
+    "targetRefName": "refs/heads/main",
+    "lastMergeSourceCommit": {
+      "commitId": "3aae318f1661c50c34effbbf6882119ed161f2d6"
+    },
+    "repository": {
+      "id": "2459d599-fdb2-4d28-9810-daeec061cf90",
+      "name": "dotnet-public-wiki",
+      "project": {
+        "name": "public"
+      }
+    }
+  },
+  {
+    "pullRequestId": 1,
+    "status": "completed",
+    "title": "A pull request",
+    "sourceRefName": "refs/heads/docs-update",
+    "targetRefName": "refs/heads/main",
+    "lastMergeSourceCommit": {
+      "commitId": "cd6039e649dcf41c410d9e970d391165cf9b8124"
+    },
+    "repository": {
+      "id": "2459d599-fdb2-4d28-9810-daeec061cf90",
+      "name": "dotnet-public-wiki",
+      "project": {
+        "name": "public"
+      }
+    }
+  },
+  {
+    "pullRequestId": 7,
+    "status": "active",
+    "title": "An open pull request",
+    "sourceRefName": "refs/heads/docs-update",
+    "targetRefName": "refs/heads/main",
+    "lastMergeSourceCommit": {
+      "commitId": "1111111111111111111111111111111111111111"
+    },
+    "repository": {
+      "id": "2459d599-fdb2-4d28-9810-daeec061cf90",
+      "name": "dotnet-public-wiki",
+      "project": {
+        "name": "public"
+      }
+    }
+  },
+  {
+    "pullRequestId": 8,
+    "status": "abandoned",
+    "title": "An abandoned pull request",
+    "sourceRefName": "refs/heads/docs-update",
+    "targetRefName": "refs/heads/main",
+    "lastMergeSourceCommit": {
+      "commitId": "2222222222222222222222222222222222222222"
+    },
+    "repository": {
+      "id": "2459d599-fdb2-4d28-9810-daeec061cf90",
+      "name": "dotnet-public-wiki",
+      "project": {
+        "name": "public"
+      }
+    }
+  },
+  {
+    "pullRequestId": 9,
+    "status": "active",
+    "title": "A pull request from a fork",
+    "sourceRefName": "refs/heads/docs-update",
+    "targetRefName": "refs/heads/main",
+    "lastMergeSourceCommit": {
+      "commitId": "3333333333333333333333333333333333333333"
+    },
+    "repository": {
+      "id": "2459d599-fdb2-4d28-9810-daeec061cf90",
+      "name": "dotnet-public-wiki",
+      "project": {
+        "name": "public"
+      }
+    },
+    "forkSource": {
+      "name": "refs/heads/docs-update",
+      "repository": {
+        "id": "00000000-0000-0000-0000-000000000009",
+        "name": "dotnet-public-wiki"
+      }
+    }
+  }
+]

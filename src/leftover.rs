@@ -282,9 +282,10 @@ impl Facts {
     }
 
     /// The number of a pull request as the forge writes it: `!3` on
-    /// GitLab (`#3` is an issue there), `#3` elsewhere.
+    /// GitLab and Azure DevOps (`#3` is an issue or a work item there),
+    /// `#3` elsewhere.
     fn number_text(&self, number: u64) -> String {
-        if self.is_gitlab() {
+        if self.is_gitlab() || self.forge == Provider::AzureDevOps.name() {
             format!("!{number}")
         } else {
             format!("#{number}")
@@ -1168,6 +1169,12 @@ mod tests {
             ..merged
         };
         assert_eq!(reason_text(Reason::Merged, &github), "PR #12 merged");
+        // Azure DevOps has pull requests, with the mark of GitLab.
+        let azure = Facts {
+            forge: "Azure DevOps".to_owned(),
+            ..github
+        };
+        assert_eq!(reason_text(Reason::Merged, &azure), "PR !12 merged");
     }
 
     #[test]
