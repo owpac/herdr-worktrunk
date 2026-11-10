@@ -29,7 +29,6 @@ use crate::git::{self, Checkout};
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, WorktreeAgent};
 use crate::picker::{self, Picked, Row};
-use crate::stale;
 use crate::ui;
 use crate::wt;
 
@@ -44,7 +43,6 @@ const MESSAGE_VARIABLE: &str = "TRUNK_MESSAGE";
 /// The reason of a question that the observer asks (an old worktree).
 const REASON_VARIABLE: &str = "TRUNK_REASON";
 /// The file of the worktrees that the popup confirm deletes together.
-const LIST_VARIABLE: &str = "TRUNK_CLEANER_LIST";
 /// A deletion of the popup cleaner: the idle agents of the worktree close
 /// first. The cleaner gives it only to a worktree with a proof of the end.
 const CLOSE_IDLE_VARIABLE: &str = "TRUNK_CLOSE_IDLE_AGENTS";
@@ -466,9 +464,13 @@ fn ask_and_run() -> Result<(), Error> {
 /// The question before the deletion of all the old worktrees of the list
 /// of the cleaner, then the deletions and a summary.
 fn delete_all() -> Result<(), Error> {
-    let list_path = PathBuf::from(env::var_os(LIST_VARIABLE).unwrap_or_default());
-    let old = stale::read_list(&list_path);
-    let _ = std::fs::remove_file(&list_path);
+    // The state file keeps the results of the checks: the cleaner reads it
+    // again after the question.
+    let state_path = PathBuf::from(env::var_os(STATE_VARIABLE).unwrap_or_default());
+    let old: Vec<cleaner::Entry> = cleaner::leftovers(&state_path)
+        .into_iter()
+        .filter(|entry| entry.path.exists())
+        .collect();
     if old.is_empty() {
         return Ok(());
     }
@@ -511,7 +513,7 @@ fn delete_all() -> Result<(), Error> {
             Ok(agents) if agents.is_empty() => {}
             // Only a worktree with a proof of the end closes its idle
             // agents: the age alone keeps them.
-            Ok(agents) if worktree.close_idle_agents => {
+            Ok(agents) if leftover::closes_idle_agents(worktree.reason, &worktree.facts) => {
                 if let Err(error) = close_agents(&agents, &worktree.path) {
                     kept.push(format!("{}: {error}", worktree.branch));
                     continue;
@@ -627,13 +629,8 @@ pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
             let _ = std::fs::remove_file(&state_path);
             Ok(())
         }
-        Some(cleaner::Choice::DeleteAll(leftovers)) => {
-            let list_path = state_path.with_extension("delete");
-            stale::write_list(&list_path, &leftovers)
-                .map_err(|error| Error::Command(format!("cannot write the list: {error}")))?;
-            let list_text = list_path.to_string_lossy();
+        Some(cleaner::Choice::DeleteAll) => {
             environment.push((OPERATION_VARIABLE, DELETE_ALL));
-            environment.push((LIST_VARIABLE, list_text.as_ref()));
             open_after_this_popup("confirm", &folder, &environment)
         }
         Some(cleaner::Choice::Delete(entry)) => {

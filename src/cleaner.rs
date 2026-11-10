@@ -38,7 +38,7 @@ use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Merge, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
-use crate::stale::{self, OldWorktree};
+use crate::stale;
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
@@ -139,16 +139,6 @@ impl Entry {
     pub fn question(&self) -> String {
         leftover::question(self.reason, &self.facts)
     }
-
-    fn as_old_worktree(&self) -> OldWorktree {
-        OldWorktree {
-            main_checkout: self.main_checkout.clone(),
-            path: self.path.clone(),
-            branch: self.branch.clone(),
-            days: self.facts.days.unwrap_or(0),
-            close_idle_agents: leftover::closes_idle_agents(self.reason, &self.facts),
-        }
-    }
 }
 
 /// Write the state file in one rename, one JSON line for each entry: fzf
@@ -168,6 +158,18 @@ pub fn read_state(path: &Path) -> Vec<Entry> {
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The leftovers of the state file: the group To delete, for "delete all".
+pub fn leftovers(state_path: &Path) -> Vec<Entry> {
+    leftover_entries(read_state(state_path))
+}
+
+fn leftover_entries(entries: Vec<Entry>) -> Vec<Entry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.reason.is_leftover())
         .collect()
 }
 
@@ -943,7 +945,8 @@ fn scope_of(entries: &[Entry]) -> String {
 pub enum Choice {
     Delete(Box<Entry>),
     /// The worktrees of the group "To delete".
-    DeleteAll(Vec<OldWorktree>),
+    /// Delete the group To delete: `leftovers` reads it in the state file.
+    DeleteAll,
 }
 
 /// Show the list in fzf, start the checks, and return the choice of the
@@ -1070,12 +1073,10 @@ pub fn choose(
 fn parse_choice(text: &str, entries: &[Entry]) -> Option<Choice> {
     let first = text.lines().next()?;
     if first == DELETE_ALL_REQUEST {
-        let leftovers: Vec<OldWorktree> = entries
+        return entries
             .iter()
-            .filter(|entry| entry.reason.is_leftover())
-            .map(Entry::as_old_worktree)
-            .collect();
-        return (!leftovers.is_empty()).then_some(Choice::DeleteAll(leftovers));
+            .any(|entry| entry.reason.is_leftover())
+            .then_some(Choice::DeleteAll);
     }
     let path = first.split('\t').next()?;
     entries
@@ -1287,15 +1288,16 @@ mod tests {
         let entries = entries();
 
         let choice = parse_choice("delete-all\n", &entries);
+        let old = leftover_entries(entries.clone());
 
-        let Some(Choice::DeleteAll(old)) = choice else {
-            panic!("no choice");
-        };
-        let branches: Vec<&str> = old
-            .iter()
-            .map(|worktree| worktree.branch.as_str())
-            .collect();
+        assert_eq!(choice, Some(Choice::DeleteAll));
+        let branches: Vec<&str> = old.iter().map(|entry| entry.branch.as_str()).collect();
         assert_eq!(branches, ["a-old", "d-merged"]);
+        let kept_only: Vec<Entry> = entries
+            .into_iter()
+            .filter(|entry| !entry.reason.is_leftover())
+            .collect();
+        assert_eq!(parse_choice("delete-all\n", &kept_only), None);
     }
 
     #[test]
