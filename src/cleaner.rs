@@ -82,6 +82,8 @@ const WORKTREE_KIND: &str = "worktree";
 fn glyph(reason: Reason) -> (&'static str, &'static str) {
     match reason {
         Reason::Checking => (ACCENT, SPINNER[0]),
+        // is_leftover decides the group To delete: the color follows it.
+        reason if reason.is_leftover() => (RED, "✕"),
         Reason::PullRequestMerged
         | Reason::PullRequestClosed
         | Reason::BranchMerged
@@ -336,12 +338,12 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
     };
     let listed = wt::list_json(main_checkout);
     let merges = listed.as_ref().map(leftover::parse_merges);
-    let default_branch = git::default_branch(main_checkout);
+    let origin_default_branch = git::default_branch(main_checkout);
     let main_name = listed
         .as_ref()
         .and_then(leftover::parse_default_branch)
         .or_else(|| {
-            default_branch
+            origin_default_branch
                 .as_deref()
                 .map(|branch| branch.trim_start_matches("origin/").to_owned())
         });
@@ -353,7 +355,7 @@ fn repository_facts(main_checkout: &Path, fetch: bool) -> RepositoryFacts {
     RepositoryFacts {
         forge,
         backend,
-        origin_default_branch: default_branch,
+        origin_default_branch,
         main_name,
         merges,
         pushes,
@@ -378,7 +380,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
             .unwrap_or_else(|| Merge::Undetermined("wt did not list this worktree".to_owned())),
         None => Merge::Undetermined("wt gave no answer".to_owned()),
     };
-    facts.default_branch = repository.main_name.clone();
+    facts.default_branch_name = repository.main_name.clone();
     facts.push = repository
         .pushes
         .get(&entry.branch)
@@ -1205,7 +1207,7 @@ mod tests {
     fn a_merged_worktree_is_a_leftover_with_its_proof() {
         let mut squashed = entry("e-squash", "alpha", Reason::BranchMerged, Some(3));
         squashed.facts.merge = Merge::Merged("patch_id_match".to_owned());
-        squashed.facts.default_branch = Some("main".to_owned());
+        squashed.facts.default_branch_name = Some("main".to_owned());
 
         let text = line(&Row::Worktree(&squashed), 90);
         let shown = style::visible(text.split('\t').nth(ROW_FIELDS).unwrap());
@@ -1319,6 +1321,45 @@ mod tests {
             Some(Choice::Delete(Box::new(entries[0].clone())))
         );
         assert_eq!(parse_choice("", &entries), None);
+    }
+
+    #[test]
+    fn a_new_worktree_is_kept_today() {
+        let base = test_folder("new-worktree");
+        let main = base.join("repo");
+        fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        let worktree = base.join("repo.fresh");
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "fresh",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let entry = Entry::new(worktree, "fresh".to_owned(), main.clone(), Agents::None);
+
+        let result = check(&entry, &repository_facts(&main, false), 7);
+
+        // wt sees the commit of main: merged at once. Without wt (the CI),
+        // the merge is unknown. In both cases, the worktree stays.
+        let has_wt = Command::new("wt")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let expected = if has_wt {
+            Reason::MergedRecently
+        } else {
+            Reason::Recent
+        };
+        assert_eq!(result.reason, expected);
+        assert!(!result.reason.is_leftover());
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

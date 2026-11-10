@@ -164,12 +164,12 @@ pub enum KeptWhy {
 }
 
 /// Read the pull requests of `branch` (one call to the forge, sometimes 2),
-/// and tell the status of its worktree. `default_branch` is the default
+/// and tell the status of its worktree. `origin_default_branch` is the default
 /// branch of `origin`, if git knows it.
 pub fn branch_status(
     main_checkout: &Path,
     backend: &dyn Backend,
-    default_branch: Option<&str>,
+    origin_default_branch: Option<&str>,
     branch: &str,
 ) -> Result<BranchStatus, Error> {
     let pull_requests = backend.pull_requests(branch)?;
@@ -188,7 +188,7 @@ pub fn branch_status(
             why: KeptWhy::NoLocalCommit,
         });
     };
-    let place = match default_branch {
+    let place = match origin_default_branch {
         None => DefaultBranch::Unknown,
         Some(default) if git::is_ancestor(main_checkout, &local_commit, default) => {
             DefaultBranch::Contains
@@ -230,13 +230,13 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
         return Ok(Check::default());
     }
     let backend = repository_backend(main_checkout)?;
-    let default_branch = git::default_branch(main_checkout);
+    let origin_default_branch = git::default_branch(main_checkout);
     let mut check = Check::default();
     for worktree in worktrees {
         match branch_status(
             main_checkout,
             backend.as_ref(),
-            default_branch.as_deref(),
+            origin_default_branch.as_deref(),
             &worktree.branch,
         )? {
             BranchStatus::NoPullRequest => check.without_pull_request.push(worktree),
@@ -441,10 +441,10 @@ mod tests {
     fn status_of(
         folder: &Path,
         forge: &FakeForge,
-        default_branch: Option<&str>,
+        origin_default_branch: Option<&str>,
         branch: &str,
     ) -> BranchStatus {
-        branch_status(folder, forge, default_branch, branch).unwrap()
+        branch_status(folder, forge, origin_default_branch, branch).unwrap()
     }
 
     #[test]

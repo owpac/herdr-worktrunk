@@ -24,8 +24,10 @@
 //! 5. No pull request (the forge says so, or the branch was never pushed
 //!    and the forge gives no answer), and no activity for `stale_days`
 //!    days: to delete.
-//! 6. Else kept: recent activity, work after a finished pull request, or
-//!    a forge that gave no answer.
+//! 6. Else kept: recent activity (also a merged branch with activity
+//!    today), work after a finished pull request, a finished pull request
+//!    with its commit in the default branch, or a forge that gave no
+//!    answer.
 //!
 //! Idle agents (idle or done, in the worktree and in its workspace,
 //! without the focus) do not keep a worktree with a proof of the end (rules
@@ -254,17 +256,18 @@ pub struct Facts {
     pub pull_requests: PullRequests,
     /// The forge that gave the pull requests, for the user.
     pub forge: String,
-    /// The default branch of the repository (`main`), for the user.
+    /// The name of the default branch of the repository (`main`), for the
+    /// user.
     #[serde(default)]
-    pub default_branch: Option<String>,
+    pub default_branch_name: Option<String>,
     /// The days since the last activity, once known.
     pub days: Option<u64>,
 }
 
 impl Facts {
     /// The name of the default branch, for the texts.
-    fn default_branch_name(&self) -> &str {
-        self.default_branch
+    fn default_branch_text(&self) -> &str {
+        self.default_branch_name
             .as_deref()
             .unwrap_or("the default branch")
     }
@@ -284,6 +287,15 @@ impl Facts {
         } else {
             format!("#{number}")
         }
+    }
+
+    /// The number of the pull request of the facts, as the forge writes
+    /// it, or an empty text.
+    fn pull_request_number_text(&self) -> String {
+        self.pull_requests
+            .number()
+            .map(|number| self.number_text(number))
+            .unwrap_or_default()
     }
 
     /// The short name of a pull request: `MR` on GitLab, `PR` elsewhere.
@@ -382,11 +394,7 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
         _ => {}
     }
     let is_merged = matches!(facts.merge, Merge::Merged(_));
-    if is_merged
-        && facts
-            .days
-            .is_some_and(|days| days >= activity_limit(facts, stale_days))
-    {
+    if is_merged && facts.days.is_some_and(|days| days >= MERGED_MIN_DAYS) {
         return Reason::BranchMerged;
     }
     // A branch that was never pushed has no pull request, but only if the
@@ -506,11 +514,7 @@ pub fn unknown_detail(facts: &Facts) -> String {
 
 /// The text of a verdict in a row of the list.
 pub fn reason_text(reason: Reason, facts: &Facts) -> String {
-    let number = facts
-        .pull_requests
-        .number()
-        .map(|number| facts.number_text(number))
-        .unwrap_or_default();
+    let number = facts.pull_request_number_text();
     let short = facts.short_name();
     let never_pushed = matches!(facts.push, Push::Never);
     let text = match reason {
@@ -519,9 +523,9 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
         Reason::PullRequestClosed => format!("{short} {number} closed"),
         Reason::BranchMerged => match &facts.merge {
             Merge::Merged(how) => {
-                format!("merged: {}", merge_words(how, facts.default_branch_name()))
+                format!("merged: {}", merge_words(how, facts.default_branch_text()))
             }
-            _ => format!("merged into {}", facts.default_branch_name()),
+            _ => format!("merged into {}", facts.default_branch_text()),
         },
         Reason::Old if never_pushed => "never pushed, no recent activity".to_owned(),
         Reason::Old => format!("no {short}, no recent activity"),
@@ -547,17 +551,13 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
 
 /// The text of a verdict in the question of the popup confirm.
 pub fn question(reason: Reason, facts: &Facts) -> String {
-    let number = facts
-        .pull_requests
-        .number()
-        .map(|number| facts.number_text(number))
-        .unwrap_or_default();
+    let number = facts.pull_request_number_text();
     let name = facts.long_name();
     let days = facts.days.unwrap_or(0);
     match reason {
         Reason::PullRequestMerged => format!("Its {name} {number} is merged."),
         Reason::PullRequestClosed => format!("Its {name} {number} is closed."),
-        Reason::BranchMerged => format!("{} contains its content.", facts.default_branch_name()),
+        Reason::BranchMerged => format!("{} contains its content.", facts.default_branch_text()),
         Reason::Old => format!("No {name}, and no change for {}.", days_text(days)),
         Reason::PullRequestOpen => format!("Careful: its {name} {number} is open."),
         Reason::Recent => format!(
@@ -566,7 +566,7 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
         ),
         Reason::MergedRecently => format!(
             "{} contains its content, but it had a change {}.",
-            facts.default_branch_name(),
+            facts.default_branch_text(),
             ago_text(days)
         ),
         Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
@@ -650,13 +650,15 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
     ]
 }
 
-/// The line of a layer without its fact: the check runs, the verdict
-/// needed no check (an agent works), or the check gave no answer.
-fn missing_line(reason: Reason, layer: &'static str, source: &str) -> Line {
-    match reason {
-        Reason::Checking => line(Mark::Wait, layer, "checking…", source),
-        Reason::Agent => line(Mark::Info, layer, "not needed", source),
-        _ => line(Mark::Unknown, layer, "no answer", source),
+/// The line of a layer without its fact: the check runs, an agent works
+/// (the cleaner skips the checks), or the check gave no answer.
+fn missing_line(facts: &Facts, reason: Reason, layer: &'static str, source: &str) -> Line {
+    if reason == Reason::Checking {
+        line(Mark::Wait, layer, "checking…", source)
+    } else if facts.agent == Agents::Busy {
+        line(Mark::Info, layer, "not needed", source)
+    } else {
+        line(Mark::Unknown, layer, "no answer", source)
     }
 }
 
@@ -681,12 +683,12 @@ fn changes_line(facts: &Facts, reason: Reason) -> Line {
         Changes::Clean => changes(Mark::Pass, "none"),
         Changes::Uncommitted => changes(Mark::Fail, "not committed"),
         Changes::Failed => changes(Mark::Unknown, "git status failed"),
-        Changes::NotChecked => missing_line(reason, "Changes", "git status"),
+        Changes::NotChecked => missing_line(facts, reason, "Changes", "git status"),
     }
 }
 
 fn merge_line(facts: &Facts, reason: Reason) -> Line {
-    let main = facts.default_branch_name();
+    let main = facts.default_branch_text();
     let merge = |mark: Mark, text: String| line(mark, "Merged", text, "wt");
     match &facts.merge {
         Merge::Merged(how) => merge(Mark::Pass, format!("yes: {}", merge_words(how, main))),
@@ -696,7 +698,7 @@ fn merge_line(facts: &Facts, reason: Reason) -> Line {
         ),
         Merge::NotMerged(None) => merge(Mark::Info, format!("no: commits not in {main}")),
         Merge::Undetermined(why) => merge(Mark::Unknown, format!("unknown: {why}")),
-        Merge::NotChecked => missing_line(reason, "Merged", "wt"),
+        Merge::NotChecked => missing_line(facts, reason, "Merged", "wt"),
     }
 }
 
@@ -715,7 +717,7 @@ fn push_line(facts: &Facts, reason: Reason) -> Line {
         ),
         Push::Pushed(remote) => push(Mark::Info, format!("pushed to {remote}")),
         Push::Gone(remote) => push(Mark::Info, format!("{remote} is deleted (a hint only)")),
-        Push::NotChecked => missing_line(reason, "Push", "git"),
+        Push::NotChecked => missing_line(facts, reason, "Push", "git"),
     }
 }
 
@@ -725,11 +727,7 @@ fn pull_requests_line(facts: &Facts, reason: Reason) -> Line {
     } else {
         facts.forge.as_str()
     };
-    let number = facts
-        .pull_requests
-        .number()
-        .map(|number| facts.number_text(number))
-        .unwrap_or_default();
+    let number = facts.pull_request_number_text();
     let pull_requests = |mark: Mark, text: String| line(mark, "Pull requests", text, forge);
     match &facts.pull_requests {
         PullRequests::NoPullRequest => pull_requests(Mark::Pass, "none".to_owned()),
@@ -751,13 +749,13 @@ fn pull_requests_line(facts: &Facts, reason: Reason) -> Line {
         }
         PullRequests::NotNeeded(why) => pull_requests(Mark::Info, format!("not needed: {why}")),
         PullRequests::Failed(error) => pull_requests(Mark::Unknown, format!("no answer: {error}")),
-        PullRequests::NotChecked => missing_line(reason, "Pull requests", forge),
+        PullRequests::NotChecked => missing_line(facts, reason, "Pull requests", forge),
     }
 }
 
 fn activity_line(facts: &Facts, reason: Reason, stale_days: u32) -> Line {
     let Some(days) = facts.days else {
-        return missing_line(reason, "Activity", "git");
+        return missing_line(facts, reason, "Activity", "git");
     };
     let limit = activity_limit(facts, stale_days);
     let mark = if days >= limit {
@@ -862,7 +860,7 @@ mod tests {
             push: Push::Pushed("origin/feat".to_owned()),
             pull_requests: PullRequests::NoPullRequest,
             forge: "GitHub".to_owned(),
-            default_branch: Some("main".to_owned()),
+            default_branch_name: Some("main".to_owned()),
             days: Some(30),
         }
     }
@@ -884,7 +882,11 @@ mod tests {
         };
 
         let after_checks = lines(&facts, Reason::Unknown, 7);
-        let busy_agent = lines(&facts, Reason::Agent, 7);
+        let busy = Facts {
+            agent: Agents::Busy,
+            ..facts.clone()
+        };
+        let busy_agent = lines(&busy, Reason::Agent, 7);
 
         for name in ["Push", "Activity"] {
             assert_eq!(layer(&after_checks, name).mark, Mark::Unknown, "{name}");
