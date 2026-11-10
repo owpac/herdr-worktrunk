@@ -29,14 +29,15 @@
 use std::collections::HashMap;
 use std::env;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::forge::{encode_url_part as encode, Backend, PullRequest, PullRequestState};
+use crate::forge::{self, encode_url_part as encode, Backend, PullRequest, PullRequestState};
 use crate::herdr::Error;
 use crate::process;
+use crate::sync::lock;
 
 /// The number of items that one call asks for.
 const PAGE_SIZE: usize = 50;
@@ -76,10 +77,6 @@ struct Response {
     body: Option<String>,
     /// The number of items of the whole list (`X-Total-Count`).
     total: Option<usize>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Gitea {
@@ -192,7 +189,7 @@ impl Gitea {
         if !is_complete {
             return Err(Error::Command(format!(
                 "more than {} pull requests for this branch",
-                MAX_PAGES * PAGE_SIZE
+                listed.len()
             )));
         }
         // An old version of Forgejo ignores the filter: the list then has
@@ -297,7 +294,6 @@ impl Backend for Gitea {
                 head,
             });
         }
-        pull_requests.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.number));
         Ok(pull_requests)
     }
 
@@ -380,16 +376,12 @@ impl Listed {
     }
 }
 
-fn invalid_json(error: serde_json::Error) -> Error {
-    Error::Command(format!("tea api: invalid JSON: {error}"))
-}
-
 fn parse_pulls(text: &str) -> Result<Vec<Listed>, Error> {
-    serde_json::from_str(text).map_err(invalid_json)
+    forge::parse_json(text, "tea api")
 }
 
 fn parse_pull(text: &str) -> Result<Listed, Error> {
-    serde_json::from_str(text).map_err(invalid_json)
+    forge::parse_json(text, "tea api")
 }
 
 /// The commits of a pull request, in the order of the JSON.
@@ -398,7 +390,7 @@ fn parse_commits(text: &str) -> Result<Vec<String>, Error> {
     struct Commit {
         sha: String,
     }
-    let commits: Vec<Commit> = serde_json::from_str(text).map_err(invalid_json)?;
+    let commits: Vec<Commit> = forge::parse_json(text, "tea api")?;
     Ok(commits.into_iter().map(|commit| commit.sha).collect())
 }
 
@@ -407,7 +399,7 @@ fn parse_default_branch(text: &str) -> Result<String, Error> {
     struct Repository {
         default_branch: String,
     }
-    let repository: Repository = serde_json::from_str(text).map_err(invalid_json)?;
+    let repository: Repository = forge::parse_json(text, "tea api")?;
     Ok(repository.default_branch)
 }
 
@@ -695,7 +687,7 @@ mod tests {
             Flavor::Forgejo,
             Duration::from_secs(1),
         );
-        gitea.commits.lock().unwrap().insert(
+        lock(&gitea.commits).insert(
             "head".to_owned(),
             vec!["head".to_owned(), "local".to_owned()],
         );

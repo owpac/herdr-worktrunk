@@ -1,6 +1,6 @@
 //! The popup cleaner: all the linked worktrees of the repositories of the
 //! herdr workspaces, in fzf. The list shows at once. Threads check each
-//! worktree in the background (local criteria, then gh), and its row
+//! worktree in the background (local criteria, then the forge), and its row
 //! shows a spinner until its check ends. The leftovers go to the group
 //! "To delete" at the top. The other worktrees stay in a group for each
 //! project, with the reason that keeps them.
@@ -23,8 +23,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -38,7 +38,7 @@ use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Merge, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
-use crate::stale::{self, OldWorktree, DAY};
+use crate::stale::{self, OldWorktree};
 use crate::style::{
     self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
@@ -146,7 +146,7 @@ impl Entry {
             path: self.path.clone(),
             branch: self.branch.clone(),
             days: self.facts.days.unwrap_or(0),
-            close_idle_agents: self.facts.agent == Agents::Idle && self.reason.is_leftover(),
+            close_idle_agents: leftover::closes_idle_agents(self.reason, &self.facts),
         }
     }
 }
@@ -178,20 +178,14 @@ fn herdr_repositories() -> Result<HerdrState, Error> {
     // A few threads: herdr and git take about 20 ms for each workspace,
     // and the list must show at once. herdr refuses too many worktree
     // checks at the same time.
-    let next = Mutex::new(0_usize);
+    let next = AtomicUsize::new(0);
     let checkouts: Vec<(String, Option<(PathBuf, PathBuf)>)> = thread::scope(|scope| {
         let handles: Vec<_> = (0..LIST_THREADS)
             .map(|_| {
                 scope.spawn(|| {
                     let mut found = Vec::new();
                     loop {
-                        let index = {
-                            let Ok(mut next) = next.lock() else {
-                                return found;
-                            };
-                            *next += 1;
-                            *next - 1
-                        };
+                        let index = next.fetch_add(1, Ordering::SeqCst);
                         let Some(workspace) = snapshot.workspaces.get(index) else {
                             return found;
                         };
@@ -241,7 +235,7 @@ struct HerdrState {
 }
 
 /// The linked worktrees of `scope` (one repository), or of all the
-/// repositories of the herdr workspaces. Only local data: no gh. A
+/// repositories of the herdr workspaces. Only local data: no forge. A
 /// worktree with an agent gets its reason at once. `previous` gives the
 /// results of an earlier list (the return after a question): these
 /// worktrees keep their result without a new check.
@@ -372,7 +366,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
         None => Changes::Failed,
     };
     let now = stale::now();
-    facts.days = git::last_activity(&entry.path).map(|time| now.saturating_sub(time) / DAY);
+    facts.days = git::last_activity(&entry.path).map(|time| stale::days_since(time, now));
     facts.merge = match &repository.merges {
         Some(merges) => merges
             .get(&entry.branch)
@@ -397,7 +391,8 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
             // A repository without a remote has no pull request.
             Err(error) if error == forge::NO_REMOTE => PullRequests::NotNeeded(error.clone()),
             Err(error) => PullRequests::Failed(error.clone()),
-            // A forge that does not answer gives "no answer" after 15 s:
+            // A forge that does not answer gives "no answer" after
+            // forge::POPUP_TIME_LIMIT:
             // the worktree stays, and the spinner stops.
             Ok(backend) => PullRequests::from_status(
                 prune::branch_status(
@@ -566,15 +561,13 @@ fn read_shown(state_path: &Path) -> Option<Vec<(bool, String)>> {
 /// interval. When the checks end, stop the spinner.
 fn notify_fzf(receiver: &mpsc::Receiver<()>, socket: &Path, reload: &str) {
     loop {
-        match receiver.recv_timeout(Duration::from_secs(60)) {
-            Ok(()) => {
-                thread::sleep(RELOAD_INTERVAL);
-                while receiver.try_recv().is_ok() {}
-                post_with_retries(socket, reload);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+        // The end of the checks drops the senders: recv then fails.
+        if receiver.recv().is_err() {
+            break;
         }
+        thread::sleep(RELOAD_INTERVAL);
+        while receiver.try_recv().is_ok() {}
+        post_with_retries(socket, reload);
     }
     // The checks end: the header of a refused ctrl-a is not true anymore.
     let last = format!("{reload}+unbind(every({FRAME_INTERVAL}))+change-header:");
@@ -699,6 +692,17 @@ fn line(row: &Row, width: usize) -> String {
             } else {
                 1
             };
+            // Only the glyph changes from one frame to the next.
+            let reason_color = if entry.reason.is_leftover() {
+                RED
+            } else {
+                MUTED
+            };
+            let reason_text = entry.reason_text();
+            let mut right = vec![part(MUTED, git::folder_name(&entry.path))];
+            if let Some(days) = entry.facts.days {
+                right.push(part(MUTED, format!("{days}d")));
+            }
             let mut frames: Vec<String> = (0..frame_count)
                 .map(|frame| {
                     let (color, glyph) = if entry.reason == Reason::Checking {
@@ -706,22 +710,13 @@ fn line(row: &Row, width: usize) -> String {
                     } else {
                         glyph(entry.reason)
                     };
-                    let reason_color = if entry.reason.is_leftover() {
-                        RED
-                    } else {
-                        MUTED
-                    };
                     let left = [
                         part("", "  "),
                         part(color, format!("{glyph} ")),
                         part("", entry.branch.clone()),
                         part(RULE, " — "),
-                        part(reason_color, entry.reason_text()),
+                        part(reason_color, reason_text.clone()),
                     ];
-                    let mut right = vec![part(MUTED, git::folder_name(&entry.path))];
-                    if let Some(days) = entry.facts.days {
-                        right.push(part(MUTED, format!("{days}d")));
-                    }
                     style::row(&left, &right, width)
                 })
                 .collect();
@@ -846,15 +841,10 @@ pub fn print_enter(kind: &str) {
 /// fzf event `cleaner-delete-all`: accept the deletion of the group "To
 /// delete" if it has worktrees.
 pub fn print_delete_all(state_path: &Path) {
-    if read_state(state_path)
-        .iter()
-        .any(|entry| entry.reason.is_leftover())
-    {
+    let entries = read_state(state_path);
+    if entries.iter().any(|entry| entry.reason.is_leftover()) {
         println!("print({DELETE_ALL_REQUEST})+accept");
-    } else if read_state(state_path)
-        .iter()
-        .any(|entry| entry.reason == Reason::Checking)
-    {
+    } else if entries.iter().any(|entry| entry.reason == Reason::Checking) {
         println!("change-header:The checks run: wait for the group To delete.");
     } else {
         println!("change-header:The group To delete is empty.");

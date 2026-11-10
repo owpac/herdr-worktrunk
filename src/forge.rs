@@ -13,9 +13,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::azure::{self, AzureDevOps};
@@ -25,6 +26,7 @@ use crate::github::GitHub;
 use crate::gitlab::GitLab;
 use crate::herdr::Error;
 use crate::process;
+use crate::sync::lock;
 use crate::wt;
 
 /// The URL schemes of a remote. A remote without scheme has the form
@@ -38,6 +40,28 @@ pub const BACKGROUND_TIME_LIMIT: Duration = Duration::from_secs(60);
 /// The time limit of a call to a forge from a popup: the user waits for
 /// it.
 pub const POPUP_TIME_LIMIT: Duration = Duration::from_secs(15);
+
+/// The number of pull requests of a branch that one call reads. A branch
+/// has few: a full page gives an error.
+pub const PAGE_SIZE: usize = 50;
+
+/// Read the JSON of a CLI. `label` names the command in the error.
+pub fn parse_json<T: DeserializeOwned>(text: &str, label: &str) -> Result<T, Error> {
+    serde_json::from_str(text)
+        .map_err(|error| Error::Command(format!("{label}: invalid JSON: {error}")))
+}
+
+/// Read one page of pull requests. A full page gives an error: it can miss
+/// an open pull request, and then the worktree stays.
+pub fn parse_page<T: DeserializeOwned>(text: &str, label: &str) -> Result<Vec<T>, Error> {
+    let page: Vec<T> = parse_json(text, label)?;
+    if page.len() >= PAGE_SIZE {
+        return Err(Error::Command(format!(
+            "{label}: {PAGE_SIZE} results or more for this branch, the list can miss one"
+        )));
+    }
+    Ok(page)
+}
 
 /// The state of a pull request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,11 +84,13 @@ pub struct PullRequest {
 /// share one backend for each repository.
 pub trait Backend: Send + Sync {
     /// The pull requests of `branch` in the repository itself, in all the
-    /// states, the newest first. A pull request from a fork does not count.
+    /// states, in any order. A pull request from a fork does not count.
     fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error>;
 
     /// Return true if the commit `head` contains the commit `commit`, as
-    /// the forge sees them. False if the forge does not know `commit`.
+    /// the forge sees them. `head` is the head of a pull request from
+    /// `pull_requests` of this backend, never empty. False means "no
+    /// proof": the forge does not know `commit`, or the backend cannot tell.
     fn contains(&self, head: &str, commit: &str) -> bool;
 
     /// The command that gets back the branch of a closed pull request.
@@ -288,20 +314,13 @@ pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
     type Known = HashMap<PathBuf, (Instant, Result<RepositoryForge, String>)>;
     static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
     let known = KNOWN.get_or_init(Mutex::default);
-    if let Some((time, forge)) = known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(main_checkout)
-    {
+    if let Some((time, forge)) = lock(known).get(main_checkout) {
         if time.elapsed() < OBSERVER_FORGE_LIFETIME {
             return forge.clone();
         }
     }
     let forge = resolve(main_checkout, wt::list_json(main_checkout).as_ref());
-    known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(main_checkout.to_owned(), (Instant::now(), forge.clone()));
+    lock(known).insert(main_checkout.to_owned(), (Instant::now(), forge.clone()));
     forge
 }
 
@@ -311,18 +330,11 @@ pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
 fn real_host(host: &str) -> String {
     static KNOWN: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let known = KNOWN.get_or_init(Mutex::default);
-    if let Some(real) = known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(host)
-    {
+    if let Some(real) = lock(known).get(host) {
         return real.clone();
     }
     let real = host_from_ssh(host);
-    known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(host.to_owned(), real.clone());
+    lock(known).insert(host.to_owned(), real.clone());
     real
 }
 
@@ -441,6 +453,23 @@ pub fn encode_url_part(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{git_in, test_folder};
+
+    #[test]
+    fn a_full_page_of_pull_requests_gives_an_error() {
+        let page = |count: u64| {
+            let numbers: Vec<String> = (1..=count).map(|number| number.to_string()).collect();
+            format!("[{}]", numbers.join(","))
+        };
+
+        assert_eq!(parse_page::<u64>(&page(49), "x").unwrap().len(), 49);
+        assert_eq!(
+            parse_page::<u64>(&page(50), "gh pr list")
+                .unwrap_err()
+                .to_string(),
+            "gh pr list: 50 results or more for this branch, the list can miss one"
+        );
+        assert!(parse_page::<u64>("{\"message\":\"x\"}", "x").is_err());
+    }
 
     #[test]
     fn the_provider_comes_from_the_name_of_the_host() {
@@ -685,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn github_and_gitlab_have_a_backend() {
+    fn each_provider_gets_its_backend() {
         let forge = |provider, host: &str| RepositoryForge {
             provider,
             host: host.to_owned(),

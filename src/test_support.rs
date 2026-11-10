@@ -52,3 +52,9 @@ pub fn git_output(folder: &Path, arguments: &[&str]) -> String {
     assert!(output.status.success(), "git {arguments:?}");
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
+
+/// A JSON page of `forge::PAGE_SIZE` items, from the JSON of one item.
+pub fn full_page(item: impl Fn(u64) -> String) -> String {
+    let items: Vec<String> = (1..=crate::forge::PAGE_SIZE as u64).map(item).collect();
+    format!("[{}]", items.join(","))
+}

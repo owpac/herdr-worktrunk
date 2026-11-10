@@ -26,7 +26,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,8 +34,10 @@ use crate::actions;
 use crate::forge::PullRequestState;
 use crate::git::{self, Checkout, LinkedWorktree};
 use crate::herdr::{self, Error, Pane, Snapshot};
+use crate::leftover;
 use crate::prune::{self, FinishedWorktree};
 use crate::stale::{self, OldWorktree};
+use crate::sync::lock;
 use crate::wt;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -348,17 +350,7 @@ fn agent_decision(agents: &[ViewAgent], checkout: &Path) -> AgentDecision {
 
 /// The command that resumes the conversation of an agent.
 fn resume_command(agent: &ViewAgent) -> String {
-    let session = agent.session.as_deref().unwrap_or("<session>");
-    match agent.kind.as_str() {
-        "claude" => format!("claude --resume {session}"),
-        "codex" => format!("codex resume {session}"),
-        kind => format!("{kind}, session {session}"),
-    }
-}
-
-/// Lock the view. A panic of the other thread does not stop this thread.
-fn lock(view: &Mutex<PruneView>) -> MutexGuard<'_, PruneView> {
-    view.lock().unwrap_or_else(PoisonError::into_inner)
+    leftover::resume_command(&agent.kind, agent.session.as_deref())
 }
 
 /// The agents for the view: each agent with the checkout of its folder
@@ -907,7 +899,7 @@ impl Log {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        let mut file = self.file.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut file = lock(&self.file);
         if let Some(file) = file.as_mut() {
             // The log is only for a diagnosis: a failed write must not stop
             // the observer.

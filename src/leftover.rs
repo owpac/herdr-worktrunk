@@ -94,12 +94,19 @@ impl WorktreeAgent {
 
     /// The command that resumes the conversation of the agent.
     pub fn resume_command(&self) -> String {
-        let session = self.session.as_deref().unwrap_or("<session>");
-        match self.kind.as_str() {
-            "claude" => format!("claude --resume {session}"),
-            "codex" => format!("codex resume {session}"),
-            kind => format!("{kind}, session {session}"),
-        }
+        resume_command(&self.kind, self.session.as_deref())
+    }
+}
+
+/// The command that resumes the conversation of an agent of the kind
+/// `kind` (claude, codex...). The cleaner and the observer write it after
+/// they close an idle agent.
+pub fn resume_command(kind: &str, session: Option<&str>) -> String {
+    let session = session.unwrap_or("<session>");
+    match kind {
+        "claude" => format!("claude --resume {session}"),
+        "codex" => format!("codex resume {session}"),
+        kind => format!("{kind}, session {session}"),
     }
 }
 
@@ -354,6 +361,14 @@ pub enum Reason {
     Unknown,
 }
 
+/// Return true if the deletion closes the idle agents of the worktree
+/// first: a leftover, and only idle agents. A leftover with idle agents
+/// always has a proof of the end: the verdict gives `IdleAgent` (kept), not
+/// `Old`, to an old worktree with idle agents.
+pub fn closes_idle_agents(reason: Reason, facts: &Facts) -> bool {
+    reason.is_leftover() && facts.agent == Agents::Idle
+}
+
 impl Reason {
     /// Return true for a leftover: the group "To delete".
     pub fn is_leftover(self) -> bool {
@@ -494,9 +509,8 @@ fn merge_words(reason: &str, main: &str) -> String {
     }
 }
 
-/// The detail of a check that gave no answer, for the row and the
-/// question.
-pub fn unknown_detail(facts: &Facts) -> String {
+/// The detail of a check that gave no answer, for the row.
+fn unknown_detail(facts: &Facts) -> String {
     match (&facts.changes, &facts.pull_requests) {
         (Changes::Failed, _) => "git status failed".to_owned(),
         (_, PullRequests::Failed(error)) => error.clone(),
@@ -542,7 +556,7 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
         }
         Reason::Unknown => format!("not checked: {}", unknown_detail(facts)),
     };
-    if reason.is_leftover() && facts.agent == Agents::Idle {
+    if closes_idle_agents(reason, facts) {
         format!("{text}, idle agent closed first")
     } else {
         text
@@ -667,7 +681,7 @@ fn agent_line(facts: &Facts, reason: Reason) -> Line {
     match facts.agent {
         Agents::None => agent(Mark::Pass, "none"),
         Agents::Busy => agent(Mark::Fail, "an agent works here"),
-        Agents::Idle if reason.is_leftover() => {
+        Agents::Idle if closes_idle_agents(reason, facts) => {
             agent(Mark::Pass, "idle: it closes before the deletion")
         }
         Agents::Idle if reason == Reason::IdleAgent => {
@@ -982,7 +996,7 @@ mod tests {
             number: 3,
             merged: true,
         };
-        let no_backend = PullRequests::Failed("no backend for GitLab yet".to_owned());
+        let no_backend = PullRequests::Failed("no backend for an unknown forge yet".to_owned());
         let cases: Vec<(&str, Facts, Reason)> = vec![
             (
                 "busy agent",
@@ -1146,6 +1160,25 @@ mod tests {
         for (name, facts, expected) in cases {
             assert_eq!(verdict(&facts, 7), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn only_a_leftover_closes_its_idle_agents() {
+        let idle = Facts {
+            agent: Agents::Idle,
+            ..facts()
+        };
+        let busy = Facts {
+            agent: Agents::Busy,
+            ..facts()
+        };
+
+        assert!(closes_idle_agents(Reason::PullRequestMerged, &idle));
+        assert!(closes_idle_agents(Reason::BranchMerged, &idle));
+        assert!(!closes_idle_agents(Reason::IdleAgent, &idle));
+        assert!(!closes_idle_agents(Reason::PullRequestOpen, &idle));
+        assert!(!closes_idle_agents(Reason::PullRequestMerged, &busy));
+        assert!(!closes_idle_agents(Reason::PullRequestMerged, &facts()));
     }
 
     #[test]
@@ -1541,11 +1574,13 @@ mod tests {
             reason_text(
                 Reason::Unknown,
                 &Facts {
-                    pull_requests: PullRequests::Failed("no backend for GitLab yet".to_owned()),
+                    pull_requests: PullRequests::Failed(
+                        "no backend for an unknown forge yet".to_owned()
+                    ),
                     ..facts()
                 }
             ),
-            "not checked: no backend for GitLab yet"
+            "not checked: no backend for an unknown forge yet"
         );
     }
 }

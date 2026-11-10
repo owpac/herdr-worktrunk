@@ -17,9 +17,10 @@
 //!
 //! Thus the forge keeps each local commit of a finished worktree: in the
 //! default branch after a merge, and with the pull request after a close.
-//! GitHub keeps `refs/pull/<number>/head`. GitLab deletes
-//! `refs/merge-requests/<iid>/head` 14 days after the close, but keeps the
-//! commits: a fetch of the commit itself gets the branch back.
+//! Each backend gives the command that gets the branch back
+//! (`Backend::recover_command`): GitHub, Gitea and Forgejo keep
+//! `refs/pull/<number>/head`, GitLab and Azure DevOps give the commit
+//! itself.
 //!
 //! A local commit in the default branch is not work of the branch: a new
 //! worktree starts there. Thus a new worktree stays, also on the name of
@@ -108,9 +109,10 @@ pub fn finished_pull_request<'a>(
     if is_open || default_branch == DefaultBranch::Contains {
         return None;
     }
-    let mut finished = pull_requests
-        .iter()
-        .filter(|pull_request| pull_request.state != PullRequestState::Open);
+    // An empty head (a pull request without commit) proves nothing.
+    let mut finished = pull_requests.iter().filter(|pull_request| {
+        pull_request.state != PullRequestState::Open && !pull_request.head.is_empty()
+    });
     if let Some(same_commit) = finished
         .clone()
         .find(|pull_request| pull_request.head == local_commit)
@@ -163,7 +165,7 @@ pub enum KeptWhy {
     NoLocalCommit,
 }
 
-/// Read the pull requests of `branch` (one call to the forge, sometimes 2),
+/// Read the pull requests of `branch` (one or more calls to the forge),
 /// and tell the status of its worktree. `origin_default_branch` is the default
 /// branch of `origin`, if git knows it.
 pub fn branch_status(
@@ -172,7 +174,10 @@ pub fn branch_status(
     origin_default_branch: Option<&str>,
     branch: &str,
 ) -> Result<BranchStatus, Error> {
-    let pull_requests = backend.pull_requests(branch)?;
+    let mut pull_requests = backend.pull_requests(branch)?;
+    // The backends give no order. The newest pull request comes first:
+    // the open one, the proof and the last number name the newest match.
+    pull_requests.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.number));
     let Some(last) = pull_requests.first() else {
         return Ok(BranchStatus::NoPullRequest);
     };
@@ -294,7 +299,7 @@ mod tests {
     }
 
     fn never(_head: &str) -> bool {
-        panic!("GitHub must not be asked");
+        panic!("the forge must not be asked");
     }
 
     const MERGED: PullRequestState = PullRequestState::Merged;
@@ -531,6 +536,32 @@ mod tests {
                 number: 2,
                 why: KeptWhy::NoLocalCommit
             }
+        );
+        // The last pull request has the highest number, in any order.
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![
+                    pull_request(2, MERGED, "older"),
+                    pull_request(9, CLOSED, "old")
+                ]),
+                Some("main"),
+                "work"
+            ),
+            BranchStatus::Kept {
+                number: 9,
+                why: KeptWhy::WorkAfter
+            }
+        );
+        // An empty head proves nothing, also when the local commit is empty.
+        assert_eq!(
+            finished_pull_request(
+                "",
+                &[pull_request(2, MERGED, "")],
+                DefaultBranch::Unknown,
+                never
+            ),
+            None
         );
         // Without a default branch, only the same commit proves the end.
         assert_eq!(

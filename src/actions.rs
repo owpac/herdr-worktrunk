@@ -642,7 +642,7 @@ pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
             environment.push((OPERATION_VARIABLE, DELETE));
             environment.push((CHECKOUT_VARIABLE, checkout_text.as_ref()));
             environment.push((REASON_VARIABLE, reason.as_str()));
-            if entry.reason.is_leftover() && entry.facts.agent == Agents::Idle {
+            if leftover::closes_idle_agents(entry.reason, &entry.facts) {
                 environment.push((CLOSE_IDLE_VARIABLE, "1"));
             }
             open_after_this_popup("confirm", &folder, &environment)

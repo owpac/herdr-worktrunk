@@ -28,6 +28,7 @@ mod process;
 mod prune;
 mod stale;
 mod style;
+mod sync;
 #[cfg(test)]
 mod test_support;
 mod ui;
