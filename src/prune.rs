@@ -29,10 +29,10 @@
 //! the check can only remove a worktree of a finished pull request.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
+use crate::forge::{self, Backend, PullRequest, PullRequestState};
 use crate::git::{self, LinkedWorktree};
-use crate::github::{self, PullRequest, PullRequestState};
+use crate::github::{self, GitHub};
 use crate::herdr::Error;
 use crate::stale::OldWorktree;
 
@@ -47,6 +47,9 @@ pub struct FinishedWorktree {
     pub commit: String,
     /// The finished pull request that contains the local commit.
     pub pull_request: PullRequest,
+    /// The command that gets back the branch after the removal of a closed
+    /// pull request.
+    pub recover_command: String,
 }
 
 impl FinishedWorktree {
@@ -156,18 +159,16 @@ pub enum KeptWhy {
     NoLocalCommit,
 }
 
-/// Read the pull requests of `branch` (one call to gh, sometimes 2), and
-/// tell the status of its worktree. `repository` is the repository on
-/// GitHub, and `default_branch` the default branch of `origin`, if git
-/// knows it. `limit` is the time limit of each call to gh.
+/// Read the pull requests of `branch` (one call to the forge, sometimes 2),
+/// and tell the status of its worktree. `default_branch` is the default
+/// branch of `origin`, if git knows it.
 pub fn branch_status(
     main_checkout: &Path,
-    repository: &str,
+    backend: &dyn Backend,
     default_branch: Option<&str>,
     branch: &str,
-    limit: Duration,
 ) -> Result<BranchStatus, Error> {
-    let pull_requests = github::pull_requests(repository, branch, limit)?;
+    let pull_requests = backend.pull_requests(branch)?;
     let Some(last) = pull_requests.first() else {
         return Ok(BranchStatus::NoPullRequest);
     };
@@ -191,7 +192,7 @@ pub fn branch_status(
         Some(_) => DefaultBranch::DoesNotContain,
     };
     let finished = finished_pull_request(&local_commit, &pull_requests, place, |head| {
-        github::contains(repository, head, &local_commit, limit)
+        backend.contains(head, &local_commit)
     });
     Ok(match finished {
         Some(pull_request) => BranchStatus::Finished {
@@ -224,22 +225,25 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
     if worktrees.is_empty() {
         return Ok(Check::default());
     }
-    let repository = github_repository(main_checkout)?;
+    let backend = GitHub::new(
+        github_repository(main_checkout)?,
+        forge::BACKGROUND_TIME_LIMIT,
+    );
     let default_branch = git::default_branch(main_checkout);
     let mut check = Check::default();
     for worktree in worktrees {
         match branch_status(
             main_checkout,
-            &repository,
+            &backend,
             default_branch.as_deref(),
             &worktree.branch,
-            github::GH_TIME_LIMIT,
         )? {
             BranchStatus::NoPullRequest => check.without_pull_request.push(worktree),
             BranchStatus::Finished {
                 pull_request,
                 commit,
             } => check.finished.push(FinishedWorktree {
+                recover_command: backend.recover_command(pull_request.number, &worktree.branch),
                 path: worktree.path,
                 branch: worktree.branch,
                 pull_request,
@@ -264,10 +268,13 @@ pub fn without_pull_request(
     if old.is_empty() {
         return Ok(old);
     }
-    let repository = github_repository(main_checkout)?;
+    let backend = GitHub::new(
+        github_repository(main_checkout)?,
+        forge::BACKGROUND_TIME_LIMIT,
+    );
     let mut kept = Vec::new();
     for worktree in old {
-        if github::pull_requests(&repository, &worktree.branch, github::GH_TIME_LIMIT)?.is_empty() {
+        if backend.pull_requests(&worktree.branch)?.is_empty() {
             kept.push(worktree);
         }
     }
@@ -277,6 +284,7 @@ pub fn without_pull_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, git_output, test_folder};
 
     fn pull_request(number: u64, state: PullRequestState, head: &str) -> PullRequest {
         PullRequest {
@@ -379,7 +387,155 @@ mod tests {
             branch: "feature".to_owned(),
             commit: "aaa".to_owned(),
             pull_request: pull_request(1, MERGED, "aaa"),
+            recover_command: "git fetch origin pull/1/head:feature".to_owned(),
         }
+    }
+
+    /// A forge for the tests: its pull requests, and the pairs (head,
+    /// commit) where the head contains the commit.
+    struct FakeForge {
+        pull_requests: Vec<PullRequest>,
+        contains: Vec<(String, String)>,
+    }
+
+    impl Backend for FakeForge {
+        fn pull_requests(&self, _branch: &str) -> Result<Vec<PullRequest>, Error> {
+            Ok(self.pull_requests.clone())
+        }
+
+        fn contains(&self, head: &str, commit: &str) -> bool {
+            self.contains
+                .iter()
+                .any(|(known_head, known_commit)| known_head == head && known_commit == commit)
+        }
+
+        fn recover_command(&self, number: u64, branch: &str) -> String {
+            format!("fetch {number} {branch}")
+        }
+    }
+
+    /// A repository with the branch `main` (one commit), the branch `work`
+    /// (one more commit), and the branch `fresh` on the commit of `main`.
+    /// Return its folder and the commit of `work`.
+    fn repository_with_branches(name: &str) -> (PathBuf, String) {
+        let folder = test_folder(name);
+        git_in(&folder, &["init", "-q", "-b", "main"]);
+        git_in(&folder, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        git_in(&folder, &["branch", "fresh"]);
+        git_in(&folder, &["checkout", "-q", "-b", "work"]);
+        git_in(&folder, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        let work = git_output(&folder, &["rev-parse", "work"]);
+        git_in(&folder, &["checkout", "-q", "main"]);
+        (folder, work)
+    }
+
+    fn status_of(
+        folder: &Path,
+        forge: &FakeForge,
+        default_branch: Option<&str>,
+        branch: &str,
+    ) -> BranchStatus {
+        branch_status(folder, forge, default_branch, branch).unwrap()
+    }
+
+    #[test]
+    fn branch_status_reads_each_case_of_the_forge() {
+        let (folder, work) = repository_with_branches("branch-status");
+        let forge = |pull_requests: Vec<PullRequest>| FakeForge {
+            pull_requests,
+            contains: vec![("newer".to_owned(), work.clone())],
+        };
+
+        assert_eq!(
+            status_of(&folder, &forge(vec![]), Some("main"), "work"),
+            BranchStatus::NoPullRequest
+        );
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![
+                    pull_request(3, OPEN, "x"),
+                    pull_request(2, MERGED, &work)
+                ]),
+                Some("main"),
+                "work"
+            ),
+            BranchStatus::Open(3)
+        );
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![pull_request(2, MERGED, &work)]),
+                Some("main"),
+                "work"
+            ),
+            BranchStatus::Finished {
+                pull_request: pull_request(2, MERGED, &work),
+                commit: work.clone(),
+            }
+        );
+        // The button "Update branch" adds a commit on the forge only.
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![pull_request(2, CLOSED, "newer")]),
+                Some("main"),
+                "work"
+            ),
+            BranchStatus::Finished {
+                pull_request: pull_request(2, CLOSED, "newer"),
+                commit: work.clone(),
+            }
+        );
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![pull_request(2, MERGED, "older")]),
+                Some("main"),
+                "work"
+            ),
+            BranchStatus::Kept {
+                number: 2,
+                why: KeptWhy::WorkAfter
+            }
+        );
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![pull_request(2, MERGED, "older")]),
+                Some("main"),
+                "fresh"
+            ),
+            BranchStatus::Kept {
+                number: 2,
+                why: KeptWhy::InDefaultBranch
+            }
+        );
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![pull_request(2, MERGED, "older")]),
+                Some("main"),
+                "gone"
+            ),
+            BranchStatus::Kept {
+                number: 2,
+                why: KeptWhy::NoLocalCommit
+            }
+        );
+        // Without a default branch, only the same commit proves the end.
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![pull_request(2, CLOSED, "newer")]),
+                None,
+                "work"
+            ),
+            BranchStatus::Kept {
+                number: 2,
+                why: KeptWhy::WorkAfter
+            }
+        );
     }
 
     #[test]

@@ -25,6 +25,8 @@ mod process;
 mod prune;
 mod stale;
 mod style;
+#[cfg(test)]
+mod test_support;
 mod ui;
 mod wt;
 
@@ -91,7 +93,7 @@ fn observe(is_observer: bool) -> Result<(), Error> {
 fn list_merged(folder: &Path) -> Result<(), Error> {
     for worktree in prune::check_worktrees(&main_checkout_of(folder)?, |_| false)?.finished {
         let state = match worktree.pull_request.state {
-            github::PullRequestState::Closed => "closed",
+            forge::PullRequestState::Closed => "closed",
             _ => "merged",
         };
         println!(

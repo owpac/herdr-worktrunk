@@ -6,9 +6,9 @@
 //! (`forge.platform` for a self-hosted host). Without wt, the provider
 //! comes from the name of the host of `origin`.
 //!
-//! This version has a backend for GitHub only. The other providers give
-//! "no backend": the cleaner keeps their worktrees, except the leftovers
-//! that git proves.
+//! A backend reads the pull requests of one provider. The providers
+//! without backend give "no backend": the cleaner keeps their worktrees,
+//! except the leftovers that git proves.
 
 use std::path::Path;
 use std::process::Command;
@@ -17,6 +17,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::git;
+use crate::github::GitHub;
+use crate::herdr::Error;
 use crate::process;
 use crate::prune::{self, BranchStatus};
 
@@ -25,6 +27,43 @@ use crate::prune::{self, BranchStatus};
 const SCHEMES: [&str; 4] = ["ssh://", "https://", "http://", "git://"];
 /// The time limit of `ssh -G`, which reads only the config of ssh.
 const SSH_CONFIG_TIME_LIMIT: Duration = Duration::from_secs(5);
+/// The time limit of a call to a forge from the observer, in the
+/// background.
+pub const BACKGROUND_TIME_LIMIT: Duration = Duration::from_secs(60);
+/// The time limit of a call to a forge from a popup: the user waits for
+/// it.
+pub const POPUP_TIME_LIMIT: Duration = Duration::from_secs(15);
+
+/// The state of a pull request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequestState {
+    Open,
+    Merged,
+    Closed,
+}
+
+/// A pull request of a branch: a merge request on GitLab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub state: PullRequestState,
+    /// The last commit of the pull request.
+    pub head: String,
+}
+
+/// The calls to one forge, for one repository.
+pub trait Backend {
+    /// The pull requests of `branch` in the repository itself, in all the
+    /// states, the newest first. A pull request from a fork does not count.
+    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error>;
+
+    /// Return true if the commit `head` contains the commit `commit`, as
+    /// the forge sees them. False if the forge does not know `commit`.
+    fn contains(&self, head: &str, commit: &str) -> bool;
+
+    /// The command that gets back the branch of a closed pull request.
+    fn recover_command(&self, number: u64, branch: &str) -> String;
+}
 
 /// The provider of a forge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,16 +212,9 @@ fn real_host(host: &str) -> String {
         .unwrap_or_else(|| host.to_owned())
 }
 
-/// The status of the pull requests of `branch`, from the backend of the
-/// provider. An error tells why the forge gave no answer: no backend, gh
-/// failed, a time limit.
-pub fn branch_status(
-    forge: &RepositoryForge,
-    main_checkout: &Path,
-    default_branch: Option<&str>,
-    branch: &str,
-    limit: Duration,
-) -> Result<BranchStatus, String> {
+/// The backend of the provider of `forge`. An error tells why the plugin
+/// cannot ask the forge: no backend, no repository.
+pub fn backend(forge: &RepositoryForge, limit: Duration) -> Result<Box<dyn Backend>, String> {
     match forge.provider {
         Provider::GitHub => {
             let host = if forge.host == "github.com" {
@@ -195,13 +227,27 @@ pub fn branch_status(
             }
             let repository = forge
                 .repository
-                .as_deref()
+                .clone()
                 .ok_or_else(|| "no owner and name for the repository on GitHub".to_owned())?;
-            prune::branch_status(main_checkout, repository, default_branch, branch, limit)
-                .map_err(|error| error.to_string().replace('\n', " "))
+            Ok(Box::new(GitHub::new(repository, limit)))
         }
         provider => Err(format!("no backend for {} yet", provider.name())),
     }
+}
+
+/// The status of the pull requests of `branch`, from the backend of the
+/// provider. An error tells why the forge gave no answer: no backend, the
+/// CLI failed, a time limit.
+pub fn branch_status(
+    forge: &RepositoryForge,
+    main_checkout: &Path,
+    default_branch: Option<&str>,
+    branch: &str,
+    limit: Duration,
+) -> Result<BranchStatus, String> {
+    let backend = backend(forge, limit)?;
+    prune::branch_status(main_checkout, backend.as_ref(), default_branch, branch)
+        .map_err(|error| error.to_string().replace('\n', " "))
 }
 
 #[cfg(test)]

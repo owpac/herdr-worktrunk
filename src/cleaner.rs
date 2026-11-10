@@ -35,7 +35,6 @@ use serde_json::Value;
 use crate::forge;
 use crate::fzf;
 use crate::git::{self, canonical};
-use crate::github;
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, Changes, Facts, Integration, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
@@ -414,7 +413,7 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
                 &entry.main_checkout,
                 repository.default_branch.as_deref(),
                 &entry.branch,
-                github::POPUP_TIME_LIMIT,
+                forge::POPUP_TIME_LIMIT,
             )),
         },
     };
@@ -1120,6 +1119,7 @@ fn parse_choice(text: &str, entries: &[Entry]) -> Option<Choice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, test_folder};
 
     fn entry(branch: &str, project: &str, reason: Reason, days: Option<u64>) -> Entry {
         Entry {
@@ -1339,37 +1339,6 @@ mod tests {
             Some(Choice::Delete(Box::new(entries[0].clone())))
         );
         assert_eq!(parse_choice("", &entries), None);
-    }
-
-    /// Run git in `folder` for a test, without the global config (for
-    /// example a signature with an agent).
-    fn git_in(folder: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(folder)
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(arguments)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {arguments:?}");
-    }
-
-    /// A new empty folder for a test.
-    fn test_folder(name: &str) -> PathBuf {
-        let base = env::temp_dir().join(format!("herdr-worktrunk-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(&base).unwrap();
-        base
     }
 
     #[test]

@@ -226,7 +226,7 @@ impl PullRequests {
             Ok(BranchStatus::Open(number)) => PullRequests::Open(number),
             Ok(BranchStatus::Finished { pull_request, .. }) => PullRequests::Finished {
                 number: pull_request.number,
-                merged: pull_request.state == crate::github::PullRequestState::Merged,
+                merged: pull_request.state == crate::forge::PullRequestState::Merged,
             },
             Ok(BranchStatus::Kept { number, why }) => match why {
                 KeptWhy::WorkAfter => PullRequests::WorkAfter(number),

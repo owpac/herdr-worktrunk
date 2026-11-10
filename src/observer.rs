@@ -31,8 +31,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::actions;
+use crate::forge::PullRequestState;
 use crate::git::{self, Checkout, LinkedWorktree};
-use crate::github::PullRequestState;
 use crate::herdr::{self, Error, Pane, Snapshot};
 use crate::prune::{self, FinishedWorktree};
 use crate::stale::{self, OldWorktree};
@@ -852,8 +852,8 @@ fn finish_worktree(
     let number = worktree.pull_request.number;
     let message = match worktree.pull_request.state {
         PullRequestState::Closed => format!(
-            "removed the worktree of {}: its pull request #{number} is closed. To get the branch back: git fetch origin pull/{number}/head:{}",
-            worktree.branch, worktree.branch
+            "removed the worktree of {}: its pull request #{number} is closed. To get the branch back: {}",
+            worktree.branch, worktree.recover_command
         ),
         _ => format!(
             "removed the worktree of {}: its pull request #{number} is merged",
@@ -1175,6 +1175,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::test_folder;
 
     fn checkout(root: &str) -> Checkout {
         Checkout {
@@ -1594,17 +1595,6 @@ mod tests {
         let binary = binary_to_run(Path::new(OLD_BINARY), Some(Path::new(OLD_BINARY)), true);
 
         assert_eq!(binary, Some(PathBuf::from(OLD_BINARY)));
-    }
-
-    /// A new empty folder for one test, in the temporary folder.
-    fn test_folder(name: &str) -> PathBuf {
-        let folder = env::temp_dir().join(format!(
-            "herdr-worktrunk-test-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&folder);
-        fs::create_dir_all(&folder).unwrap();
-        folder
     }
 
     #[test]
