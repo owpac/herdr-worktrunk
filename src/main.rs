@@ -191,8 +191,8 @@ fn main() -> ExitCode {
             cleaner::print_enter(kind);
             return ExitCode::SUCCESS;
         }
-        ["cleaner-delete-all", state] => {
-            cleaner::print_delete_all(Path::new(state));
+        ["cleaner-delete-all", state, visible] => {
+            cleaner::print_delete_all(Path::new(state), Path::new(visible));
             return ExitCode::SUCCESS;
         }
         ["cleaner-preview", state, stale_days, id, branch, main_checkout, kind] => {

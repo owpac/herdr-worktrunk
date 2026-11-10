@@ -475,10 +475,7 @@ fn delete_all() -> Result<(), Error> {
     // The state file keeps the results of the checks: the cleaner reads it
     // again after the question.
     let state_path = PathBuf::from(env::var_os(STATE_VARIABLE).unwrap_or_default());
-    let old: Vec<cleaner::Entry> = cleaner::leftovers(&state_path)
-        .into_iter()
-        .filter(|entry| entry.path.exists())
-        .collect();
+    let (old, total) = cleaner::chosen_leftovers(&state_path);
     if old.is_empty() {
         return Ok(());
     }
@@ -492,12 +489,23 @@ fn delete_all() -> Result<(), Error> {
     } else {
         String::new()
     };
+    // Only the group To delete: the kept worktrees never go.
+    let hidden = if total > old.len() {
+        let hidden = total - old.len();
+        format!(
+            "\nThe filter hides {} of the group: {}.",
+            worktrees_text(hidden),
+            if hidden == 1 { "it stays" } else { "they stay" }
+        )
+    } else {
+        String::new()
+    };
     let question = format!(
-        "Delete {} of the group To delete?\n{}{more}\nwt keeps a branch that is not merged.",
+        "Delete {} of the group To delete?\n{}{more}{hidden}\nThe other groups stay. wt keeps a branch that is not merged.",
         worktrees_text(old.len()),
         shown.join("\n")
     );
-    if !ui::confirm("Clean the worktrees", &question, "Delete all", true) {
+    if !ui::confirm("Clean the worktrees", &question, "Delete", true) {
         return Ok(());
     }
     let mut deleted = 0;
@@ -568,8 +576,8 @@ fn delete_all() -> Result<(), Error> {
 }
 
 /// Popup cleaner: all the linked worktrees, checked in the background.
-/// `Enter` deletes one, `ctrl-a` deletes the group "To delete", through
-/// the popup confirm. Then the list comes back, without the deleted
+/// `Enter` deletes one, `ctrl-a` deletes the worktrees of the group "To
+/// delete" that the filter shows, through the popup confirm. Then the list comes back, without the deleted
 /// worktrees.
 ///
 /// The list covers `TRUNK_CLEANER_SCOPE`, or all the repositories of the

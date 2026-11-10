@@ -53,7 +53,7 @@ The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a term
 |-----|--------|
 | `↑` `↓` | Move to the next worktree, over the titles of the groups. |
 | `Enter` | Asks to delete the worktree. The question gives its reason, for example an open pull request. |
-| `ctrl-a` | Asks to delete the group To delete. |
+| `ctrl-a` | Asks to delete the worktrees of the group To delete that the filter shows. A worktree of another group never goes. |
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes`, and `checks`: the verdict and the result of each layer. |
 | `Esc` | Quits. |
 

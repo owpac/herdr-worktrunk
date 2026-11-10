@@ -7,8 +7,9 @@
 //!
 //! The module `leftover` gives the layers of the checks and the verdict.
 //!
-//! `Enter` deletes one worktree after a question, `ctrl-a` deletes the
-//! group "To delete". Then the list comes back.
+//! `Enter` deletes one worktree after a question. `ctrl-a` deletes the
+//! worktrees of the group "To delete" that the filter shows, never a kept
+//! worktree. Then the list comes back.
 //!
 //! fzf runs this binary for its events: `cleaner-rows` gives the rows,
 //! `cleaner-move` moves the cursor over the titles of the groups, and
@@ -49,7 +50,7 @@ const GHOST: &str = "worktree — type to filter";
 // The footer has the width of the list: the hints must be short.
 const HINTS: [(&str, &str); 4] = [
     ("⏎", "delete"),
-    ("^a", "delete all"),
+    ("^a", "delete group To delete"),
     ("⇥", "preview"),
     ("esc", "close"),
 ];
@@ -161,16 +162,64 @@ pub fn read_state(path: &Path) -> Vec<Entry> {
         .collect()
 }
 
-/// The leftovers of the state file: the group To delete, for "delete all".
-pub fn leftovers(state_path: &Path) -> Vec<Entry> {
-    leftover_entries(read_state(state_path))
+/// The file of the worktrees that `ctrl-a` chose: the leftovers that the
+/// filter of fzf shows, one path for each line.
+pub fn chosen_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("delete")
 }
 
-fn leftover_entries(entries: Vec<Entry>) -> Vec<Entry> {
-    entries
+/// The worktrees that "delete all" deletes: the leftovers of the state
+/// file that `ctrl-a` chose and that still exist, and the number of all
+/// the leftovers of the group To delete. The file of the choice goes away.
+pub fn chosen_leftovers(state_path: &Path) -> (Vec<Entry>, usize) {
+    let chosen_file = chosen_path(state_path);
+    let chosen = fs::read_to_string(&chosen_file).unwrap_or_default();
+    let _ = fs::remove_file(&chosen_file);
+    let leftovers: Vec<Entry> = read_state(state_path)
         .into_iter()
-        .filter(|entry| entry.reason.is_leftover())
+        .filter(|entry| entry.reason.is_leftover() && entry.path.exists())
+        .collect();
+    let total = leftovers.len();
+    (chosen_entries(leftovers, &chosen), total)
+}
+
+/// The leftovers whose path is a line of `chosen`.
+fn chosen_entries(leftovers: Vec<Entry>, chosen: &str) -> Vec<Entry> {
+    let chosen: HashSet<&Path> = chosen.lines().map(Path::new).collect();
+    leftovers
+        .into_iter()
+        .filter(|entry| entry.reason.is_leftover() && chosen.contains(entry.path.as_path()))
         .collect()
+}
+
+/// The answer of fzf to `ctrl-a`.
+#[derive(Debug, PartialEq, Eq)]
+enum DeleteAllAnswer {
+    /// Delete these leftovers, after a question.
+    Delete(Vec<PathBuf>),
+    /// No deletion: the header tells why.
+    Header(&'static str),
+}
+
+/// The answer to `ctrl-a`: the leftovers among the rows that the filter
+/// shows (`visible`, one id for each line). A kept worktree never goes.
+fn delete_all_answer(entries: &[Entry], visible: &str) -> DeleteAllAnswer {
+    let visible: HashSet<&str> = visible.lines().collect();
+    let chosen: Vec<PathBuf> = entries
+        .iter()
+        .filter(|entry| entry.reason.is_leftover())
+        .filter(|entry| visible.contains(entry.path.to_string_lossy().as_ref()))
+        .map(|entry| entry.path.clone())
+        .collect();
+    if !chosen.is_empty() {
+        DeleteAllAnswer::Delete(chosen)
+    } else if entries.iter().any(|entry| entry.reason.is_leftover()) {
+        DeleteAllAnswer::Header("The filter shows no worktree of the group To delete.")
+    } else if entries.iter().any(|entry| entry.reason == Reason::Checking) {
+        DeleteAllAnswer::Header("The checks run: wait for the group To delete.")
+    } else {
+        DeleteAllAnswer::Header("The group To delete is empty.")
+    }
 }
 
 /// The main checkouts of the repositories of the herdr workspaces, the
@@ -854,16 +903,23 @@ pub fn print_enter(kind: &str) {
     }
 }
 
-/// fzf event `cleaner-delete-all`: accept the deletion of the group "To
-/// delete" if it has worktrees.
-pub fn print_delete_all(state_path: &Path) {
-    let entries = read_state(state_path);
-    if entries.iter().any(|entry| entry.reason.is_leftover()) {
-        println!("print({DELETE_ALL_REQUEST})+accept");
-    } else if entries.iter().any(|entry| entry.reason == Reason::Checking) {
-        println!("change-header:The checks run: wait for the group To delete.");
-    } else {
-        println!("change-header:The group To delete is empty.");
+/// fzf event `cleaner-delete-all`: accept the deletion of the worktrees of
+/// the group "To delete" that the filter shows (`visible_path`, the file
+/// of `{*f1}`), or tell why not in the header.
+pub fn print_delete_all(state_path: &Path, visible_path: &Path) {
+    let visible = fs::read_to_string(visible_path).unwrap_or_default();
+    match delete_all_answer(&read_state(state_path), &visible) {
+        DeleteAllAnswer::Delete(chosen) => {
+            let text: String = chosen
+                .iter()
+                .map(|path| format!("{}\n", path.display()))
+                .collect();
+            match stale::write_atomically(&chosen_path(state_path), &text) {
+                Ok(()) => println!("print({DELETE_ALL_REQUEST})+accept"),
+                Err(_) => println!("change-header:The cleaner cannot write its choice."),
+            }
+        }
+        DeleteAllAnswer::Header(text) => println!("change-header:{text}"),
     }
 }
 
@@ -1021,7 +1077,8 @@ pub fn choose(
         // Enter and a double-click accept a worktree row only.
         format!("enter:transform({binary} cleaner-enter {{4}})"),
         format!("double-click:transform({binary} cleaner-enter {{4}})"),
-        format!("ctrl-a:transform({binary} cleaner-delete-all {state})"),
+        // {*f1}: a file with the id of each row that the filter shows.
+        format!("ctrl-a:transform({binary} cleaner-delete-all {state} {{*f1}})"),
         format!(
             "tab:transform({binary} picker-tab {state} next {})",
             PREVIEW_TABS.len()
@@ -1344,20 +1401,59 @@ mod tests {
     }
 
     #[test]
-    fn delete_all_takes_the_leftovers_only() {
+    fn ctrl_a_takes_only_the_leftovers_that_the_filter_shows() {
         let entries = entries();
+        // The file of {*f1}: the ids of the rows that the filter shows.
+        let all = "group:to-delete\n/work/zeta.d-merged\n/work/alpha.a-old\n/work/zeta.b-open\n";
+        let filtered = "/work/zeta.d-merged\n/work/zeta.b-open\n";
 
-        let choice = parse_choice("delete-all\n", &entries);
-        let old = leftover_entries(entries.clone());
+        assert_eq!(
+            delete_all_answer(&entries, all),
+            DeleteAllAnswer::Delete(vec![
+                PathBuf::from("/work/alpha.a-old"),
+                PathBuf::from("/work/zeta.d-merged"),
+            ])
+        );
+        // A kept worktree (b-open) never goes, also when the filter shows it.
+        assert_eq!(
+            delete_all_answer(&entries, filtered),
+            DeleteAllAnswer::Delete(vec![PathBuf::from("/work/zeta.d-merged")])
+        );
+        assert_eq!(
+            delete_all_answer(&entries, "/work/zeta.b-open\n"),
+            DeleteAllAnswer::Header("The filter shows no worktree of the group To delete.")
+        );
+        let checking = [entry("c-check", "alpha", Reason::Checking, None)];
+        assert_eq!(
+            delete_all_answer(&checking, ""),
+            DeleteAllAnswer::Header("The checks run: wait for the group To delete.")
+        );
+        assert_eq!(
+            delete_all_answer(&[], ""),
+            DeleteAllAnswer::Header("The group To delete is empty.")
+        );
+        assert_eq!(
+            parse_choice("delete-all\n", &entries),
+            Some(Choice::DeleteAll)
+        );
+    }
 
-        assert_eq!(choice, Some(Choice::DeleteAll));
-        let branches: Vec<&str> = old.iter().map(|entry| entry.branch.as_str()).collect();
-        assert_eq!(branches, ["a-old", "d-merged"]);
-        let kept_only: Vec<Entry> = entries
+    #[test]
+    fn delete_all_deletes_only_the_chosen_leftovers() {
+        let leftovers: Vec<Entry> = entries()
             .into_iter()
-            .filter(|entry| !entry.reason.is_leftover())
+            .filter(|entry| entry.reason.is_leftover())
             .collect();
-        assert_eq!(parse_choice("delete-all\n", &kept_only), None);
+
+        let chosen = chosen_entries(
+            leftovers.clone(),
+            "/work/zeta.d-merged\n/work/zeta.b-open\n",
+        );
+        let branches: Vec<&str> = chosen.iter().map(|entry| entry.branch.as_str()).collect();
+
+        assert_eq!(branches, ["d-merged"]);
+        // No file of the choice: nothing to delete.
+        assert!(chosen_entries(leftovers, "").is_empty());
     }
 
     #[test]
