@@ -47,7 +47,7 @@ The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a term
 
 ![The tab checks of the cleaner](docs/cleaner-checks.png)
 
-`prefix+shift+c` lists **all the linked worktrees of the repositories of the herdr workspaces**, at once. Threads check each worktree in the background: its row shows a spinner until the check ends. The leftovers go to the group **To delete** at the top. The other worktrees stay in one group for each project, with the reason that keeps them.
+`prefix+shift+c` lists **all the linked worktrees of the repositories of the herdr workspaces**, at once. Threads check each worktree in the background: its row shows a spinner until the check ends. The leftovers go to the group **To delete** at the top. Then the group **Waiting** shows the worktrees where an idle agent waits without a proof of the end, for example a fork that never opened a pull request: resume the agent in its workspace, or close it. The other worktrees stay in one group for each project, with the reason that keeps them.
 
 | Key | Result |
 |-----|--------|
@@ -177,7 +177,7 @@ The plugin starts an observer with herdr. Every 2 seconds, it reads the state of
 1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell.
 2. **The workspace of a removed worktree closes**, if no agent works in it.
 3. **The worktrees of the finished work go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces: the finished pull requests, and the branches in the default branch.
-4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days.
+4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days. A worktree where an idle agent waits counts too: the cleaner shows it in the group Waiting, and does not delete it.
 
 <details>
 <summary>The rules of <code>prune_merged</code></summary>

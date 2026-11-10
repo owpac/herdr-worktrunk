@@ -292,6 +292,21 @@ impl ViewAgent {
             .is_some_and(|root| git::canonical(root) == git::canonical(checkout))
     }
 
+    /// Return true if the agent waits in the worktree `checkout`, as the
+    /// cleaner sees it (`leftover::WorktreeAgent::may_close`): idle or
+    /// done, its folder in the worktree, its pane in the workspace of the
+    /// worktree, and this workspace without the focus. The cleaner shows
+    /// such a worktree in the group "Waiting".
+    fn waits_in(&self, checkout: &Path) -> bool {
+        matches!(self.status.as_deref(), Some("idle" | "done"))
+            && !self.is_workspace_focused
+            && self.works_in(checkout)
+            && self
+                .workspace_root
+                .as_deref()
+                .is_some_and(|root| git::canonical(root) == git::canonical(checkout))
+    }
+
     /// Return true if the folder or the workspace of the agent is in
     /// `checkout`.
     fn uses(&self, checkout: &Path) -> bool {
@@ -659,8 +674,10 @@ struct PruneSettings {
 }
 
 /// Select the old worktrees among the worktrees without pull request: no
-/// agent, a question allowed again, no activity for `stale_days` days, and
-/// no change that is not committed.
+/// agent that works (an idle agent can wait there), a question allowed
+/// again, no activity for `stale_days` days, and no change that is not
+/// committed. The cleaner shows a worktree with an idle agent in the group
+/// "Waiting", and never deletes it.
 fn old_worktrees(
     main_checkout: &Path,
     worktrees: Vec<LinkedWorktree>,
@@ -668,14 +685,22 @@ fn old_worktrees(
     asked: &HashMap<PathBuf, u64>,
     stale_days: u32,
 ) -> Vec<OldWorktree> {
-    let is_busy = |checkout: &Path| !lock(view).agents_in(checkout).is_empty();
+    let is_busy = |checkout: &Path| {
+        let agents = lock(view).agents_in(checkout);
+        !agents.iter().all(|agent| agent.waits_in(checkout))
+    };
     stale::select_old(main_checkout, worktrees, is_busy, Some(asked), stale_days)
 }
 
 /// Open the popup cleaner with all the old worktrees, in a new thread: an
 /// open popup must not stop the removals. The thread records a question
 /// for each worktree of the list: `Esc` keeps them for `stale_days` days.
-fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: Arc<Log>) {
+fn ask_about_old_worktrees(
+    old: Vec<OldWorktree>,
+    waiting: usize,
+    settings: PruneSettings,
+    log: Arc<Log>,
+) {
     let Some(folder) = old.first().map(|worktree| worktree.main_checkout.clone()) else {
         return;
     };
@@ -698,7 +723,7 @@ fn ask_about_old_worktrees(old: Vec<OldWorktree>, settings: PruneSettings, log: 
             }
             stale::write_asked(&settings.state_dir, &asked);
             log.write(&format!(
-                "opened the popup cleaner with {} old worktrees",
+                "opened the popup cleaner with {} old worktrees, {waiting} with an idle agent that waits",
                 old.len()
             ));
         });
@@ -753,7 +778,11 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
         // tries again.
         if is_stale_pass && is_checked {
             stale::write_last_pass(&settings.state_dir, stale::now());
-            ask_about_old_worktrees(old, settings.clone(), Arc::clone(log));
+            let waiting = old
+                .iter()
+                .filter(|worktree| !lock(view).agents_in(&worktree.path).is_empty())
+                .count();
+            ask_about_old_worktrees(old, waiting, settings.clone(), Arc::clone(log));
         }
         for notice in &notices {
             if !previous_notices.contains(notice) {
@@ -805,9 +834,23 @@ fn prune_repository(
             notices.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
         }
     }
+    let mut without_pull_request = check.without_pull_request;
     for worktree in &check.merged {
-        if let Err(error) = finish_merged_worktree(main_checkout, worktree, view, log) {
-            notices.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
+        let is_kept_by_rule = match finish_merged_worktree(main_checkout, worktree, view, log) {
+            Ok(is_kept_by_rule) => is_kept_by_rule,
+            Err(error) => {
+                notices.insert(format!("finish {}: {}", worktree.branch, one_line(&error)));
+                false
+            }
+        };
+        // A merged worktree that the rule keeps, without a pull request,
+        // can wait for the daily question too: for example a fork that
+        // never committed.
+        if is_kept_by_rule && !worktree.has_pull_request {
+            without_pull_request.push(LinkedWorktree {
+                path: worktree.path.clone(),
+                branch: worktree.branch.clone(),
+            });
         }
     }
     // Without any checked branch, the daily question has no list: the
@@ -815,7 +858,7 @@ fn prune_repository(
     if check.checked == 0 && !check.errors.is_empty() {
         return None;
     }
-    Some(check.without_pull_request)
+    Some(without_pull_request)
 }
 
 /// A number of branches: `1 branch`, `3 branches`.
@@ -858,7 +901,7 @@ fn finish_worktree(
             ));
             return Ok(());
         }
-        Preparation::Kept => return Ok(()),
+        Preparation::Refused | Preparation::Kept => return Ok(()),
     };
     wt::remove_finished(main_checkout, &worktree.path)?;
     let why = if is_closed {
@@ -877,12 +920,15 @@ fn finish_worktree(
 /// `leftover::merged_branch` allows it: with its own commits, at once
 /// (idle agents close first). Without own commit, only without agent, after
 /// 1 day without activity. wt deletes the branch only if it sees it merged.
+///
+/// Return true if the rule or an agent keeps the worktree: not a change, a
+/// late view of herdr or a removal.
 fn finish_merged_worktree(
     main_checkout: &Path,
     worktree: &MergedWorktree,
     view: &Mutex<PruneView>,
     log: &Log,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let target = Target {
         main_checkout,
         path: &worktree.path,
@@ -906,8 +952,10 @@ fn finish_merged_worktree(
     };
     // An agent in a new worktree is the usual case: no notice. The agent
     // of a merge without pull request reports, then stops.
-    let Preparation::Ready(closed_agents) = prepare_removal(&target, view, log, may_remove)? else {
-        return Ok(());
+    let closed_agents = match prepare_removal(&target, view, log, may_remove)? {
+        Preparation::Ready(closed_agents) => closed_agents,
+        Preparation::AgentStays | Preparation::Refused => return Ok(true),
+        Preparation::Kept => return Ok(false),
     };
     wt::remove_quietly(main_checkout, &worktree.path)?;
     let commits = match history.get() {
@@ -924,7 +972,7 @@ fn finish_merged_worktree(
         worktree.default_branch
     );
     report_removal(log, &worktree.branch, &why, &closed_agents);
-    Ok(())
+    Ok(false)
 }
 
 /// Write a removal in the log, and show it to the user in a herdr
@@ -976,7 +1024,9 @@ enum Preparation {
     /// An agent works in the worktree, waits for an answer, or its
     /// workspace has the focus.
     AgentStays,
-    /// The branch, the changes or the rule keep the worktree.
+    /// The rule (`may_remove`) keeps the worktree.
+    Refused,
+    /// The branch, the changes or a late view of herdr keep the worktree.
     Kept,
 }
 
@@ -1003,8 +1053,11 @@ fn prepare_removal(
     };
     // Check the branch and the changes before an agent closes: if the
     // worktree must stay, its agents stay too. The cheap checks first.
-    if !target.is_unchanged() || !git::is_clean(target.path) || !may_remove(state) {
+    if !target.is_unchanged() || !git::is_clean(target.path) {
         return Ok(Preparation::Kept);
+    }
+    if !may_remove(state) {
+        return Ok(Preparation::Refused);
     }
     let mut closed_agents = Vec::new();
     if state == leftover::Agents::Idle {
@@ -1869,5 +1922,27 @@ mod tests {
             ),
             "Reason: main contains its commits.\nClosed agent, to resume it: claude --resume abc"
         );
+    }
+
+    #[test]
+    fn an_agent_waits_only_in_the_workspace_of_its_worktree() {
+        let worktree = Path::new("/work/app.feat");
+        let agent = |status: &str, workspace: &str, focused: bool| ViewAgent {
+            pane_id: "p1".to_owned(),
+            kind: "claude".to_owned(),
+            status: Some(status.to_owned()),
+            session: None,
+            folder_root: Some(PathBuf::from("/work/app.feat")),
+            workspace_root: Some(PathBuf::from(workspace)),
+            is_workspace_focused: focused,
+            is_in_main_workspace: workspace == "/work/app",
+        };
+
+        assert!(agent("idle", "/work/app.feat", false).waits_in(worktree));
+        assert!(agent("done", "/work/app.feat", false).waits_in(worktree));
+        // The cleaner sees these agents as busy: no group Waiting.
+        assert!(!agent("working", "/work/app.feat", false).waits_in(worktree));
+        assert!(!agent("idle", "/work/app.feat", true).waits_in(worktree));
+        assert!(!agent("idle", "/work/other", false).waits_in(worktree));
     }
 }

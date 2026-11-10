@@ -77,6 +77,9 @@ pub struct MergedWorktree {
     /// The default branch that contains the commit: `main` or
     /// `origin/main`.
     pub default_branch: String,
+    /// The branch has a finished pull request: its commit is in the default
+    /// branch, without a proof that the pull request contains it.
+    pub has_pull_request: bool,
 }
 
 /// The linked worktrees of a repository, sorted by their pull requests.
@@ -205,6 +208,7 @@ fn merged_worktree(
         branch: worktree.branch.clone(),
         commit,
         default_branch: default_branch.clone(),
+        has_pull_request: false,
     })
 }
 
@@ -356,7 +360,8 @@ fn sort_worktrees(
             }
         };
         if is_merge_candidate(&status, pushes.get(&worktree.branch)) {
-            if let Some(merged) = merged_worktree(main_checkout, &worktree, &default_branches) {
+            if let Some(mut merged) = merged_worktree(main_checkout, &worktree, &default_branches) {
+                merged.has_pull_request = matches!(status, BranchStatus::Kept { .. });
                 check.merged.push(merged);
                 continue;
             }
