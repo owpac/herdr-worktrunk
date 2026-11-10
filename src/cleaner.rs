@@ -65,7 +65,7 @@ const FRAME_INTERVAL: &str = "0.1";
 const RELOAD_INTERVAL: Duration = Duration::from_millis(100);
 /// The attempts to reach the socket of fzf, one for each reload interval.
 const SOCKET_ATTEMPTS: u32 = 30;
-/// The checks that run at the same time: each one calls gh.
+/// The checks that run at the same time: each one calls the forge.
 const WORKERS: usize = 8;
 /// Set when the popup closes without a choice: the checks stop writing
 /// the state file, so the plugin can remove it.

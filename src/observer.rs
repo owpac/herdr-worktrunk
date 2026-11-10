@@ -773,7 +773,7 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
 /// pull request, for the daily question, or None if the check failed.
 ///
 /// A worktree where an agent must stay (see `agent_decision`) costs no
-/// call to GitHub.
+/// call to the forge.
 fn prune_repository(
     main_checkout: &Path,
     view: &Mutex<PruneView>,
@@ -806,7 +806,7 @@ fn prune_repository(
 /// Remove one finished worktree and its branch.
 ///
 /// The thread reads the view and the commit of the branch just before the
-/// removal: during the calls to GitHub, an agent can enter the worktree,
+/// removal: during the calls to the forge, an agent can enter the worktree,
 /// or a commit can change the branch. If idle agents work in the worktree,
 /// the thread first closes their panes. Then the observer closes the
 /// workspace of the removed worktree (rule 2).

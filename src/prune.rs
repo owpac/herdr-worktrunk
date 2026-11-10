@@ -5,7 +5,7 @@
 //! for a change of the review. The observer finds these worktrees, and
 //! removes them with wt.
 //!
-//! A pull request is finished if GitHub merged it or closed it. A worktree
+//! A pull request is finished if the forge merged it or closed it. A worktree
 //! is finished if its branch has no open pull request, if the default
 //! branch does not contain its local commit, and if one of these
 //! conditions is true for a finished pull request of its branch:
@@ -15,9 +15,10 @@
 //!   button "Update branch" of GitHub: it adds a commit that the local
 //!   branch does not have.
 //!
-//! Thus GitHub keeps each local commit of a finished worktree: in the
-//! default branch after a merge, and in `refs/pull/<number>/head` after a
-//! close.
+//! Thus the forge keeps each local commit of a finished worktree: in the
+//! default branch after a merge, and in the ref of the pull request after a
+//! close (`refs/pull/<number>/head` on GitHub,
+//! `refs/merge-requests/<iid>/head` on GitLab).
 //!
 //! A local commit in the default branch is not work of the branch: a new
 //! worktree starts there. Thus a new worktree stays, also on the name of
@@ -89,7 +90,7 @@ pub enum DefaultBranch {
 /// - `default_branch`: where the local commit is. If the default branch is
 ///   not known, only the first condition applies.
 /// - `head_contains`: tells if a pull request head contains the local
-///   commit (a call to GitHub).
+///   commit (a call to the forge).
 pub fn finished_pull_request<'a>(
     local_commit: &str,
     pull_requests: &'a [PullRequest],
@@ -211,9 +212,9 @@ pub fn branch_status(
 /// pull requests.
 ///
 /// `skip` tells if the thread must keep a worktree without a question to
-/// GitHub, for example a worktree where an agent works. If the remote
-/// `origin` is not on GitHub, or if git or gh fails, the function returns
-/// an error and no worktree.
+/// the forge, for example a worktree where an agent works. If the forge of
+/// `origin` has no backend, or if git or the forge fails, the function
+/// returns an error and no worktree.
 pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Result<Check, Error> {
     let worktrees: Vec<LinkedWorktree> = git::linked_worktrees(main_checkout)?
         .into_iter()
@@ -249,12 +250,12 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
     Ok(check)
 }
 
-/// Keep the old worktrees whose branch has no pull request on GitHub.
+/// Keep the old worktrees whose branch has no pull request on the forge.
 ///
 /// The caller selects the old worktrees with local checks first (agents,
-/// activity, changes): this function then calls gh once for each of them
-/// only. Without old worktrees, it calls nothing, also for a repository
-/// without remote on GitHub.
+/// activity, changes): this function then calls the forge once for each
+/// of them only. Without old worktrees, it calls nothing, also for a
+/// repository without a forge.
 pub fn without_pull_request(
     main_checkout: &Path,
     old: Vec<OldWorktree>,
