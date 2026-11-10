@@ -1,19 +1,16 @@
 //! The old worktrees without pull request (option `stale_days`).
 //!
-//! Once a day, the thread of the merged pull requests looks for the
+//! At each pass, the thread of the merged pull requests looks for the
 //! linked worktrees with no pull request, no agent that works, no change
-//! that is not committed, and no activity for `stale_days` days. It opens
-//! the popup cleaner of the plugin with these worktrees: the user deletes
-//! some or all of them, or quits. A worktree where an idle agent waits
-//! goes to the group "Waiting" of the cleaner: the user resumes or closes
-//! the agent. The thread does not ask again about a worktree for
-//! `stale_days` days. The action clean opens the same popup at once.
+//! that is not committed, and no activity for `stale_days` days. A herdr
+//! notification names the new ones: the user opens the cleaner to delete
+//! them. A worktree where an idle agent waits goes to the group "Waiting"
+//! of the cleaner: the user resumes or closes the agent. The thread does
+//! not name a worktree again for `stale_days` days.
 //!
-//! 2 files in the state folder keep the dates, so a restart of the
-//! observer does not ask again:
-//!
-//! - `stale-last`: the time of the last pass.
-//! - `stale-asked`: one line for each question, `<time>\t<path>`.
+//! The file `stale-asked` of the state folder keeps the time of each
+//! notification, one line for each worktree (`<time>\t<path>`): a restart
+//! of the observer does not name them again.
 
 use std::collections::HashMap;
 use std::fs;
@@ -42,12 +39,6 @@ pub fn is_stale(last_activity: u64, now: u64, stale_days: u32) -> bool {
     stale_days > 0 && now.saturating_sub(last_activity) >= u64::from(stale_days) * DAY
 }
 
-/// Return true if the last pass is one day old or older, or if no pass
-/// ran yet.
-pub fn is_pass_due(last_pass: Option<u64>, now: u64) -> bool {
-    last_pass.is_none_or(|time| now.saturating_sub(time) >= DAY)
-}
-
 /// Return true if the thread did not ask about `path` in the last
 /// `stale_days` days.
 pub fn may_ask(asked: &HashMap<PathBuf, u64>, path: &Path, now: u64, stale_days: u32) -> bool {
@@ -56,27 +47,8 @@ pub fn may_ask(asked: &HashMap<PathBuf, u64>, path: &Path, now: u64, stale_days:
         .is_none_or(|&time| now.saturating_sub(time) >= u64::from(stale_days) * DAY)
 }
 
-fn last_pass_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("stale-last")
-}
-
 fn asked_path(state_dir: &Path) -> PathBuf {
     state_dir.join("stale-asked")
-}
-
-/// Read the time of the last pass, or None if no pass ran yet.
-pub fn read_last_pass(state_dir: &Path) -> Option<u64> {
-    fs::read_to_string(last_pass_path(state_dir))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-}
-
-/// Write the time of the last pass. A failed write only makes the next
-/// pass come sooner.
-pub fn write_last_pass(state_dir: &Path, time: u64) {
-    let _ = fs::write(last_pass_path(state_dir), time.to_string());
 }
 
 /// Read the time of each question, by path of the worktree.
@@ -129,8 +101,8 @@ pub struct OldWorktree {
 /// the repository of `main_checkout`: no agent (`is_busy`), no activity
 /// for `stale_days` days, and no change that is not committed.
 ///
-/// `asked` gives the last questions of the daily pass: a worktree gets a
-/// new question only after `stale_days` days. A manual cleaning gives
+/// `asked` gives the last notifications: a worktree is named again only
+/// after `stale_days` days. A manual cleaning gives
 /// None: it shows all the old worktrees.
 pub fn select_old(
     main_checkout: &Path,
@@ -192,13 +164,6 @@ mod tests {
     #[test]
     fn stale_days_0_turns_the_question_off() {
         assert!(!is_stale(0, NOW, 0));
-    }
-
-    #[test]
-    fn a_pass_runs_once_a_day() {
-        assert!(is_pass_due(None, NOW));
-        assert!(is_pass_due(Some(NOW - DAY), NOW));
-        assert!(!is_pass_due(Some(NOW - DAY + 60), NOW));
     }
 
     #[test]

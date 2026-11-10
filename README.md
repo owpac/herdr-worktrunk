@@ -177,7 +177,7 @@ The plugin starts an observer with herdr. Every 2 seconds, it reads the state of
 1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell.
 2. **The workspace of a removed worktree closes**, if no agent works in it.
 3. **The worktrees of the finished work go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces: the finished pull requests, and the branches in the default branch.
-4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days. A worktree where an idle agent waits counts too: the cleaner shows it in the group Waiting, and does not delete it. The daily pass needs the check of a repository: a forge with a backend, or no remote `origin`.
+4. **The worktrees to clean**, with `stale_days = <days>`: when a worktree has no pull request and no activity for `stale_days` days, a herdr notification names it. Open the cleaner to delete it. The thread names a worktree again only after `stale_days` days. A worktree where an idle agent waits counts too: the notification tells it, and the cleaner shows it in the group Waiting. The check needs a forge with a backend, or no remote `origin`.
 
 <details>
 <summary>The rules of <code>prune_merged</code></summary>
@@ -199,7 +199,7 @@ The thread also removes the worktree of a branch that the default branch contain
 - With its own commits, the worktree goes at once, for example after a merge commit, or after `wt merge --no-remove` without a pull request. Idle agents close first.
 - Without its own commit, the worktree is new or unused. It goes only without agent, after 1 day without activity.
 
-A repository without the remote `origin` has no pull request: only this rule applies to it. A pushed branch without a pull request, for example `develop`, stays: the daily question and the cleaner show it. The thread finds a merge only in the history of git: a squash merge without a pull request stays for the cleaner.
+A repository without the remote `origin` has no pull request: only this rule applies to it. A pushed branch without a pull request, for example `develop`, stays: the notification of the worktrees to clean and the cleaner show it. The thread finds a merge only in the history of git: a squash merge without a pull request stays for the cleaner.
 
 The thread keeps a worktree with an open pull request, with changes that are not committed, or with a new commit after the check. It also keeps the main worktree, a detached worktree and a locked worktree, and ignores a pull request from a fork.
 
@@ -249,8 +249,8 @@ observe = true
 # Needs gh (GitHub), glab (GitLab), tea (Gitea, Forgejo) or az (Azure DevOps).
 prune_merged = false
 
-# Once a day, open the cleaner if a worktree has no pull request and no change for this number
-# of days (default: 0, off). Needs prune_merged = true. The cleaner uses 7 days if it is 0.
+# A notification names each worktree without pull request and without change for this number of
+# days (default: 0, off). Needs prune_merged = true. The cleaner uses 7 days if it is 0.
 stale_days = 0
 
 # The size of the picker, the cleaner and the merger: "default" (the size of herdr-bar,

@@ -312,7 +312,7 @@ pub fn branch_status(
 /// branch that was never pushed: a local merge, for example `wt merge
 /// --no-remove`. A pushed branch without pull request (`develop`) can be a
 /// long work that the default branch receives from time to time: it stays
-/// without pull request, for the daily question.
+/// without pull request, for the notification of the old worktrees.
 pub fn check_worktrees(main_checkout: &Path) -> Result<Check, Error> {
     let worktrees = git::linked_worktrees(main_checkout)?;
     if worktrees.is_empty() {
@@ -834,8 +834,8 @@ mod tests {
             .iter()
             .map(|worktree| worktree.branch.as_str())
             .collect();
-        // The broken branch is not "without pull request": the daily
-        // question does not see it.
+        // The broken branch is not "without pull request": the
+        // notification of the old worktrees does not see it.
         assert_eq!(without, ["other"]);
     }
 }
