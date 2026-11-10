@@ -308,7 +308,7 @@ bin/herdr-worktrunk observe                          # give the binary of the li
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-shellcheck scripts/*.sh
+shellcheck scripts/*.sh docs/make-images
 ```
 
 The images of this README come from `docs/make-images`: it makes a demo repository, then records the popups with [VHS](https://github.com/charmbracelet/vhs).
