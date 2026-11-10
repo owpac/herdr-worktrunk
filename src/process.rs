@@ -1,6 +1,6 @@
-//! Run a command without a terminal, with a time limit. The thread of the
-//! merged pull requests uses it for git and gh: a network that does not
-//! answer must not stop this thread.
+//! Run a command without a terminal, with a time limit: git, ssh and the
+//! CLIs of the forges (gh, glab, tea, az), for the observer and the popup
+//! cleaner. A network that does not answer must not stop a thread.
 
 use std::io::{self, Read};
 use std::process::{Command, Output, Stdio};

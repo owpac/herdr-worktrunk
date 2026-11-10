@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -37,6 +37,7 @@ use serde::Deserialize;
 use crate::forge::{self, encode_url_part as encode, Backend, PullRequest, PullRequestState};
 use crate::herdr::Error;
 use crate::process;
+use crate::sync::lock;
 
 /// The number of items that one call asks for.
 const PAGE_SIZE: usize = 50;
@@ -76,10 +77,6 @@ struct Response {
     body: Option<String>,
     /// The number of items of the whole list (`X-Total-Count`).
     total: Option<usize>,
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Gitea {
@@ -690,7 +687,7 @@ mod tests {
             Flavor::Forgejo,
             Duration::from_secs(1),
         );
-        gitea.commits.lock().unwrap().insert(
+        lock(&gitea.commits).insert(
             "head".to_owned(),
             vec!["head".to_owned(), "local".to_owned()],
         );

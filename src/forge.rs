@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
@@ -26,6 +26,7 @@ use crate::github::GitHub;
 use crate::gitlab::GitLab;
 use crate::herdr::Error;
 use crate::process;
+use crate::sync::lock;
 use crate::wt;
 
 /// The URL schemes of a remote. A remote without scheme has the form
@@ -313,20 +314,13 @@ pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
     type Known = HashMap<PathBuf, (Instant, Result<RepositoryForge, String>)>;
     static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
     let known = KNOWN.get_or_init(Mutex::default);
-    if let Some((time, forge)) = known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(main_checkout)
-    {
+    if let Some((time, forge)) = lock(known).get(main_checkout) {
         if time.elapsed() < OBSERVER_FORGE_LIFETIME {
             return forge.clone();
         }
     }
     let forge = resolve(main_checkout, wt::list_json(main_checkout).as_ref());
-    known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(main_checkout.to_owned(), (Instant::now(), forge.clone()));
+    lock(known).insert(main_checkout.to_owned(), (Instant::now(), forge.clone()));
     forge
 }
 
@@ -336,18 +330,11 @@ pub fn of_repository(main_checkout: &Path) -> Result<RepositoryForge, String> {
 fn real_host(host: &str) -> String {
     static KNOWN: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let known = KNOWN.get_or_init(Mutex::default);
-    if let Some(real) = known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(host)
-    {
+    if let Some(real) = lock(known).get(host) {
         return real.clone();
     }
     let real = host_from_ssh(host);
-    known
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(host.to_owned(), real.clone());
+    lock(known).insert(host.to_owned(), real.clone());
     real
 }
 

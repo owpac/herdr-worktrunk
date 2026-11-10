@@ -1,6 +1,6 @@
 //! The popup cleaner: all the linked worktrees of the repositories of the
 //! herdr workspaces, in fzf. The list shows at once. Threads check each
-//! worktree in the background (local criteria, then gh), and its row
+//! worktree in the background (local criteria, then the forge), and its row
 //! shows a spinner until its check ends. The leftovers go to the group
 //! "To delete" at the top. The other worktrees stay in a group for each
 //! project, with the reason that keeps them.
@@ -146,7 +146,7 @@ impl Entry {
             path: self.path.clone(),
             branch: self.branch.clone(),
             days: self.facts.days.unwrap_or(0),
-            close_idle_agents: self.facts.agent == Agents::Idle && self.reason.is_leftover(),
+            close_idle_agents: leftover::closes_idle_agents(self.reason, &self.facts),
         }
     }
 }
@@ -241,7 +241,7 @@ struct HerdrState {
 }
 
 /// The linked worktrees of `scope` (one repository), or of all the
-/// repositories of the herdr workspaces. Only local data: no gh. A
+/// repositories of the herdr workspaces. Only local data: no forge. A
 /// worktree with an agent gets its reason at once. `previous` gives the
 /// results of an earlier list (the return after a question): these
 /// worktrees keep their result without a new check.
@@ -397,7 +397,8 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
             // A repository without a remote has no pull request.
             Err(error) if error == forge::NO_REMOTE => PullRequests::NotNeeded(error.clone()),
             Err(error) => PullRequests::Failed(error.clone()),
-            // A forge that does not answer gives "no answer" after 15 s:
+            // A forge that does not answer gives "no answer" after
+            // forge::POPUP_TIME_LIMIT:
             // the worktree stays, and the spinner stops.
             Ok(backend) => PullRequests::from_status(
                 prune::branch_status(

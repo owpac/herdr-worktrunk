@@ -17,9 +17,10 @@
 //!
 //! Thus the forge keeps each local commit of a finished worktree: in the
 //! default branch after a merge, and with the pull request after a close.
-//! GitHub keeps `refs/pull/<number>/head`. GitLab deletes
-//! `refs/merge-requests/<iid>/head` 14 days after the close, but keeps the
-//! commits: a fetch of the commit itself gets the branch back.
+//! Each backend gives the command that gets the branch back
+//! (`Backend::recover_command`): GitHub, Gitea and Forgejo keep
+//! `refs/pull/<number>/head`, GitLab and Azure DevOps give the commit
+//! itself.
 //!
 //! A local commit in the default branch is not work of the branch: a new
 //! worktree starts there. Thus a new worktree stays, also on the name of
@@ -164,7 +165,7 @@ pub enum KeptWhy {
     NoLocalCommit,
 }
 
-/// Read the pull requests of `branch` (one call to the forge, sometimes 2),
+/// Read the pull requests of `branch` (one or more calls to the forge),
 /// and tell the status of its worktree. `origin_default_branch` is the default
 /// branch of `origin`, if git knows it.
 pub fn branch_status(
@@ -299,7 +300,7 @@ mod tests {
     }
 
     fn never(_head: &str) -> bool {
-        panic!("GitHub must not be asked");
+        panic!("the forge must not be asked");
     }
 
     const MERGED: PullRequestState = PullRequestState::Merged;
