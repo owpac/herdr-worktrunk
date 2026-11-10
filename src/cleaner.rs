@@ -82,15 +82,19 @@ const WORKTREE_KIND: &str = "worktree";
 fn glyph(reason: Reason) -> (&'static str, &'static str) {
     match reason {
         Reason::Checking => (ACCENT, SPINNER[0]),
-        reason if reason.is_leftover() => (RED, "✕"),
+        Reason::PullRequestMerged
+        | Reason::PullRequestClosed
+        | Reason::BranchMerged
+        | Reason::Old => (RED, "✕"),
         Reason::PullRequestOpen
         | Reason::Recent
+        | Reason::MergedRecently
         | Reason::WorkAfterPullRequest
         | Reason::CommitInDefaultBranch => (GREEN, "✓"),
         Reason::Changes => (YELLOW, "●"),
         Reason::Agent => (ACCENT, "◐"),
         Reason::IdleAgent => (DIM, "◐"),
-        _ => (DIM, "?"),
+        Reason::Unknown => (DIM, "?"),
     }
 }
 
@@ -885,18 +889,7 @@ fn print_checklist(entry: &Entry, stale_days: u32) {
         );
     }
     println!();
-    // The rule of the verdict, on short lines: the preview does not wrap.
-    for line in [
-        "To delete, in this order:".to_owned(),
-        "- no agent that works, and no change,".to_owned(),
-        "- no open pull request,".to_owned(),
-        "- a finished pull request with the last commit,".to_owned(),
-        format!(
-            "- or a merged branch, {} day without activity,",
-            leftover::MERGED_MIN_DAYS
-        ),
-        format!("- or no pull request, {stale_days} days without activity and no agent."),
-    ] {
+    for line in leftover::rule_lines(stale_days) {
         println!("{DIM}{line}{RESET}");
     }
 }
@@ -1347,6 +1340,11 @@ mod tests {
                 worktree.to_str().unwrap(),
             ],
         );
+        // A commit that main does not have: the branch is not merged, with
+        // or without wt.
+        fs::write(worktree.join("work.txt"), "work").unwrap();
+        git_in(&worktree, &["add", "work.txt"]);
+        git_in(&worktree, &["commit", "-q", "-m", "work"]);
         let entry = Entry::new(worktree, "local".to_owned(), main.clone(), Agents::None);
 
         let result = check(&entry, &repository_facts(&main, false), 7);

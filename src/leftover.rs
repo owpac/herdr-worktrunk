@@ -321,8 +321,12 @@ pub enum Reason {
     Old,
     /// Kept: an open pull request.
     PullRequestOpen,
-    /// Kept: some activity in the last days.
+    /// Kept: no pull request, and some activity in the last `stale_days`
+    /// days.
     Recent,
+    /// Kept: the branch is merged, but its last activity is less than
+    /// `MERGED_MIN_DAYS` old. A new worktree is merged at once.
+    MergedRecently,
     /// Kept: changes that are not committed.
     Changes,
     /// Kept: an agent works in the worktree.
@@ -378,7 +382,11 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
         _ => {}
     }
     let is_merged = matches!(facts.merge, Merge::Merged(_));
-    if is_merged && facts.days.is_some_and(|days| days >= MERGED_MIN_DAYS) {
+    if is_merged
+        && facts
+            .days
+            .is_some_and(|days| days >= activity_limit(facts, stale_days))
+    {
         return Reason::BranchMerged;
     }
     // A branch that was never pushed has no pull request, but only if the
@@ -389,6 +397,7 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
     if has_no_pull_request {
         return match facts.days {
             Some(days) if days >= u64::from(stale_days) => Reason::Old,
+            Some(_) if is_merged => Reason::MergedRecently,
             Some(_) => Reason::Recent,
             None => Reason::Unknown,
         };
@@ -402,9 +411,38 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
             why: KeptWhy::InDefaultBranch,
             ..
         } => Reason::CommitInDefaultBranch,
-        _ if is_merged && facts.days.is_some() => Reason::Recent,
+        _ if is_merged && facts.days.is_some() => Reason::MergedRecently,
         _ => Reason::Unknown,
     }
+}
+
+/// The days without activity that the verdict needs: `MERGED_MIN_DAYS` for
+/// a merged branch, else `stale_days`.
+pub fn activity_limit(facts: &Facts, stale_days: u32) -> u64 {
+    if matches!(facts.merge, Merge::Merged(_)) {
+        MERGED_MIN_DAYS
+    } else {
+        u64::from(stale_days)
+    }
+}
+
+/// The rule of the verdict, on short lines: the preview of the cleaner
+/// does not wrap.
+pub fn rule_lines(stale_days: u32) -> Vec<String> {
+    vec![
+        "To delete, in this order:".to_owned(),
+        "- no agent that works, and no change,".to_owned(),
+        "- no open pull request,".to_owned(),
+        "- a finished pull request with the last commit,".to_owned(),
+        format!(
+            "- or a merged branch, {} without activity,",
+            days_text(MERGED_MIN_DAYS)
+        ),
+        format!(
+            "- or no pull request, {} without activity and no agent.",
+            days_text(u64::from(stale_days))
+        ),
+    ]
 }
 
 /// A number of days: `1 day`, `7 days`.
@@ -413,6 +451,15 @@ fn days_text(days: u64) -> String {
         "1 day".to_owned()
     } else {
         format!("{days} days")
+    }
+}
+
+/// The time of a change: `today`, `1 day ago`, `3 days ago`.
+fn ago_text(days: u64) -> String {
+    if days == 0 {
+        "today".to_owned()
+    } else {
+        format!("{} ago", days_text(days))
     }
 }
 
@@ -479,9 +526,7 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
         Reason::Old if never_pushed => "never pushed, no recent activity".to_owned(),
         Reason::Old => format!("no {short}, no recent activity"),
         Reason::PullRequestOpen => format!("{short} {number} open"),
-        Reason::Recent if matches!(facts.merge, Merge::Merged(_)) => {
-            "merged, activity today".to_owned()
-        }
+        Reason::MergedRecently => "merged, recent activity".to_owned(),
         Reason::Recent if never_pushed => "never pushed, recent activity".to_owned(),
         Reason::Recent => format!("no {short}, recent activity"),
         Reason::Changes => "changes not committed".to_owned(),
@@ -513,9 +558,17 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
         Reason::PullRequestMerged => format!("Its {name} {number} is merged."),
         Reason::PullRequestClosed => format!("Its {name} {number} is closed."),
         Reason::BranchMerged => format!("{} contains its content.", facts.default_branch_name()),
-        Reason::Old => format!("No {name}, and no change for {days} days."),
+        Reason::Old => format!("No {name}, and no change for {}.", days_text(days)),
         Reason::PullRequestOpen => format!("Careful: its {name} {number} is open."),
-        Reason::Recent => format!("No proof that it is finished, and a change {days} days ago."),
+        Reason::Recent => format!(
+            "No proof that it is finished, and a change {}.",
+            ago_text(days)
+        ),
+        Reason::MergedRecently => format!(
+            "{} contains its content, but it had a change {}.",
+            facts.default_branch_name(),
+            ago_text(days)
+        ),
         Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
         Reason::Agent => "Careful: an agent works in it.".to_owned(),
         Reason::IdleAgent => {
@@ -587,166 +640,143 @@ fn line(mark: Mark, layer: &'static str, text: impl Into<String>, source: &str) 
 /// The lines of the tab `checks`, one for each layer, in the order of the
 /// checks.
 pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
-    let checking = reason == Reason::Checking;
-    let waiting = |layer: &'static str, source: &str| {
-        if checking {
-            line(Mark::Wait, layer, "checking…", source)
-        } else {
-            line(Mark::Info, layer, "not needed", source)
+    vec![
+        agent_line(facts, reason),
+        changes_line(facts, reason),
+        merge_line(facts, reason),
+        push_line(facts, reason),
+        pull_requests_line(facts, reason),
+        activity_line(facts, reason, stale_days),
+    ]
+}
+
+/// The line of a layer without its fact: the check runs, the verdict
+/// needed no check (an agent works), or the check gave no answer.
+fn missing_line(reason: Reason, layer: &'static str, source: &str) -> Line {
+    match reason {
+        Reason::Checking => line(Mark::Wait, layer, "checking…", source),
+        Reason::Agent => line(Mark::Info, layer, "not needed", source),
+        _ => line(Mark::Unknown, layer, "no answer", source),
+    }
+}
+
+fn agent_line(facts: &Facts, reason: Reason) -> Line {
+    let agent = |mark: Mark, text: &str| line(mark, "Agent", text, "herdr");
+    match facts.agent {
+        Agents::None => agent(Mark::Pass, "none"),
+        Agents::Busy => agent(Mark::Fail, "an agent works here"),
+        Agents::Idle if reason.is_leftover() => {
+            agent(Mark::Pass, "idle: it closes before the deletion")
         }
-    };
-    let agent = match facts.agent {
-        Agents::None => line(Mark::Pass, "Agent", "none", "herdr"),
-        Agents::Busy => line(Mark::Fail, "Agent", "an agent works here", "herdr"),
-        Agents::Idle if reason.is_leftover() => line(
-            Mark::Pass,
-            "Agent",
-            "idle: it closes before the deletion",
-            "herdr",
-        ),
-        Agents::Idle if reason == Reason::IdleAgent => line(
-            Mark::Fail,
-            "Agent",
-            "idle, but no proof of the end of its work",
-            "herdr",
-        ),
-        Agents::Idle => line(Mark::Info, "Agent", "idle", "herdr"),
-    };
-    let changes = match facts.changes {
-        Changes::Clean => line(Mark::Pass, "Changes", "none", "git status"),
-        Changes::Uncommitted => line(Mark::Fail, "Changes", "not committed", "git status"),
-        Changes::Failed => line(Mark::Unknown, "Changes", "git status failed", "git status"),
-        Changes::NotChecked => waiting("Changes", "git status"),
-    };
-    let merged = match &facts.merge {
-        Merge::Merged(how) => line(
-            Mark::Pass,
-            "Merged",
-            format!("yes: {}", merge_words(how, facts.default_branch_name())),
-            "wt",
-        ),
-        Merge::NotMerged(Some(commits)) => line(
+        Agents::Idle if reason == Reason::IdleAgent => {
+            agent(Mark::Fail, "idle, but no proof of the end of its work")
+        }
+        Agents::Idle => agent(Mark::Info, "idle"),
+    }
+}
+
+fn changes_line(facts: &Facts, reason: Reason) -> Line {
+    let changes = |mark: Mark, text: &str| line(mark, "Changes", text, "git status");
+    match facts.changes {
+        Changes::Clean => changes(Mark::Pass, "none"),
+        Changes::Uncommitted => changes(Mark::Fail, "not committed"),
+        Changes::Failed => changes(Mark::Unknown, "git status failed"),
+        Changes::NotChecked => missing_line(reason, "Changes", "git status"),
+    }
+}
+
+fn merge_line(facts: &Facts, reason: Reason) -> Line {
+    let main = facts.default_branch_name();
+    let merge = |mark: Mark, text: String| line(mark, "Merged", text, "wt");
+    match &facts.merge {
+        Merge::Merged(how) => merge(Mark::Pass, format!("yes: {}", merge_words(how, main))),
+        Merge::NotMerged(Some(commits)) => merge(
             Mark::Info,
-            "Merged",
-            format!(
-                "no: {} not in {}",
-                commits_text(*commits),
-                facts.default_branch_name()
-            ),
-            "wt",
+            format!("no: {} not in {main}", commits_text(*commits)),
         ),
-        Merge::NotMerged(None) => line(
-            Mark::Info,
-            "Merged",
-            format!("no: commits not in {}", facts.default_branch_name()),
-            "wt",
-        ),
-        Merge::Undetermined(why) => line(Mark::Unknown, "Merged", format!("unknown: {why}"), "wt"),
-        Merge::NotChecked => waiting("Merged", "wt"),
-    };
-    let push = match &facts.push {
-        Push::Never if forge_is_silent(&facts.pull_requests) => line(
+        Merge::NotMerged(None) => merge(Mark::Info, format!("no: commits not in {main}")),
+        Merge::Undetermined(why) => merge(Mark::Unknown, format!("unknown: {why}")),
+        Merge::NotChecked => missing_line(reason, "Merged", "wt"),
+    }
+}
+
+fn push_line(facts: &Facts, reason: Reason) -> Line {
+    let push = |mark: Mark, text: String| line(mark, "Push", text, "git");
+    match &facts.push {
+        Push::Never if forge_is_silent(&facts.pull_requests) => push(
             Mark::Pass,
-            "Push",
-            "never pushed: no pull request is possible",
-            "git",
+            "never pushed: no pull request is possible".to_owned(),
         ),
         // A push without -u, or a branch from the ref of a pull request,
         // has no remote branch here: the forge decides.
-        Push::Never => line(
+        Push::Never => push(
             Mark::Info,
-            "Push",
-            "no remote branch here: the forge decides",
-            "git",
+            "no remote branch here: the forge decides".to_owned(),
         ),
-        Push::Pushed(remote) => line(Mark::Info, "Push", format!("pushed to {remote}"), "git"),
-        Push::Gone(remote) => line(
-            Mark::Info,
-            "Push",
-            format!("{remote} is deleted (a hint only)"),
-            "git",
-        ),
-        Push::NotChecked => waiting("Push", "git"),
-    };
+        Push::Pushed(remote) => push(Mark::Info, format!("pushed to {remote}")),
+        Push::Gone(remote) => push(Mark::Info, format!("{remote} is deleted (a hint only)")),
+        Push::NotChecked => missing_line(reason, "Push", "git"),
+    }
+}
+
+fn pull_requests_line(facts: &Facts, reason: Reason) -> Line {
     let forge = if facts.forge.is_empty() {
-        "forge".to_owned()
+        "forge"
     } else {
-        facts.forge.clone()
+        facts.forge.as_str()
     };
-    let pull_requests = match &facts.pull_requests {
-        PullRequests::NoPullRequest => line(Mark::Pass, "Pull requests", "none", &forge),
-        PullRequests::Finished { number, merged } => line(
+    let number = facts
+        .pull_requests
+        .number()
+        .map(|number| facts.number_text(number))
+        .unwrap_or_default();
+    let pull_requests = |mark: Mark, text: String| line(mark, "Pull requests", text, forge);
+    match &facts.pull_requests {
+        PullRequests::NoPullRequest => pull_requests(Mark::Pass, "none".to_owned()),
+        PullRequests::Finished { merged, .. } => pull_requests(
             Mark::Pass,
-            "Pull requests",
             format!(
-                "{} {}, with the last commit",
-                facts.number_text(*number),
+                "{number} {}, with the last commit",
                 if *merged { "merged" } else { "closed" }
             ),
-            &forge,
         ),
-        PullRequests::Open(number) => line(
-            Mark::Fail,
-            "Pull requests",
-            format!("{} open", facts.number_text(*number)),
-            &forge,
-        ),
-        PullRequests::Kept { number, why } => {
+        PullRequests::Open(_) => pull_requests(Mark::Fail, format!("{number} open")),
+        PullRequests::Kept { why, .. } => {
             let (mark, words) = match why {
                 KeptWhy::WorkAfter => (Mark::Fail, "but the branch has commits after it"),
                 KeptWhy::InDefaultBranch => (Mark::Info, "the default branch has the commit"),
                 KeptWhy::NoLocalCommit => (Mark::Unknown, "but no local commit"),
             };
-            line(
-                mark,
-                "Pull requests",
-                format!("{} finished, {words}", facts.number_text(*number)),
-                &forge,
-            )
+            pull_requests(mark, format!("{number} finished, {words}"))
         }
-        PullRequests::NotNeeded(why) => line(
-            Mark::Info,
-            "Pull requests",
-            format!("not needed: {why}"),
-            &forge,
-        ),
-        PullRequests::Failed(error) => line(
-            Mark::Unknown,
-            "Pull requests",
-            format!("no answer: {error}"),
-            &forge,
-        ),
-        PullRequests::NotChecked => waiting("Pull requests", &forge),
+        PullRequests::NotNeeded(why) => pull_requests(Mark::Info, format!("not needed: {why}")),
+        PullRequests::Failed(error) => pull_requests(Mark::Unknown, format!("no answer: {error}")),
+        PullRequests::NotChecked => missing_line(reason, "Pull requests", forge),
+    }
+}
+
+fn activity_line(facts: &Facts, reason: Reason, stale_days: u32) -> Line {
+    let Some(days) = facts.days else {
+        return missing_line(reason, "Activity", "git");
     };
-    let activity = match facts.days {
-        Some(days) => {
-            // The rule of the merge has its own limit.
-            let limit = if matches!(facts.merge, Merge::Merged(_)) {
-                MERGED_MIN_DAYS
-            } else {
-                u64::from(stale_days)
-            };
-            let mark = if days >= limit {
-                Mark::Pass
-            } else if reason == Reason::Recent {
-                Mark::Fail
-            } else {
-                Mark::Info
-            };
-            line(
-                mark,
-                "Activity",
-                format!(
-                    "{} without activity (limit: {})",
-                    days_text(days),
-                    days_text(limit)
-                ),
-                "git",
-            )
-        }
-        None => waiting("Activity", "git"),
+    let limit = activity_limit(facts, stale_days);
+    let mark = if days >= limit {
+        Mark::Pass
+    } else if matches!(reason, Reason::Recent | Reason::MergedRecently) {
+        Mark::Fail
+    } else {
+        Mark::Info
     };
-    vec![agent, changes, merged, push, pull_requests, activity]
+    line(
+        mark,
+        "Activity",
+        format!(
+            "{} without activity (limit: {})",
+            days_text(days),
+            days_text(limit)
+        ),
+        "git",
+    )
 }
 
 /// The name of the default branch, from the JSON of `wt list`.
@@ -837,6 +867,112 @@ mod tests {
         }
     }
 
+    /// The line of a layer, by its name.
+    fn layer<'a>(shown: &'a [Line], name: &str) -> &'a Line {
+        shown
+            .iter()
+            .find(|line| line.layer == name)
+            .unwrap_or_else(|| panic!("no layer {name}"))
+    }
+
+    #[test]
+    fn a_layer_without_answer_after_the_checks_is_unknown() {
+        let facts = Facts {
+            push: Push::NotChecked,
+            days: None,
+            ..facts()
+        };
+
+        let after_checks = lines(&facts, Reason::Unknown, 7);
+        let busy_agent = lines(&facts, Reason::Agent, 7);
+
+        for name in ["Push", "Activity"] {
+            assert_eq!(layer(&after_checks, name).mark, Mark::Unknown, "{name}");
+            assert_eq!(layer(&after_checks, name).text, "no answer", "{name}");
+            // An agent that works needs no check.
+            assert_eq!(layer(&busy_agent, name).mark, Mark::Info, "{name}");
+            assert_eq!(layer(&busy_agent, name).text, "not needed", "{name}");
+        }
+    }
+
+    #[test]
+    fn the_texts_count_the_days() {
+        let merged_today = Facts {
+            merge: Merge::Merged("same_commit".to_owned()),
+            pull_requests: PullRequests::NoPullRequest,
+            days: Some(0),
+            ..facts()
+        };
+
+        assert_eq!(
+            question(
+                Reason::Old,
+                &Facts {
+                    pull_requests: PullRequests::NoPullRequest,
+                    days: Some(1),
+                    ..facts()
+                }
+            ),
+            "No pull request, and no change for 1 day."
+        );
+        assert_eq!(
+            question(
+                Reason::Recent,
+                &Facts {
+                    days: Some(0),
+                    ..facts()
+                }
+            ),
+            "No proof that it is finished, and a change today."
+        );
+        assert_eq!(
+            question(Reason::MergedRecently, &merged_today),
+            "main contains its content, but it had a change today."
+        );
+        assert_eq!(
+            reason_text(Reason::MergedRecently, &merged_today),
+            "merged, recent activity"
+        );
+        assert_eq!(verdict(&merged_today, 7), Reason::MergedRecently);
+        assert_eq!(
+            rule_lines(7)[4..],
+            [
+                "- or a merged branch, 1 day without activity,",
+                "- or no pull request, 7 days without activity and no agent.",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_verdict_covers_the_rare_cases_of_the_forge() {
+        // A finished pull request, but the branch has no local commit.
+        let no_local_commit = Facts {
+            pull_requests: PullRequests::Kept {
+                number: 5,
+                why: KeptWhy::NoLocalCommit,
+            },
+            ..facts()
+        };
+        // Rule 4 comes before rule 6: a merged branch is a leftover, also
+        // with work after a finished pull request.
+        let merged_with_work_after = Facts {
+            merge: Merge::Merged("patch_id_match".to_owned()),
+            pull_requests: PullRequests::Kept {
+                number: 5,
+                why: KeptWhy::WorkAfter,
+            },
+            days: Some(1),
+            ..facts()
+        };
+
+        assert_eq!(verdict(&no_local_commit, 7), Reason::Unknown);
+        assert_eq!(
+            reason_text(Reason::Unknown, &no_local_commit),
+            "not checked: no local commit"
+        );
+        assert_eq!(verdict(&merged_with_work_after, 7), Reason::BranchMerged);
+    }
+
     #[test]
     fn the_verdict_follows_the_order_of_the_layers() {
         let squash = Merge::Merged("patch_id_match".to_owned());
@@ -918,7 +1054,7 @@ mod tests {
                     days: Some(0),
                     ..facts()
                 },
-                Reason::Recent,
+                Reason::MergedRecently,
             ),
             ("no PR and old", facts(), Reason::Old),
             (
@@ -1162,7 +1298,11 @@ mod tests {
             "Its merge request !12 is merged."
         );
         assert_eq!(
-            lines(&merged, Reason::PullRequestMerged, 7)[4].text,
+            layer(
+                &lines(&merged, Reason::PullRequestMerged, 7),
+                "Pull requests"
+            )
+            .text,
             "!12 merged, with the last commit"
         );
         assert_eq!(
@@ -1198,7 +1338,7 @@ mod tests {
         };
         let push_line = |facts: &Facts| {
             let shown = lines(facts, Reason::Recent, 7);
-            let line = &shown[3];
+            let line = layer(&shown, "Push");
             (line.mark, line.text.clone())
         };
 
@@ -1243,26 +1383,38 @@ mod tests {
                 "Activity"
             ]
         );
-        assert_eq!(shown[2].text, "yes: a squash merge into main");
-        assert_eq!(shown[2].source, "wt");
-        assert_eq!(shown[4].source, "GitHub");
-        assert_eq!(shown[5].text, "2 days without activity (limit: 1 day)");
-        assert_eq!(shown[5].mark, Mark::Pass);
+        assert_eq!(
+            layer(&shown, "Merged").text,
+            "yes: a squash merge into main"
+        );
+        assert_eq!(layer(&shown, "Merged").source, "wt");
+        assert_eq!(layer(&shown, "Pull requests").source, "GitHub");
+        assert_eq!(
+            layer(&shown, "Activity").text,
+            "2 days without activity (limit: 1 day)"
+        );
+        assert_eq!(layer(&shown, "Activity").mark, Mark::Pass);
     }
 
     #[test]
     fn the_layer_merged_tells_the_commits_and_why_it_is_unknown() {
         let not_merged = lines(&facts(), Reason::Old, 7);
-        assert_eq!(not_merged[2].text, "no: 2 commits not in main");
-        assert_eq!(not_merged[2].mark, Mark::Info);
+        assert_eq!(
+            layer(&not_merged, "Merged").text,
+            "no: 2 commits not in main"
+        );
+        assert_eq!(layer(&not_merged, "Merged").mark, Mark::Info);
 
         let empty = Facts {
             merge: Merge::Undetermined("the branch has no commit".to_owned()),
             ..facts()
         };
         let unknown = lines(&empty, Reason::Old, 7);
-        assert_eq!(unknown[2].text, "unknown: the branch has no commit");
-        assert_eq!(unknown[2].mark, Mark::Unknown);
+        assert_eq!(
+            layer(&unknown, "Merged").text,
+            "unknown: the branch has no commit"
+        );
+        assert_eq!(layer(&unknown, "Merged").mark, Mark::Unknown);
     }
 
     #[test]
@@ -1273,7 +1425,8 @@ mod tests {
             ..facts()
         };
 
-        let activity = &lines(&kept, Reason::Recent, 7)[5];
+        let shown = lines(&kept, Reason::MergedRecently, 7);
+        let activity = layer(&shown, "Activity");
 
         assert_eq!(activity.text, "0 days without activity (limit: 1 day)");
         assert_eq!(activity.mark, Mark::Fail);
