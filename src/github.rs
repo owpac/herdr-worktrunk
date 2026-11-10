@@ -162,4 +162,13 @@ mod tests {
         );
         assert_eq!(pull_requests[0].head, "3541f65");
     }
+
+    #[test]
+    fn a_full_page_gives_an_error() {
+        let page = crate::test_support::full_page(|number| {
+            format!(r#"{{"headRefOid":"aaa","number":{number},"state":"CLOSED"}}"#)
+        });
+
+        assert!(parse_pull_requests(&page).is_err());
+    }
 }

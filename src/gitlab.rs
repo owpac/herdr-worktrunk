@@ -218,4 +218,15 @@ mod tests {
         );
         assert_eq!(gitlab().reference(12), "merge request !12");
     }
+
+    #[test]
+    fn a_full_page_gives_an_error() {
+        let page = crate::test_support::full_page(|number| {
+            format!(
+                r#"{{"iid":{number},"state":"closed","sha":"aaa","project_id":1,"source_project_id":1}}"#
+            )
+        });
+
+        assert!(parse_merge_requests(&page).is_err());
+    }
 }

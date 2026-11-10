@@ -174,12 +174,11 @@ pub fn branch_status(
     origin_default_branch: Option<&str>,
     branch: &str,
 ) -> Result<BranchStatus, Error> {
-    let pull_requests = backend.pull_requests(branch)?;
-    // The last pull request: the backends give no order.
-    let Some(last) = pull_requests
-        .iter()
-        .max_by_key(|pull_request| pull_request.number)
-    else {
+    let mut pull_requests = backend.pull_requests(branch)?;
+    // The backends give no order. The newest pull request comes first:
+    // the open one, the proof and the last number name the newest match.
+    pull_requests.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.number));
+    let Some(last) = pull_requests.first() else {
         return Ok(BranchStatus::NoPullRequest);
     };
     if let Some(open) = pull_requests

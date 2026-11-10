@@ -57,7 +57,7 @@ pub fn parse_page<T: DeserializeOwned>(text: &str, label: &str) -> Result<Vec<T>
     let page: Vec<T> = parse_json(text, label)?;
     if page.len() >= PAGE_SIZE {
         return Err(Error::Command(format!(
-            "{label}: {PAGE_SIZE} pull requests or more for this branch"
+            "{label}: {PAGE_SIZE} results or more for this branch, the list can miss one"
         )));
     }
     Ok(page)
@@ -452,6 +452,7 @@ pub fn encode_url_part(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, test_folder};
 
     #[test]
     fn a_full_page_of_pull_requests_gives_an_error() {
@@ -465,11 +466,10 @@ mod tests {
             parse_page::<u64>(&page(50), "gh pr list")
                 .unwrap_err()
                 .to_string(),
-            "gh pr list: 50 pull requests or more for this branch"
+            "gh pr list: 50 results or more for this branch, the list can miss one"
         );
         assert!(parse_page::<u64>("{\"message\":\"x\"}", "x").is_err());
     }
-    use crate::test_support::{git_in, test_folder};
 
     #[test]
     fn the_provider_comes_from_the_name_of_the_host() {

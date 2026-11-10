@@ -100,8 +100,9 @@ impl Backend for AzureDevOps {
     }
 }
 
-/// Read the JSON of `az repos pr list`: the pull requests of `branch`. A pull request from a fork does not count. A status that
-/// the plugin does not know keeps the worktree, as an open pull request.
+/// Read the JSON of `az repos pr list`: the pull requests of `branch`. A
+/// pull request from a fork does not count. A status that the plugin does
+/// not know keeps the worktree, as an open pull request.
 fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -415,5 +416,16 @@ mod tests {
             "git branch feat/x aaa || git fetch origin aaa:refs/heads/feat/x"
         );
         assert!(!azure.contains("aaa", "aaa"));
+    }
+
+    #[test]
+    fn a_full_page_gives_an_error() {
+        let page = crate::test_support::full_page(|number| {
+            format!(
+                r#"{{"pullRequestId":{number},"status":"completed","sourceRefName":"refs/heads/develop"}}"#
+            )
+        });
+
+        assert!(parse_pull_requests(&page, "develop").is_err());
     }
 }

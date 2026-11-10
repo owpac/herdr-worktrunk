@@ -362,8 +362,9 @@ pub enum Reason {
 }
 
 /// Return true if the deletion closes the idle agents of the worktree
-/// first: a leftover with a proof of the end, and only idle agents. The
-/// verdict gives `IdleAgent` (kept) to an old worktree with idle agents.
+/// first: a leftover, and only idle agents. A leftover with idle agents
+/// always has a proof of the end: the verdict gives `IdleAgent` (kept), not
+/// `Old`, to an old worktree with idle agents.
 pub fn closes_idle_agents(reason: Reason, facts: &Facts) -> bool {
     reason.is_leftover() && facts.agent == Agents::Idle
 }
