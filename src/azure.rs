@@ -16,12 +16,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::forge::{Backend, PullRequest, PullRequestState};
+use crate::forge::{self, Backend, PullRequest, PullRequestState, PAGE_SIZE};
 use crate::herdr::Error;
 use crate::process;
-
-/// The number of pull requests that one call reads. A branch has few.
-const PAGE_SIZE: &str = "50";
 
 /// The backend of a repository on Azure DevOps.
 pub struct AzureDevOps {
@@ -68,7 +65,7 @@ impl Backend for AzureDevOps {
                 "--status",
                 "all",
                 "--top",
-                PAGE_SIZE,
+                &PAGE_SIZE.to_string(),
                 // Not the config of git in the folder of the process.
                 "--detect",
                 "false",
@@ -103,8 +100,7 @@ impl Backend for AzureDevOps {
     }
 }
 
-/// Read the JSON of `az repos pr list`: the pull requests of `branch`, the
-/// newest first. A pull request from a fork does not count. A status that
+/// Read the JSON of `az repos pr list`: the pull requests of `branch`. A pull request from a fork does not count. A status that
 /// the plugin does not know keeps the worktree, as an open pull request.
 fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Error> {
     #[derive(Deserialize)]
@@ -122,16 +118,9 @@ fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Err
         last_merge_source_commit: Option<Commit>,
         fork_source: Option<serde_json::Value>,
     }
-    let listed: Vec<Listed> = serde_json::from_str(text)
-        .map_err(|error| Error::Command(format!("az repos pr list: invalid JSON: {error}")))?;
-    // A full page can miss an open pull request.
-    if listed.len() >= PAGE_SIZE.parse().unwrap_or(usize::MAX) {
-        return Err(Error::Command(format!(
-            "{PAGE_SIZE} pull requests or more for {branch}"
-        )));
-    }
+    let listed: Vec<Listed> = forge::parse_page(text, "az repos pr list")?;
     let source = format!("refs/heads/{branch}");
-    let mut pull_requests: Vec<PullRequest> = listed
+    Ok(listed
         .into_iter()
         .filter(|listed| listed.fork_source.is_none() && listed.source_ref_name == source)
         .map(|listed| PullRequest {
@@ -147,9 +136,7 @@ fn parse_pull_requests(text: &str, branch: &str) -> Result<Vec<PullRequest>, Err
                 .map(|commit| commit.commit_id)
                 .unwrap_or_default(),
         })
-        .collect();
-    pull_requests.sort_by_key(|pull_request| std::cmp::Reverse(pull_request.number));
-    Ok(pull_requests)
+        .collect())
 }
 
 /// The name of a host, without its port and in lowercase.
@@ -272,9 +259,9 @@ mod tests {
             pull_requests,
             [
                 PullRequest {
-                    number: 8,
-                    state: PullRequestState::Closed,
-                    head: "2222222222222222222222222222222222222222".to_owned(),
+                    number: 1,
+                    state: PullRequestState::Merged,
+                    head: "cd6039e649dcf41c410d9e970d391165cf9b8124".to_owned(),
                 },
                 PullRequest {
                     number: 7,
@@ -282,9 +269,9 @@ mod tests {
                     head: "1111111111111111111111111111111111111111".to_owned(),
                 },
                 PullRequest {
-                    number: 1,
-                    state: PullRequestState::Merged,
-                    head: "cd6039e649dcf41c410d9e970d391165cf9b8124".to_owned(),
+                    number: 8,
+                    state: PullRequestState::Closed,
+                    head: "2222222222222222222222222222222222222222".to_owned(),
                 },
             ]
         );
@@ -381,23 +368,6 @@ mod tests {
             organization_url("tfs.example.com:8080", "DefaultCollection"),
             "https://tfs.example.com:8080/DefaultCollection"
         );
-    }
-
-    #[test]
-    fn a_full_page_of_pull_requests_gives_an_error() {
-        let page: Vec<serde_json::Value> = (1..=50)
-            .map(|number| {
-                serde_json::json!({
-                    "pullRequestId": number,
-                    "status": "completed",
-                    "sourceRefName": "refs/heads/develop",
-                })
-            })
-            .collect();
-
-        let result = parse_pull_requests(&serde_json::to_string(&page).unwrap(), "develop");
-
-        assert!(result.is_err());
     }
 
     #[test]

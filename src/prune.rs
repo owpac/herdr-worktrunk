@@ -108,9 +108,10 @@ pub fn finished_pull_request<'a>(
     if is_open || default_branch == DefaultBranch::Contains {
         return None;
     }
-    let mut finished = pull_requests
-        .iter()
-        .filter(|pull_request| pull_request.state != PullRequestState::Open);
+    // An empty head (a pull request without commit) proves nothing.
+    let mut finished = pull_requests.iter().filter(|pull_request| {
+        pull_request.state != PullRequestState::Open && !pull_request.head.is_empty()
+    });
     if let Some(same_commit) = finished
         .clone()
         .find(|pull_request| pull_request.head == local_commit)
@@ -173,7 +174,11 @@ pub fn branch_status(
     branch: &str,
 ) -> Result<BranchStatus, Error> {
     let pull_requests = backend.pull_requests(branch)?;
-    let Some(last) = pull_requests.first() else {
+    // The last pull request: the backends give no order.
+    let Some(last) = pull_requests
+        .iter()
+        .max_by_key(|pull_request| pull_request.number)
+    else {
         return Ok(BranchStatus::NoPullRequest);
     };
     if let Some(open) = pull_requests
@@ -531,6 +536,32 @@ mod tests {
                 number: 2,
                 why: KeptWhy::NoLocalCommit
             }
+        );
+        // The last pull request has the highest number, in any order.
+        assert_eq!(
+            status_of(
+                &folder,
+                &forge(vec![
+                    pull_request(2, MERGED, "older"),
+                    pull_request(9, CLOSED, "old")
+                ]),
+                Some("main"),
+                "work"
+            ),
+            BranchStatus::Kept {
+                number: 9,
+                why: KeptWhy::WorkAfter
+            }
+        );
+        // An empty head proves nothing, also when the local commit is empty.
+        assert_eq!(
+            finished_pull_request(
+                "",
+                &[pull_request(2, MERGED, "")],
+                DefaultBranch::Unknown,
+                never
+            ),
+            None
         );
         // Without a default branch, only the same commit proves the end.
         assert_eq!(
