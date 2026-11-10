@@ -2,7 +2,7 @@ id = "herdr-worktrunk"
 name = "Worktrunk"
 # The version of a release: YYYY.M.N. On main, the version stays 0.0.0. The release workflow
 # writes the version in the commit of the tag of each release.
-version = "0.0.0"
+version = "2026.11.24"
 min_herdr_version = "0.9.0"
 description = "Worktrees that live and die with the work, from the first commit to the merged pull request"
 platforms = ["linux", "macos"]
