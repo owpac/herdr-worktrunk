@@ -50,7 +50,7 @@ const GHOST: &str = "worktree — type to filter";
 // The footer has the width of the list: the hints must be short.
 const HINTS: [(&str, &str); 4] = [
     ("⏎", "delete"),
-    ("^a", "delete group To delete"),
+    ("^a", "delete leftovers"),
     ("⇥", "preview"),
     ("esc", "close"),
 ];

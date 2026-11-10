@@ -57,7 +57,7 @@ fn herdr_folder(variable: &str, default_parts: &[&str]) -> PathBuf {
 }
 
 /// The state folder of the plugin: the observer writes its files there.
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     herdr_folder(
         "HERDR_PLUGIN_STATE_DIR",
         &[".local", "state", "herdr", "plugins", herdr::PLUGIN_ID],

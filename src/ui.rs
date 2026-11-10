@@ -60,7 +60,17 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for paragraph in text.lines() {
         let mut line = String::new();
-        for word in paragraph.split_whitespace() {
+        // A word longer than the width (a path) breaks into pieces: the
+        // popup cuts a line that is too long.
+        let words = paragraph.split_whitespace().flat_map(|word| {
+            let characters: Vec<char> = word.chars().collect();
+            characters
+                .chunks(width.max(1))
+                .map(|piece| piece.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        });
+        for word in words {
+            let word = word.as_str();
             let needed = line.chars().count() + word.chars().count() + 1;
             if !line.is_empty() && needed > width {
                 lines.push(std::mem::take(&mut line));
@@ -163,11 +173,43 @@ fn button_line(buttons: &[Button], selected: usize) -> (String, usize) {
     (line, length)
 }
 
+/// The rows of a popup around its message: the title, the buttons, the
+/// hint and 3 blank lines.
+const FRAME_ROWS: usize = 6;
+
+/// The width of the text of a message.
+pub fn text_width() -> usize {
+    let (_, columns) = terminal_size();
+    columns.saturating_sub(2 * SIDE_MARGIN).max(1)
+}
+
+/// The lines of a message that the popup can show.
+pub fn message_rows() -> usize {
+    let (rows, _) = terminal_size();
+    rows.saturating_sub(FRAME_ROWS).max(1)
+}
+
+/// Return true if the popup shows all the lines of `message`.
+pub fn message_fits(message: &str) -> bool {
+    wrap(message, text_width()).len() <= message_rows()
+}
+
+/// The lines that a popup of `rows` rows can show: the last one becomes
+/// `…` if the message is longer. The title and the buttons stay visible.
+fn fit_rows(mut lines: Vec<String>, rows: usize) -> Vec<String> {
+    let available = rows.saturating_sub(FRAME_ROWS).max(1);
+    if lines.len() > available {
+        lines.truncate(available - 1);
+        lines.push("…".to_owned());
+    }
+    lines
+}
+
 /// Draw a box: the title, the message, the buttons and a key hint.
 fn draw(title: &str, message: &str, buttons: &[Button], selected: usize, hint: &str) {
     let (rows, columns) = terminal_size();
     let text_width = columns.saturating_sub(2 * SIDE_MARGIN).max(1);
-    let message_lines = wrap(message, text_width);
+    let message_lines = fit_rows(wrap(message, text_width), rows);
     // Title, blank line, message, blank line, buttons, blank line, hint.
     let content_rows = message_lines.len() + 6;
     let top_padding = rows.saturating_sub(content_rows) / 2;
@@ -282,10 +324,13 @@ mod tests {
     }
 
     #[test]
-    fn wrap_keeps_a_word_longer_than_the_width() {
+    fn wrap_breaks_a_word_longer_than_the_width() {
         let lines = wrap("/Users/thomas/Workspace/a-very-long-folder", 10);
 
-        assert_eq!(lines, ["/Users/thomas/Workspace/a-very-long-folder"]);
+        assert_eq!(
+            lines,
+            ["/Users/tho", "mas/Worksp", "ace/a-very", "-long-fold", "er"]
+        );
     }
 
     #[test]
@@ -322,5 +367,15 @@ mod tests {
             "[ Cancel ]".len() + BUTTON_GAP.len() + "[ Delete ]".len()
         );
         assert!(line.contains(&format!("{RED_BACKGROUND}[ Delete ]")));
+    }
+
+    #[test]
+    fn a_long_message_ends_with_an_ellipsis_and_keeps_the_frame() {
+        let lines: Vec<String> = (1..=20).map(|line| line.to_string()).collect();
+
+        let shown = fit_rows(lines.clone(), 12);
+
+        assert_eq!(shown, ["1", "2", "3", "4", "5", "…"]);
+        assert_eq!(fit_rows(lines[..3].to_vec(), 12), ["1", "2", "3"]);
     }
 }

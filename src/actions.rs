@@ -479,32 +479,24 @@ fn delete_all() -> Result<(), Error> {
     if old.is_empty() {
         return Ok(());
     }
-    let shown: Vec<String> = old
-        .iter()
-        .take(5)
-        .map(|worktree| format!("- {}", worktree.branch))
-        .collect();
-    let more = if old.len() > shown.len() {
-        format!("\n… and {} more", old.len() - shown.len())
-    } else {
-        String::new()
-    };
+    // A short question: it must fit in the small popup.
+    let names: Vec<String> = old.iter().map(|worktree| worktree.branch.clone()).collect();
+    let mut lines = vec![format!(
+        "Delete {} of the group To delete?",
+        worktrees_text(old.len())
+    )];
+    lines.extend(name_lines(&names, ui::text_width(), 2));
     // Only the group To delete: the kept worktrees never go.
-    let hidden = if total > old.len() {
+    if total > old.len() {
         let hidden = total - old.len();
-        format!(
-            "\nThe filter hides {} of the group: {}.",
-            worktrees_text(hidden),
+        lines.push(format!(
+            "The filter hides {hidden} other{}: {}.",
+            if hidden == 1 { "" } else { "s" },
             if hidden == 1 { "it stays" } else { "they stay" }
-        )
-    } else {
-        String::new()
-    };
-    let question = format!(
-        "Delete {} of the group To delete?\n{}{more}{hidden}\nThe other groups stay. wt keeps a branch that is not merged.",
-        worktrees_text(old.len()),
-        shown.join("\n")
-    );
+        ));
+    }
+    lines.push("wt keeps the branches that are not merged.".to_owned());
+    let question = lines.join("\n");
     if !ui::confirm("Clean the worktrees", &question, "Delete", true) {
         return Ok(());
     }
@@ -571,13 +563,86 @@ fn delete_all() -> Result<(), Error> {
     if !kept.is_empty() {
         summary.push_str(&format!("\nKept:\n{}", kept.join("\n")));
     }
+    // A long summary goes to a file: the popup is small.
+    if !ui::message_fits(&summary) {
+        let path = crate::state_dir().join("cleaner-summary.txt");
+        let mut short = format!("Deleted {}.", worktrees_text(deleted));
+        if !kept.is_empty() {
+            short.push_str(&format!(" Kept {}.", worktrees_text(kept.len())));
+        }
+        if !closed.is_empty() {
+            short.push_str(&format!(" Closed {} idle agents.", closed.len()));
+        }
+        summary = match std::fs::create_dir_all(crate::state_dir())
+            .and_then(|()| std::fs::write(&path, format!("{summary}\n")))
+        {
+            Ok(()) => format!("{short}\nThe full list:\n{}", home_relative(&path)),
+            Err(_) => short,
+        };
+    }
     ui::show_message("Clean the worktrees", &summary);
     Ok(())
 }
 
+/// A path with `~` for the home folder: shorter in a popup.
+fn home_relative(path: &Path) -> String {
+    match env::var_os("HOME").map(PathBuf::from) {
+        Some(home) if path.starts_with(&home) => {
+            format!("~/{}", path.strip_prefix(&home).unwrap_or(path).display())
+        }
+        _ => path.display().to_string(),
+    }
+}
+
+/// The names of `names`, separated by commas, on `max_lines` lines of
+/// `width` characters. The names that do not fit become `… and N more`.
+fn name_lines(names: &[String], width: usize, max_lines: usize) -> Vec<String> {
+    let length = |text: &str| text.chars().count();
+    let mut lines: Vec<String> = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let rest = names.len() - index - 1;
+        let suffix = if rest > 0 {
+            length(&format!(", … and {rest} more"))
+        } else {
+            0
+        };
+        let on_last = lines
+            .last()
+            .map(|line| length(line) + 2 + length(name))
+            .filter(|&line_length| line_length <= width);
+        let (line_count, line_length) = match on_last {
+            Some(line_length) => (lines.len(), line_length),
+            None => (lines.len() + 1, length(name)),
+        };
+        // The last line keeps room for `… and N more`.
+        let fits =
+            line_count < max_lines || (line_count == max_lines && line_length + suffix <= width);
+        if !fits {
+            let more = format!("… and {} more", names.len() - index);
+            match lines.last_mut() {
+                Some(line) => {
+                    line.push_str(", ");
+                    line.push_str(&more);
+                }
+                None => lines.push(more),
+            }
+            return lines;
+        }
+        match (on_last, lines.last_mut()) {
+            (Some(_), Some(line)) => {
+                line.push_str(", ");
+                line.push_str(name);
+            }
+            _ => lines.push(name.clone()),
+        }
+    }
+    lines
+}
+
 /// Popup cleaner: all the linked worktrees, checked in the background.
 /// `Enter` deletes one, `ctrl-a` deletes the worktrees of the group "To
-/// delete" that the filter shows, through the popup confirm. Then the list comes back, without the deleted
+/// delete" that the filter shows, through the popup confirm. Then the list
+/// comes back, without the deleted
 /// worktrees.
 ///
 /// The list covers `TRUNK_CLEANER_SCOPE`, or all the repositories of the
@@ -736,4 +801,40 @@ pub fn merger() -> Result<(), Error> {
         Err(error) => ui::wait_after_output(&error.to_string()),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_names_of_delete_all_fit_in_2_lines() {
+        let names = |count: usize| -> Vec<String> {
+            (1..=count)
+                .map(|number| format!("feat/branch-{number:02}"))
+                .collect()
+        };
+
+        assert_eq!(
+            name_lines(&names(3), 58, 2),
+            ["feat/branch-01, feat/branch-02, feat/branch-03"]
+        );
+        let many = name_lines(&names(40), 58, 2);
+        assert_eq!(many.len(), 2);
+        assert!(
+            many.iter().all(|line| line.chars().count() <= 58),
+            "{many:?}"
+        );
+        assert!(many[1].ends_with("more"), "{many:?}");
+        let shown = many.join(", ").matches("feat/branch-").count();
+        assert!(
+            many[1].ends_with(&format!("… and {} more", 40 - shown)),
+            "{many:?}"
+        );
+        // A name longer than the width: … and N more on its own line.
+        assert_eq!(
+            name_lines(&["a".repeat(70), "b".to_owned()], 58, 1),
+            ["… and 2 more"]
+        );
+    }
 }
