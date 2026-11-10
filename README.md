@@ -177,7 +177,7 @@ The plugin starts an observer with herdr. Every 2 seconds, it reads the state of
 1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell.
 2. **The workspace of a removed worktree closes**, if no agent works in it.
 3. **The worktrees of the finished work go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces: the finished pull requests, and the branches in the default branch.
-4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days. A worktree where an idle agent waits counts too: the cleaner shows it in the group Waiting, and does not delete it.
+4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days. A worktree where an idle agent waits counts too: the cleaner shows it in the group Waiting, and does not delete it. The daily pass needs the check of a repository: a forge with a backend, or no remote `origin`.
 
 <details>
 <summary>The rules of <code>prune_merged</code></summary>
@@ -216,7 +216,7 @@ bin/herdr-worktrunk list-merged <folder of the repository>
 
 - The observer watches only the agents. A shell that changes its folder does not move.
 - A pane moves only if the observer sees the same difference in 2 snapshots in a row. A moved pane gets a new pane ID: address an agent with its herdr name.
-- A workspace where an agent works stays open after the removal of its worktree. Close it with the herdr key `close_workspace`.
+- A workspace with an agent stays open after the removal of its worktree, also with an idle agent. Close it with the herdr key `close_workspace`.
 - `prune_merged` asks only the forge of the remote `origin`, with a backend (see [The forges](#the-forges)), and only when herdr runs. It stops a command of the forge after 1 minute, and a `git` command after 30 seconds.
 - The observer never approves the hooks of a project (`--yes`). If a hook has no approval, run `wt config approvals add` in the repository.
 - The observer writes each removal and each new error in `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`). Each removal also shows a herdr notification. An error of the forge for one branch keeps this branch only: the thread checks the other branches.
