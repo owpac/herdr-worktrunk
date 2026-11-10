@@ -78,8 +78,10 @@ impl AzureDevOps {
     }
 }
 
-impl Backend for AzureDevOps {
-    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+impl AzureDevOps {
+    /// Run `az repos pr list` for `branch`, without a terminal, and return
+    /// its output.
+    fn az_pr_list(&self, branch: &str) -> Result<String, Error> {
         let mut command = Command::new("az");
         command
             .args([
@@ -111,8 +113,13 @@ impl Backend for AzureDevOps {
             // software.
             .env("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "no")
             .current_dir(env::temp_dir());
-        let text = process::run_cli(&mut command, "az repos pr list", self.limit)?;
-        parse_pull_requests(&text, branch)
+        process::run_cli(&mut command, "az repos pr list", self.limit)
+    }
+}
+
+impl Backend for AzureDevOps {
+    fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>, Error> {
+        parse_pull_requests(&self.az_pr_list(branch)?, branch)
     }
 
     /// Only the last commit proves a finished pull request.
