@@ -21,7 +21,7 @@ use crate::herdr::Error;
 use crate::process;
 
 /// The number of merge requests that one call reads. A branch has few.
-const PAGE_SIZE: u32 = 50;
+const PAGE_SIZE: usize = 50;
 
 /// The backend of a project on a GitLab host.
 pub struct GitLab {
@@ -114,6 +114,12 @@ fn parse_merge_requests(text: &str) -> Result<Vec<PullRequest>, Error> {
     }
     let listed: Vec<Listed> = serde_json::from_str(text)
         .map_err(|error| Error::Command(format!("glab api: invalid JSON: {error}")))?;
+    // A full page can miss an open merge request.
+    if listed.len() >= PAGE_SIZE {
+        return Err(Error::Command(format!(
+            "{PAGE_SIZE} merge requests or more for this branch"
+        )));
+    }
     Ok(listed
         .into_iter()
         .filter(|listed| listed.source_project_id == listed.project_id)
@@ -230,5 +236,13 @@ mod tests {
     fn a_merge_request_without_commit_needs_no_call() {
         // An empty head returns at once: no glab, no time limit.
         assert!(!gitlab().contains("", "aaa"));
+    }
+
+    #[test]
+    fn a_full_page_gives_an_error() {
+        let items: Vec<String> = (1..=50).map(|number| format!(r#"{{"iid":{number},"state":"closed","sha":"aaa","project_id":1,"source_project_id":1}}"#)).collect();
+
+        assert!(parse_merge_requests(&format!("[{}]", items.join(","))).is_err());
+        assert!(parse_merge_requests(&format!("[{}]", items[..49].join(","))).is_ok());
     }
 }

@@ -11,6 +11,7 @@
 //!   herdr-worktrunk clean [<folder>]           open the popup cleaner from a shell
 
 mod actions;
+mod azure;
 mod cleaner;
 mod config;
 mod forge;
