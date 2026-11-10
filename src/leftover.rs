@@ -48,7 +48,7 @@ use crate::style::{ACCENT, DIM, GREEN, RED, YELLOW};
 /// The days without activity before a merged worktree is a leftover: a
 /// new worktree has the commit of the default branch, so it is merged at
 /// once. `wt step prune` has the same rule.
-pub const INTEGRATED_MIN_DAYS: u64 = 1;
+pub const MERGED_MIN_DAYS: u64 = 1;
 
 /// The agents of a worktree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,8 +157,8 @@ pub fn agents_state(agents: &[WorktreeAgent]) -> Agents {
 pub enum Changes {
     #[default]
     NotChecked,
-    None,
-    Some,
+    Clean,
+    Uncommitted,
     /// git status failed.
     Failed,
 }
@@ -166,15 +166,15 @@ pub enum Changes {
 /// The content of the branch in the default branch, from wt.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Integration {
+pub enum Merge {
     #[default]
     NotChecked,
     /// The branch has commits that the default branch does not have: the
     /// number, if wt gives it.
-    NotIntegrated(Option<u64>),
+    NotMerged(Option<u64>),
     /// The check of wt that found the content in the default branch, for
     /// example `patch_id_match` for a squash merge.
-    Integrated(String),
+    Merged(String),
     /// wt gave no answer, for this reason.
     Undetermined(String),
 }
@@ -201,19 +201,19 @@ pub enum PullRequests {
     NotChecked,
     /// The checks did not ask the forge, for this reason.
     NotNeeded(String),
-    None,
+    NoPullRequest,
     Open(u64),
     /// A finished pull request that contains the last commit.
     Finished {
         number: u64,
         merged: bool,
     },
-    /// Finished, but the branch has commits after it.
-    WorkAfter(u64),
-    /// Finished, and the default branch contains the commit.
-    InDefault(u64),
-    /// Finished, but the branch has no local commit.
-    NoLocalCommit(u64),
+    /// The pull requests are finished, but the worktree stays: the
+    /// number of the last one, and why.
+    Kept {
+        number: u64,
+        why: KeptWhy,
+    },
     /// The forge gave no answer, for this reason.
     Failed(String),
 }
@@ -223,17 +223,13 @@ impl PullRequests {
     pub fn from_status(status: Result<BranchStatus, String>) -> PullRequests {
         match status {
             Err(error) => PullRequests::Failed(error),
-            Ok(BranchStatus::NoPullRequest) => PullRequests::None,
+            Ok(BranchStatus::NoPullRequest) => PullRequests::NoPullRequest,
             Ok(BranchStatus::Open(number)) => PullRequests::Open(number),
             Ok(BranchStatus::Finished { pull_request, .. }) => PullRequests::Finished {
                 number: pull_request.number,
                 merged: pull_request.state == crate::forge::PullRequestState::Merged,
             },
-            Ok(BranchStatus::Kept { number, why }) => match why {
-                KeptWhy::WorkAfter => PullRequests::WorkAfter(number),
-                KeptWhy::InDefaultBranch => PullRequests::InDefault(number),
-                KeptWhy::NoLocalCommit => PullRequests::NoLocalCommit(number),
-            },
+            Ok(BranchStatus::Kept { number, why }) => PullRequests::Kept { number, why },
         }
     }
 
@@ -242,9 +238,7 @@ impl PullRequests {
         match self {
             PullRequests::Open(number)
             | PullRequests::Finished { number, .. }
-            | PullRequests::WorkAfter(number)
-            | PullRequests::InDefault(number)
-            | PullRequests::NoLocalCommit(number) => Some(*number),
+            | PullRequests::Kept { number, .. } => Some(*number),
             _ => None,
         }
     }
@@ -255,7 +249,7 @@ impl PullRequests {
 pub struct Facts {
     pub agent: Agents,
     pub changes: Changes,
-    pub integration: Integration,
+    pub merge: Merge,
     pub push: Push,
     pub pull_requests: PullRequests,
     /// The forge that gave the pull requests, for the user.
@@ -269,7 +263,7 @@ pub struct Facts {
 
 impl Facts {
     /// The name of the default branch, for the texts.
-    fn main(&self) -> &str {
+    fn default_branch_name(&self) -> &str {
         self.default_branch
             .as_deref()
             .unwrap_or("the default branch")
@@ -318,15 +312,15 @@ pub enum Reason {
     /// The checks run.
     Checking,
     /// To delete: a merged pull request contains the last commit.
-    Merged,
+    PullRequestMerged,
     /// To delete: a closed pull request contains the last commit.
-    Closed,
+    PullRequestClosed,
     /// To delete: the content is in the default branch.
-    Integrated,
+    BranchMerged,
     /// To delete: no pull request, and no activity for `stale_days` days.
     Old,
     /// Kept: an open pull request.
-    Open,
+    PullRequestOpen,
     /// Kept: some activity in the last days.
     Recent,
     /// Kept: changes that are not committed.
@@ -336,10 +330,10 @@ pub enum Reason {
     /// Kept: an idle agent, and no proof that the work is finished.
     IdleAgent,
     /// Kept: the branch has work after its finished pull request.
-    WorkAfter,
+    WorkAfterPullRequest,
     /// Kept: a finished pull request, and the default branch contains the
     /// commit, but wt did not see the merge.
-    InDefault,
+    CommitInDefaultBranch,
     /// Kept: a check gave no answer.
     Unknown,
 }
@@ -349,7 +343,10 @@ impl Reason {
     pub fn is_leftover(self) -> bool {
         matches!(
             self,
-            Reason::Merged | Reason::Closed | Reason::Integrated | Reason::Old
+            Reason::PullRequestMerged
+                | Reason::PullRequestClosed
+                | Reason::BranchMerged
+                | Reason::Old
         )
     }
 }
@@ -370,24 +367,24 @@ pub fn verdict(facts: &Facts, stale_days: u32) -> Reason {
 /// The verdict from the layers after the agents.
 fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
     match facts.changes {
-        Changes::None => {}
-        Changes::Some => return Reason::Changes,
+        Changes::Clean => {}
+        Changes::Uncommitted => return Reason::Changes,
         Changes::Failed | Changes::NotChecked => return Reason::Unknown,
     }
     match facts.pull_requests {
-        PullRequests::Open(_) => return Reason::Open,
-        PullRequests::Finished { merged: true, .. } => return Reason::Merged,
-        PullRequests::Finished { merged: false, .. } => return Reason::Closed,
+        PullRequests::Open(_) => return Reason::PullRequestOpen,
+        PullRequests::Finished { merged: true, .. } => return Reason::PullRequestMerged,
+        PullRequests::Finished { merged: false, .. } => return Reason::PullRequestClosed,
         _ => {}
     }
-    let is_integrated = matches!(facts.integration, Integration::Integrated(_));
-    if is_integrated && facts.days.is_some_and(|days| days >= INTEGRATED_MIN_DAYS) {
-        return Reason::Integrated;
+    let is_merged = matches!(facts.merge, Merge::Merged(_));
+    if is_merged && facts.days.is_some_and(|days| days >= MERGED_MIN_DAYS) {
+        return Reason::BranchMerged;
     }
     // A branch that was never pushed has no pull request, but only if the
     // forge gives no answer: a push without -u, or to another name, can
     // leave no remote branch here.
-    let has_no_pull_request = matches!(facts.pull_requests, PullRequests::None)
+    let has_no_pull_request = matches!(facts.pull_requests, PullRequests::NoPullRequest)
         || (matches!(facts.push, Push::Never) && forge_is_silent(&facts.pull_requests));
     if has_no_pull_request {
         return match facts.days {
@@ -397,9 +394,15 @@ fn verdict_of_work(facts: &Facts, stale_days: u32) -> Reason {
         };
     }
     match facts.pull_requests {
-        PullRequests::WorkAfter(_) => Reason::WorkAfter,
-        PullRequests::InDefault(_) => Reason::InDefault,
-        _ if is_integrated && facts.days.is_some() => Reason::Recent,
+        PullRequests::Kept {
+            why: KeptWhy::WorkAfter,
+            ..
+        } => Reason::WorkAfterPullRequest,
+        PullRequests::Kept {
+            why: KeptWhy::InDefaultBranch,
+            ..
+        } => Reason::CommitInDefaultBranch,
+        _ if is_merged && facts.days.is_some() => Reason::Recent,
         _ => Reason::Unknown,
     }
 }
@@ -424,7 +427,7 @@ fn commits_text(commits: u64) -> String {
 
 /// The words of a check of wt that found the content in the default
 /// branch `main`.
-fn integration_words(reason: &str, main: &str) -> String {
+fn merge_words(reason: &str, main: &str) -> String {
     match reason {
         "same_commit" => format!("the same commit as {main}"),
         "ancestor" => format!("an older commit of {main}"),
@@ -442,7 +445,13 @@ pub fn unknown_detail(facts: &Facts) -> String {
     match (&facts.changes, &facts.pull_requests) {
         (Changes::Failed, _) => "git status failed".to_owned(),
         (_, PullRequests::Failed(error)) => error.clone(),
-        (_, PullRequests::NoLocalCommit(_)) => "no local commit".to_owned(),
+        (
+            _,
+            PullRequests::Kept {
+                why: KeptWhy::NoLocalCommit,
+                ..
+            },
+        ) => "no local commit".to_owned(),
         _ if facts.days.is_none() => "no date of activity".to_owned(),
         _ => "no answer".to_owned(),
     }
@@ -459,18 +468,18 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
     let never_pushed = matches!(facts.push, Push::Never);
     let text = match reason {
         Reason::Checking => "checking…".to_owned(),
-        Reason::Merged => format!("{short} {number} merged"),
-        Reason::Closed => format!("{short} {number} closed"),
-        Reason::Integrated => match &facts.integration {
-            Integration::Integrated(how) => {
-                format!("merged: {}", integration_words(how, facts.main()))
+        Reason::PullRequestMerged => format!("{short} {number} merged"),
+        Reason::PullRequestClosed => format!("{short} {number} closed"),
+        Reason::BranchMerged => match &facts.merge {
+            Merge::Merged(how) => {
+                format!("merged: {}", merge_words(how, facts.default_branch_name()))
             }
-            _ => format!("merged into {}", facts.main()),
+            _ => format!("merged into {}", facts.default_branch_name()),
         },
         Reason::Old if never_pushed => "never pushed, no recent activity".to_owned(),
         Reason::Old => format!("no {short}, no recent activity"),
-        Reason::Open => format!("{short} {number} open"),
-        Reason::Recent if matches!(facts.integration, Integration::Integrated(_)) => {
+        Reason::PullRequestOpen => format!("{short} {number} open"),
+        Reason::Recent if matches!(facts.merge, Merge::Merged(_)) => {
             "merged, activity today".to_owned()
         }
         Reason::Recent if never_pushed => "never pushed, recent activity".to_owned(),
@@ -478,8 +487,10 @@ pub fn reason_text(reason: Reason, facts: &Facts) -> String {
         Reason::Changes => "changes not committed".to_owned(),
         Reason::Agent => "an agent works here".to_owned(),
         Reason::IdleAgent => "an idle agent, no proof of the end".to_owned(),
-        Reason::WorkAfter => format!("work after {short} {number}"),
-        Reason::InDefault => format!("{short} {number} finished, commit in the default branch"),
+        Reason::WorkAfterPullRequest => format!("work after {short} {number}"),
+        Reason::CommitInDefaultBranch => {
+            format!("{short} {number} finished, commit in the default branch")
+        }
         Reason::Unknown => format!("not checked: {}", unknown_detail(facts)),
     };
     if reason.is_leftover() && facts.agent == Agents::Idle {
@@ -499,19 +510,19 @@ pub fn question(reason: Reason, facts: &Facts) -> String {
     let name = facts.long_name();
     let days = facts.days.unwrap_or(0);
     match reason {
-        Reason::Merged => format!("Its {name} {number} is merged."),
-        Reason::Closed => format!("Its {name} {number} is closed."),
-        Reason::Integrated => format!("{} contains its content.", facts.main()),
+        Reason::PullRequestMerged => format!("Its {name} {number} is merged."),
+        Reason::PullRequestClosed => format!("Its {name} {number} is closed."),
+        Reason::BranchMerged => format!("{} contains its content.", facts.default_branch_name()),
         Reason::Old => format!("No {name}, and no change for {days} days."),
-        Reason::Open => format!("Careful: its {name} {number} is open."),
+        Reason::PullRequestOpen => format!("Careful: its {name} {number} is open."),
         Reason::Recent => format!("No proof that it is finished, and a change {days} days ago."),
         Reason::Changes => "Careful: it has changes that are not committed.".to_owned(),
         Reason::Agent => "Careful: an agent works in it.".to_owned(),
         Reason::IdleAgent => {
             "Careful: an idle agent is in it, and no proof shows the end of its work.".to_owned()
         }
-        Reason::WorkAfter => format!("Careful: the branch has work after {number}."),
-        Reason::InDefault => {
+        Reason::WorkAfterPullRequest => format!("Careful: the branch has work after {number}."),
+        Reason::CommitInDefaultBranch => {
             format!("Its {name} {number} is finished, and the default branch contains its commit.")
         }
         Reason::Checking | Reason::Unknown => "The cleaner did not check it.".to_owned(),
@@ -602,34 +613,36 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
         Agents::Idle => line(Mark::Info, "Agent", "idle", "herdr"),
     };
     let changes = match facts.changes {
-        Changes::None => line(Mark::Pass, "Changes", "none", "git status"),
-        Changes::Some => line(Mark::Fail, "Changes", "not committed", "git status"),
+        Changes::Clean => line(Mark::Pass, "Changes", "none", "git status"),
+        Changes::Uncommitted => line(Mark::Fail, "Changes", "not committed", "git status"),
         Changes::Failed => line(Mark::Unknown, "Changes", "git status failed", "git status"),
         Changes::NotChecked => waiting("Changes", "git status"),
     };
-    let merged = match &facts.integration {
-        Integration::Integrated(how) => line(
+    let merged = match &facts.merge {
+        Merge::Merged(how) => line(
             Mark::Pass,
             "Merged",
-            format!("yes: {}", integration_words(how, facts.main())),
+            format!("yes: {}", merge_words(how, facts.default_branch_name())),
             "wt",
         ),
-        Integration::NotIntegrated(Some(commits)) => line(
+        Merge::NotMerged(Some(commits)) => line(
             Mark::Info,
             "Merged",
-            format!("no: {} not in {}", commits_text(*commits), facts.main()),
+            format!(
+                "no: {} not in {}",
+                commits_text(*commits),
+                facts.default_branch_name()
+            ),
             "wt",
         ),
-        Integration::NotIntegrated(None) => line(
+        Merge::NotMerged(None) => line(
             Mark::Info,
             "Merged",
-            format!("no: commits not in {}", facts.main()),
+            format!("no: commits not in {}", facts.default_branch_name()),
             "wt",
         ),
-        Integration::Undetermined(why) => {
-            line(Mark::Unknown, "Merged", format!("unknown: {why}"), "wt")
-        }
-        Integration::NotChecked => waiting("Merged", "wt"),
+        Merge::Undetermined(why) => line(Mark::Unknown, "Merged", format!("unknown: {why}"), "wt"),
+        Merge::NotChecked => waiting("Merged", "wt"),
     };
     let push = match &facts.push {
         Push::Never if forge_is_silent(&facts.pull_requests) => line(
@@ -661,7 +674,7 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
         facts.forge.clone()
     };
     let pull_requests = match &facts.pull_requests {
-        PullRequests::None => line(Mark::Pass, "Pull requests", "none", &forge),
+        PullRequests::NoPullRequest => line(Mark::Pass, "Pull requests", "none", &forge),
         PullRequests::Finished { number, merged } => line(
             Mark::Pass,
             "Pull requests",
@@ -678,33 +691,19 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
             format!("{} open", facts.number_text(*number)),
             &forge,
         ),
-        PullRequests::WorkAfter(number) => line(
-            Mark::Fail,
-            "Pull requests",
-            format!(
-                "{} finished, but the branch has commits after it",
-                facts.number_text(*number)
-            ),
-            &forge,
-        ),
-        PullRequests::InDefault(number) => line(
-            Mark::Info,
-            "Pull requests",
-            format!(
-                "{} finished, the default branch has the commit",
-                facts.number_text(*number)
-            ),
-            &forge,
-        ),
-        PullRequests::NoLocalCommit(number) => line(
-            Mark::Unknown,
-            "Pull requests",
-            format!(
-                "{} finished, but no local commit",
-                facts.number_text(*number)
-            ),
-            &forge,
-        ),
+        PullRequests::Kept { number, why } => {
+            let (mark, words) = match why {
+                KeptWhy::WorkAfter => (Mark::Fail, "but the branch has commits after it"),
+                KeptWhy::InDefaultBranch => (Mark::Info, "the default branch has the commit"),
+                KeptWhy::NoLocalCommit => (Mark::Unknown, "but no local commit"),
+            };
+            line(
+                mark,
+                "Pull requests",
+                format!("{} finished, {words}", facts.number_text(*number)),
+                &forge,
+            )
+        }
         PullRequests::NotNeeded(why) => line(
             Mark::Info,
             "Pull requests",
@@ -722,8 +721,8 @@ pub fn lines(facts: &Facts, reason: Reason, stale_days: u32) -> Vec<Line> {
     let activity = match facts.days {
         Some(days) => {
             // The rule of the merge has its own limit.
-            let limit = if matches!(facts.integration, Integration::Integrated(_)) {
-                INTEGRATED_MIN_DAYS
+            let limit = if matches!(facts.merge, Merge::Merged(_)) {
+                MERGED_MIN_DAYS
             } else {
                 u64::from(stale_days)
             };
@@ -759,33 +758,31 @@ pub fn parse_default_branch(json: &Value) -> Option<String> {
 /// `wt list --format json`: `default_branch.integration` is absent when wt
 /// found no merge, null when wt could not decide, and an object with the
 /// reason when the default branch has the content.
-pub fn parse_integrations(json: &Value) -> HashMap<String, Integration> {
-    let mut integrations = HashMap::new();
+pub fn parse_merges(json: &Value) -> HashMap<String, Merge> {
+    let mut merges = HashMap::new();
     for item in json["items"].as_array().into_iter().flatten() {
         let Some(branch) = item["branch"].as_str() else {
             continue;
         };
         let default_branch = &item["default_branch"];
-        let integration = if item.get("head").is_some_and(Value::is_null) {
-            Integration::Undetermined("the branch has no commit".to_owned())
+        let merge = if item.get("head").is_some_and(Value::is_null) {
+            Merge::Undetermined("the branch has no commit".to_owned())
         } else if !default_branch.is_object() {
-            Integration::Undetermined("wt gave no answer".to_owned())
+            Merge::Undetermined("wt gave no answer".to_owned())
         } else if default_branch["orphan"].as_bool() == Some(true) {
-            Integration::Undetermined("no common history with the default branch".to_owned())
+            Merge::Undetermined("no common history with the default branch".to_owned())
         } else {
             match default_branch.get("integration") {
-                None => Integration::NotIntegrated(default_branch["ahead"].as_u64()),
-                Some(Value::Null) => {
-                    Integration::Undetermined("wt could not decide in time".to_owned())
+                None => Merge::NotMerged(default_branch["ahead"].as_u64()),
+                Some(Value::Null) => Merge::Undetermined("wt could not decide in time".to_owned()),
+                Some(found) => {
+                    Merge::Merged(found["reason"].as_str().unwrap_or("integrated").to_owned())
                 }
-                Some(found) => Integration::Integrated(
-                    found["reason"].as_str().unwrap_or("integrated").to_owned(),
-                ),
             }
         };
-        integrations.insert(branch.to_owned(), integration);
+        merges.insert(branch.to_owned(), merge);
     }
-    integrations
+    merges
 }
 
 /// The push state of each local branch, from 2 outputs of
@@ -830,10 +827,10 @@ mod tests {
     fn facts() -> Facts {
         Facts {
             agent: Agents::None,
-            changes: Changes::None,
-            integration: Integration::NotIntegrated(Some(2)),
+            changes: Changes::Clean,
+            merge: Merge::NotMerged(Some(2)),
             push: Push::Pushed("origin/feat".to_owned()),
-            pull_requests: PullRequests::None,
+            pull_requests: PullRequests::NoPullRequest,
             forge: "GitHub".to_owned(),
             default_branch: Some("main".to_owned()),
             days: Some(30),
@@ -842,7 +839,7 @@ mod tests {
 
     #[test]
     fn the_verdict_follows_the_order_of_the_layers() {
-        let squash = Integration::Integrated("patch_id_match".to_owned());
+        let squash = Merge::Merged("patch_id_match".to_owned());
         let merged_pr = PullRequests::Finished {
             number: 3,
             merged: true,
@@ -860,7 +857,7 @@ mod tests {
             (
                 "changes",
                 Facts {
-                    changes: Changes::Some,
+                    changes: Changes::Uncommitted,
                     ..facts()
                 },
                 Reason::Changes,
@@ -877,10 +874,10 @@ mod tests {
                 "an open PR wins over the merge",
                 Facts {
                     pull_requests: PullRequests::Open(3),
-                    integration: squash.clone(),
+                    merge: squash.clone(),
                     ..facts()
                 },
-                Reason::Open,
+                Reason::PullRequestOpen,
             ),
             (
                 "merged PR",
@@ -889,7 +886,7 @@ mod tests {
                     days: Some(0),
                     ..facts()
                 },
-                Reason::Merged,
+                Reason::PullRequestMerged,
             ),
             (
                 "closed PR",
@@ -900,22 +897,22 @@ mod tests {
                     },
                     ..facts()
                 },
-                Reason::Closed,
+                Reason::PullRequestClosed,
             ),
             (
                 "merged, 1 day without activity, the forge failed",
                 Facts {
-                    integration: squash.clone(),
+                    merge: squash.clone(),
                     pull_requests: PullRequests::Failed("gh: no end".to_owned()),
                     days: Some(1),
                     ..facts()
                 },
-                Reason::Integrated,
+                Reason::BranchMerged,
             ),
             (
                 "a new worktree is merged today: kept",
                 Facts {
-                    integration: Integration::Integrated("same_commit".to_owned()),
+                    merge: Merge::Merged("same_commit".to_owned()),
                     pull_requests: PullRequests::NotNeeded("no remote origin".to_owned()),
                     push: Push::Never,
                     days: Some(0),
@@ -948,7 +945,7 @@ mod tests {
                     pull_requests: PullRequests::Open(5),
                     ..facts()
                 },
-                Reason::Open,
+                Reason::PullRequestOpen,
             ),
             (
                 "never pushed and no backend: the age decides",
@@ -979,19 +976,25 @@ mod tests {
             (
                 "the commit is in the default branch, but wt failed",
                 Facts {
-                    integration: Integration::Undetermined("wt gave no answer".to_owned()),
-                    pull_requests: PullRequests::InDefault(4),
+                    merge: Merge::Undetermined("wt gave no answer".to_owned()),
+                    pull_requests: PullRequests::Kept {
+                        number: 4,
+                        why: KeptWhy::InDefaultBranch,
+                    },
                     ..facts()
                 },
-                Reason::InDefault,
+                Reason::CommitInDefaultBranch,
             ),
             (
                 "work after a finished PR",
                 Facts {
-                    pull_requests: PullRequests::WorkAfter(3),
+                    pull_requests: PullRequests::Kept {
+                        number: 3,
+                        why: KeptWhy::WorkAfter,
+                    },
                     ..facts()
                 },
-                Reason::WorkAfter,
+                Reason::WorkAfterPullRequest,
             ),
             (
                 "no date of activity",
@@ -1022,17 +1025,17 @@ mod tests {
             },
             ..facts()
         });
-        assert_eq!(verdict(&merged_pr, 7), Reason::Merged);
+        assert_eq!(verdict(&merged_pr, 7), Reason::PullRequestMerged);
         assert_eq!(
-            reason_text(Reason::Merged, &merged_pr),
+            reason_text(Reason::PullRequestMerged, &merged_pr),
             "PR #3 merged, idle agent closed first"
         );
         let squashed = idle(Facts {
-            integration: Integration::Integrated("patch_id_match".to_owned()),
+            merge: Merge::Merged("patch_id_match".to_owned()),
             days: Some(2),
             ..facts()
         });
-        assert_eq!(verdict(&squashed, 7), Reason::Integrated);
+        assert_eq!(verdict(&squashed, 7), Reason::BranchMerged);
         // The age alone: the idle agent keeps the worktree.
         assert_eq!(verdict(&idle(facts()), 7), Reason::IdleAgent);
         // An open PR stays an open PR.
@@ -1040,7 +1043,7 @@ mod tests {
             pull_requests: PullRequests::Open(1),
             ..facts()
         });
-        assert_eq!(verdict(&open, 7), Reason::Open);
+        assert_eq!(verdict(&open, 7), Reason::PullRequestOpen);
     }
 
     #[test]
@@ -1124,7 +1127,7 @@ mod tests {
     fn the_facts_go_to_json_and_back() {
         let facts = Facts {
             agent: Agents::Idle,
-            integration: Integration::Integrated("patch_id_match".to_owned()),
+            merge: Merge::Merged("patch_id_match".to_owned()),
             push: Push::Gone("origin/feat".to_owned()),
             pull_requests: PullRequests::Finished {
                 number: 12,
@@ -1150,17 +1153,20 @@ mod tests {
             merged: true,
         });
 
-        assert_eq!(reason_text(Reason::Merged, &merged), "MR !12 merged");
         assert_eq!(
-            question(Reason::Merged, &merged),
+            reason_text(Reason::PullRequestMerged, &merged),
+            "MR !12 merged"
+        );
+        assert_eq!(
+            question(Reason::PullRequestMerged, &merged),
             "Its merge request !12 is merged."
         );
         assert_eq!(
-            lines(&merged, Reason::Merged, 7)[4].text,
+            lines(&merged, Reason::PullRequestMerged, 7)[4].text,
             "!12 merged, with the last commit"
         );
         assert_eq!(
-            reason_text(Reason::Old, &gitlab(PullRequests::None)),
+            reason_text(Reason::Old, &gitlab(PullRequests::NoPullRequest)),
             "no MR, no recent activity"
         );
         // GitHub keeps its words.
@@ -1168,13 +1174,19 @@ mod tests {
             forge: "GitHub".to_owned(),
             ..merged
         };
-        assert_eq!(reason_text(Reason::Merged, &github), "PR #12 merged");
+        assert_eq!(
+            reason_text(Reason::PullRequestMerged, &github),
+            "PR #12 merged"
+        );
         // Azure DevOps has pull requests, with the mark of GitLab.
         let azure = Facts {
             forge: "Azure DevOps".to_owned(),
             ..github
         };
-        assert_eq!(reason_text(Reason::Merged, &azure), "PR !12 merged");
+        assert_eq!(
+            reason_text(Reason::PullRequestMerged, &azure),
+            "PR !12 merged"
+        );
     }
 
     #[test]
@@ -1212,12 +1224,12 @@ mod tests {
     #[test]
     fn the_tab_checks_has_one_line_for_each_layer() {
         let facts = Facts {
-            integration: Integration::Integrated("patch_id_match".to_owned()),
+            merge: Merge::Merged("patch_id_match".to_owned()),
             days: Some(2),
             ..facts()
         };
 
-        let shown = lines(&facts, Reason::Integrated, 7);
+        let shown = lines(&facts, Reason::BranchMerged, 7);
 
         let layers: Vec<&str> = shown.iter().map(|line| line.layer).collect();
         assert_eq!(
@@ -1245,7 +1257,7 @@ mod tests {
         assert_eq!(not_merged[2].mark, Mark::Info);
 
         let empty = Facts {
-            integration: Integration::Undetermined("the branch has no commit".to_owned()),
+            merge: Merge::Undetermined("the branch has no commit".to_owned()),
             ..facts()
         };
         let unknown = lines(&empty, Reason::Old, 7);
@@ -1256,7 +1268,7 @@ mod tests {
     #[test]
     fn a_merged_worktree_kept_today_shows_the_limit_of_1_day() {
         let kept = Facts {
-            integration: Integration::Integrated("same_commit".to_owned()),
+            merge: Merge::Merged("same_commit".to_owned()),
             days: Some(0),
             ..facts()
         };
@@ -1267,9 +1279,12 @@ mod tests {
         assert_eq!(activity.mark, Mark::Fail);
         assert_eq!(
             reason_text(
-                Reason::InDefault,
+                Reason::CommitInDefaultBranch,
                 &Facts {
-                    pull_requests: PullRequests::InDefault(4),
+                    pull_requests: PullRequests::Kept {
+                        number: 4,
+                        why: KeptWhy::InDefaultBranch,
+                    },
                     ..facts()
                 }
             ),
@@ -1281,7 +1296,7 @@ mod tests {
     fn a_running_check_shows_its_layers_as_waiting() {
         let facts = Facts {
             changes: Changes::NotChecked,
-            integration: Integration::NotChecked,
+            merge: Merge::NotChecked,
             push: Push::NotChecked,
             pull_requests: PullRequests::NotChecked,
             days: None,
@@ -1311,23 +1326,20 @@ mod tests {
         let json: Value =
             serde_json::from_str(include_str!("../tests/fixtures/wt-list.json")).unwrap();
 
-        let integrations = parse_integrations(&json);
+        let merges = parse_merges(&json);
 
         assert_eq!(
-            integrations["feat-squashed"],
-            Integration::Integrated("patch_id_match".to_owned())
+            merges["feat-squashed"],
+            Merge::Merged("patch_id_match".to_owned())
+        );
+        assert_eq!(merges["feat-open"], Merge::NotMerged(Some(1)));
+        assert_eq!(
+            merges["feat-orphan"],
+            Merge::Undetermined("wt could not decide in time".to_owned())
         );
         assert_eq!(
-            integrations["feat-open"],
-            Integration::NotIntegrated(Some(1))
-        );
-        assert_eq!(
-            integrations["feat-orphan"],
-            Integration::Undetermined("wt could not decide in time".to_owned())
-        );
-        assert_eq!(
-            integrations["feat-empty"],
-            Integration::Undetermined("the branch has no commit".to_owned())
+            merges["feat-empty"],
+            Merge::Undetermined("the branch has no commit".to_owned())
         );
         assert_eq!(parse_default_branch(&json).as_deref(), Some("main"));
     }
@@ -1354,7 +1366,7 @@ mod tests {
     #[test]
     fn the_row_tells_the_proof_of_the_verdict() {
         let squashed = Facts {
-            integration: Integration::Integrated("patch_id_match".to_owned()),
+            merge: Merge::Merged("patch_id_match".to_owned()),
             ..facts()
         };
         let never = Facts {
@@ -1363,7 +1375,7 @@ mod tests {
         };
 
         assert_eq!(
-            reason_text(Reason::Integrated, &squashed),
+            reason_text(Reason::BranchMerged, &squashed),
             "merged: a squash merge into main"
         );
         assert_eq!(

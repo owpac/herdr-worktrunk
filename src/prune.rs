@@ -32,6 +32,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::forge::{self, Backend, PullRequest, PullRequestState};
 use crate::git::{self, LinkedWorktree};
 use crate::herdr::Error;
@@ -148,7 +150,8 @@ pub enum BranchStatus {
 }
 
 /// Why a worktree with finished pull requests stays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum KeptWhy {
     /// The branch has a commit after its finished pull requests.
     WorkAfter,
