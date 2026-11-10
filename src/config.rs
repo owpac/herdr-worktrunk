@@ -1,10 +1,9 @@
 //! The config file of the plugin: `config.toml` in the config folder that
 //! herdr gives to the plugin (`herdr plugin config-dir herdr-worktrunk`).
 //!
-//! The agents also read this file (the skill worktrees of the agent
-//! plugin herdr): `agent_mode` and the `[repositories."<path>"]` tables
-//! are for them. The plugin reads only the top-level keys `observe`,
-//! `prune_merged`, `stale_days`, `popup_size` and `fetch_before_check`.
+//! The plugin reads only the top-level keys `observe`, `prune_merged`,
+//! `stale_days`, `popup_size` and `fetch_before_check`, and ignores the
+//! other keys and the tables.
 
 use std::env;
 use std::fs;
@@ -97,7 +96,7 @@ fn parse(text: &str) -> Config {
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
-            // The tables are for the agents.
+            // The keys of a table are not top-level keys.
             break;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -134,7 +133,7 @@ mod tests {
 
     #[test]
     fn observe_false_stops_the_observer() {
-        let text = "agent_mode = \"ask\"\nobserve = false # no observer\n";
+        let text = "other = \"x\"\nobserve = false # no observer\n";
 
         assert!(!parse(text).observe);
     }
