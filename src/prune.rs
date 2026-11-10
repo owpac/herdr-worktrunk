@@ -22,22 +22,29 @@
 //! `refs/pull/<number>/head`, GitLab and Azure DevOps give the commit
 //! itself.
 //!
-//! A local commit in the default branch is not work of the branch: a new
-//! worktree starts there. Thus a new worktree stays, also on the name of
-//! an old branch. `wt step prune` removes a worktree whose commit is in the
-//! default branch, for example after a merge commit.
+//! A local commit in the default branch does not prove a finished pull
+//! request: a new worktree starts there, also on the name of an old
+//! branch. The check gives these worktrees in `Check::merged`, as the
+//! worktrees of a merge without pull request (`wt merge --no-remove`) on a
+//! branch that was never pushed. Then the rule `leftover::merged_branch`
+//! decides: the reflog tells if the branch has its own commits.
 //!
 //! The observer does not fetch `origin`. Thus the local copy of the default
 //! branch of `origin` can be old. An old copy contains fewer commits, so
 //! the check can only remove a worktree of a finished pull request.
+//!
+//! A repository without the remote `origin` has no pull request: all its
+//! worktrees are without pull request.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::forge::{self, Backend, PullRequest, PullRequestState};
+use crate::forge::{self, Backend, ForgeError, PullRequest, PullRequestState};
 use crate::git::{self, LinkedWorktree};
 use crate::herdr::Error;
+use crate::leftover::{self, Push};
 use crate::stale::OldWorktree;
 
 /// A worktree of a finished pull request.
@@ -58,13 +65,18 @@ pub struct FinishedWorktree {
     pub reference: String,
 }
 
-impl FinishedWorktree {
-    /// Return true if the branch still has the checked commit.
-    /// `current_commit` is the commit of the branch now, or None if the
-    /// branch does not exist.
-    pub fn is_unchanged(&self, current_commit: Option<&str>) -> bool {
-        current_commit == Some(self.commit.as_str())
-    }
+/// A worktree whose branch the default branch contains, without an open
+/// pull request: after a merge commit, a merge without pull request, or a
+/// new worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergedWorktree {
+    pub path: PathBuf,
+    pub branch: String,
+    /// The commit of the branch that the default branch contains.
+    pub commit: String,
+    /// The default branch that contains the commit: `main` or
+    /// `origin/main`.
+    pub default_branch: String,
 }
 
 /// The linked worktrees of a repository, sorted by their pull requests.
@@ -72,7 +84,10 @@ impl FinishedWorktree {
 pub struct Check {
     /// The worktrees of the finished pull requests.
     pub finished: Vec<FinishedWorktree>,
-    /// The worktrees whose branch has no pull request.
+    /// The worktrees whose branch is in the default branch, without an
+    /// open pull request or a proof of a finished one.
+    pub merged: Vec<MergedWorktree>,
+    /// The other worktrees whose branch has no pull request.
     pub without_pull_request: Vec<LinkedWorktree>,
 }
 
@@ -125,11 +140,66 @@ pub fn finished_pull_request<'a>(
     finished.find(|pull_request| head_contains(&pull_request.head))
 }
 
-/// The backend of the forge of `main_checkout`, for the observer.
-fn repository_backend(main_checkout: &Path) -> Result<Box<dyn Backend>, Error> {
-    forge::of_repository(main_checkout)
+/// The backend of the forge of `main_checkout`, for the observer, or None
+/// for a repository without the remote `origin`: it has no pull request.
+fn repository_backend(main_checkout: &Path) -> Result<Option<Box<dyn Backend>>, Error> {
+    match forge::of_repository(main_checkout)
         .and_then(|forge| forge::backend(&forge, forge::BACKGROUND_TIME_LIMIT))
-        .map_err(|error| Error::Command(error.to_string()))
+    {
+        Ok(backend) => Ok(Some(backend)),
+        Err(ForgeError::NoRemote) => Ok(None),
+        Err(error) => Err(Error::Command(error.to_string())),
+    }
+}
+
+/// Return true if the rule of a merged branch applies to a branch with
+/// this status of the forge and this push state: a finished pull request
+/// whose commit is in the default branch, or no pull request and no push.
+fn is_merge_candidate(status: &BranchStatus, push: Option<&Push>) -> bool {
+    match status {
+        BranchStatus::NoPullRequest => matches!(push, Some(Push::Never)),
+        BranchStatus::Kept {
+            why: KeptWhy::InDefaultBranch,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// The default branches of a repository, local first: `main`, then
+/// `origin/main`. Without network.
+fn default_branches(main_checkout: &Path) -> Vec<String> {
+    git::local_default_branch(main_checkout)
+        .into_iter()
+        .chain(git::default_branch(main_checkout))
+        .collect()
+}
+
+/// The worktree of `worktree` as a merged worktree, if one of
+/// `default_branches` contains the commit of its branch. A worktree on the
+/// default branch itself is never merged.
+fn merged_worktree(
+    main_checkout: &Path,
+    worktree: &LinkedWorktree,
+    default_branches: &[String],
+) -> Option<MergedWorktree> {
+    if default_branches.first() == Some(&worktree.branch) {
+        return None;
+    }
+    let commit = git::branch_commit(main_checkout, &worktree.branch)?;
+    let default_branch = default_branches.iter().find(|default_branch| {
+        let reference = match default_branch.strip_prefix("origin/") {
+            Some(_) => format!("refs/remotes/{default_branch}"),
+            None => format!("refs/heads/{default_branch}"),
+        };
+        git::is_ancestor(main_checkout, &commit, &reference)
+    })?;
+    Some(MergedWorktree {
+        path: worktree.path.clone(),
+        branch: worktree.branch.clone(),
+        commit,
+        default_branch: default_branch.clone(),
+    })
 }
 
 /// The pull requests of a branch, as the observer and the cleaner see
@@ -223,9 +293,16 @@ pub fn branch_status(
 /// pull requests.
 ///
 /// `skip` tells if the thread must keep a worktree without a question to
-/// the forge, for example a worktree where an agent works. If the forge of
-/// `origin` has no backend, or if git or the forge fails, the function
-/// returns an error and no worktree.
+/// the forge, for example a worktree where an agent works. A repository
+/// without the remote `origin` has no pull request: its worktrees are all
+/// without pull request. If the forge of `origin` has no backend, or if
+/// git or the forge fails, the function returns an error and no worktree.
+///
+/// A merged worktree (`Check::merged`) has a finished pull request, or a
+/// branch that was never pushed: a local merge, for example `wt merge
+/// --no-remove`. A pushed branch without pull request (`develop`) can be a
+/// long work that the default branch receives from time to time: it stays
+/// without pull request, for the daily question.
 pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Result<Check, Error> {
     let worktrees: Vec<LinkedWorktree> = git::linked_worktrees(main_checkout)?
         .into_iter()
@@ -236,26 +313,52 @@ pub fn check_worktrees(main_checkout: &Path, skip: impl Fn(&Path) -> bool) -> Re
     }
     let backend = repository_backend(main_checkout)?;
     let origin_default_branch = git::default_branch(main_checkout);
+    let default_branches = default_branches(main_checkout);
+    let pushes = match (
+        git::branch_upstreams(main_checkout),
+        git::remote_branches(main_checkout),
+    ) {
+        (Some(branches), Some(remotes)) => leftover::parse_pushes(&branches, &remotes),
+        _ => HashMap::new(),
+    };
     let mut check = Check::default();
     for worktree in worktrees {
-        match branch_status(
-            main_checkout,
-            backend.as_ref(),
-            origin_default_branch.as_deref(),
-            &worktree.branch,
-        )? {
+        let status = match &backend {
+            Some(backend) => branch_status(
+                main_checkout,
+                backend.as_ref(),
+                origin_default_branch.as_deref(),
+                &worktree.branch,
+            )?,
+            None => BranchStatus::NoPullRequest,
+        };
+        if is_merge_candidate(&status, pushes.get(&worktree.branch)) {
+            if let Some(merged) = merged_worktree(main_checkout, &worktree, &default_branches) {
+                check.merged.push(merged);
+                continue;
+            }
+        }
+        match status {
             BranchStatus::NoPullRequest => check.without_pull_request.push(worktree),
             BranchStatus::Finished {
                 pull_request,
                 commit,
-            } => check.finished.push(FinishedWorktree {
-                recover_command: backend.recover_command(&pull_request, &commit, &worktree.branch),
-                reference: backend.provider().reference(pull_request.number),
-                path: worktree.path,
-                branch: worktree.branch,
-                pull_request,
-                commit,
-            }),
+            } => {
+                // A status of the forge needs a backend.
+                let Some(backend) = &backend else { continue };
+                check.finished.push(FinishedWorktree {
+                    recover_command: backend.recover_command(
+                        &pull_request,
+                        &commit,
+                        &worktree.branch,
+                    ),
+                    reference: backend.provider().reference(pull_request.number),
+                    path: worktree.path,
+                    branch: worktree.branch,
+                    pull_request,
+                    commit,
+                });
+            }
             BranchStatus::Open(_) | BranchStatus::Kept { .. } => {}
         }
     }
@@ -275,7 +378,9 @@ pub fn without_pull_request(
     if old.is_empty() {
         return Ok(old);
     }
-    let backend = repository_backend(main_checkout)?;
+    let Some(backend) = repository_backend(main_checkout)? else {
+        return Ok(old);
+    };
     let mut kept = Vec::new();
     for worktree in old {
         if backend.pull_requests(&worktree.branch)?.is_empty() {
@@ -384,17 +489,6 @@ mod tests {
             finished_pull_request("aaa", &[], DefaultBranch::DoesNotContain, never),
             None
         );
-    }
-
-    fn finished_worktree() -> FinishedWorktree {
-        FinishedWorktree {
-            path: PathBuf::from("/work/repo.feature"),
-            branch: "feature".to_owned(),
-            commit: "aaa".to_owned(),
-            pull_request: pull_request(1, MERGED, "aaa"),
-            recover_command: "git fetch origin pull/1/head:feature".to_owned(),
-            reference: "pull request #1".to_owned(),
-        }
     }
 
     /// A forge for the tests: its pull requests, and the pairs (head,
@@ -580,17 +674,87 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_with_the_checked_commit_is_unchanged() {
-        assert!(finished_worktree().is_unchanged(Some("aaa")));
+    fn a_repository_without_remote_gives_its_merged_worktrees() {
+        let folder = test_folder("merged-without-remote");
+        let repository = folder.join("app");
+        git_in(&folder, &["init", "-q", "-b", "main", "app"]);
+        git_in(
+            &repository,
+            &["commit", "-q", "--allow-empty", "-m", "start"],
+        );
+        git_in(&repository, &["config", "worktrunk.default-branch", "main"]);
+        let worktree = |branch: &str| {
+            let path = folder.join(format!("app.{branch}"));
+            git_in(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+            path
+        };
+        // done: a commit, then a merge into main without pull request.
+        let done = worktree("done");
+        git_in(&done, &["commit", "-q", "--allow-empty", "-m", "done"]);
+        git_in(&repository, &["merge", "-q", "--ff-only", "done"]);
+        // fresh: a new worktree on the commit of main.
+        worktree("fresh");
+        // open: a commit that main does not have.
+        let open = worktree("open");
+        git_in(&open, &["commit", "-q", "--allow-empty", "-m", "open"]);
+
+        let check = check_worktrees(&repository, |_| false).unwrap();
+
+        let merged: Vec<(&str, &str)> = check
+            .merged
+            .iter()
+            .map(|worktree| (worktree.branch.as_str(), worktree.default_branch.as_str()))
+            .collect();
+        assert_eq!(merged, [("done", "main"), ("fresh", "main")]);
+        assert!(check.finished.is_empty());
+        let without: Vec<&str> = check
+            .without_pull_request
+            .iter()
+            .map(|worktree| worktree.branch.as_str())
+            .collect();
+        assert_eq!(without, ["open"]);
+        // The reflog tells the own commits of each merged branch.
+        assert!(git::has_own_commits(&repository, "done"));
+        assert!(!git::has_own_commits(&repository, "fresh"));
     }
 
     #[test]
-    fn a_branch_with_a_new_commit_is_changed() {
-        assert!(!finished_worktree().is_unchanged(Some("bbb")));
-    }
+    fn a_pushed_branch_without_pull_request_is_not_a_merged_worktree() {
+        let kept = |why| BranchStatus::Kept { number: 4, why };
+        let pushed = Push::Pushed("origin/develop".to_owned());
 
-    #[test]
-    fn a_deleted_branch_is_changed() {
-        assert!(!finished_worktree().is_unchanged(None));
+        assert!(is_merge_candidate(
+            &BranchStatus::NoPullRequest,
+            Some(&Push::Never)
+        ));
+        // develop: a long work that main receives from time to time.
+        assert!(!is_merge_candidate(
+            &BranchStatus::NoPullRequest,
+            Some(&pushed)
+        ));
+        assert!(!is_merge_candidate(&BranchStatus::NoPullRequest, None));
+        // A merge commit of a pull request: also a pushed branch.
+        assert!(is_merge_candidate(
+            &kept(KeptWhy::InDefaultBranch),
+            Some(&pushed)
+        ));
+        assert!(!is_merge_candidate(
+            &kept(KeptWhy::WorkAfter),
+            Some(&Push::Never)
+        ));
+        assert!(!is_merge_candidate(
+            &BranchStatus::Open(4),
+            Some(&Push::Never)
+        ));
     }
 }

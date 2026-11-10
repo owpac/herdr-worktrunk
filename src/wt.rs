@@ -92,7 +92,8 @@ pub fn remove(main_checkout: &Path, checkout: &Path) -> Result<(), Error> {
 }
 
 /// Remove the worktree `checkout` without output on the terminal. On a
-/// failure, the error has the message of wt.
+/// failure, the error has the message of wt. wt deletes the branch only if
+/// it sees it merged: its own check protects the commits.
 pub fn remove_quietly(main_checkout: &Path, checkout: &Path) -> Result<(), Error> {
     remove_without_terminal(main_checkout, checkout, &[])
 }

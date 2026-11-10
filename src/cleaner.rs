@@ -36,7 +36,7 @@ use crate::forge::{self, ForgeError};
 use crate::fzf;
 use crate::git::{self, canonical};
 use crate::herdr::{self, Error};
-use crate::leftover::{self, Agents, Changes, Facts, Merge, PullRequests, Push, Reason};
+use crate::leftover::{self, Agents, Changes, Facts, History, Merge, PullRequests, Push, Reason};
 use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::prune;
 use crate::stale;
@@ -442,6 +442,9 @@ fn check(entry: &Entry, repository: &RepositoryFacts, stale_days: u32) -> Entry 
             .unwrap_or_else(|| Merge::Undetermined("wt did not list this worktree".to_owned())),
         None => Merge::Undetermined("wt gave no answer".to_owned()),
     };
+    if matches!(facts.merge, Merge::Merged(_)) {
+        facts.history = History::of(git::has_own_commits(&entry.main_checkout, &entry.branch));
+    }
     facts.default_branch_name = repository.main_name.clone();
     facts.push = repository
         .pushes

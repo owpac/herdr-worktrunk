@@ -82,8 +82,12 @@ flowchart TD
     open -->|yes| kept2[Kept]
     open -->|no| finished{"Finished pull request<br/>with the last commit?"}
     finished -->|yes| delete1[To delete]
-    finished -->|no| merged{"Branch merged,<br/>1 day without activity?"}
-    merged -->|yes| delete2[To delete]
+    finished -->|no| merged{"Branch merged?"}
+    merged -->|yes| own{"Own commits?"}
+    own -->|yes| delete2[To delete]
+    own -->|no| unused{"1 day without activity,<br/>and no agent?"}
+    unused -->|yes| delete2
+    unused -->|no| kept6["Kept: new or unused"]
     merged -->|no| nopr{"No pull request,<br/>or never pushed?"}
     nopr -->|no| kept3["Kept: no proof"]
     nopr -->|yes| old{"stale_days days<br/>without activity?"}
@@ -93,13 +97,13 @@ flowchart TD
     old -->|no| kept4["Kept: recent"]
 ```
 
-A new worktree has the commit of the default branch, so it is "merged" at once: the day without activity keeps it. A forge that gives no answer (no login, no network, a limit of 15 s) never gives a leftover: the row says "not checked".
+A new worktree has the commit of the default branch, so it is "merged" at once. The reflog of the branch tells if it has its own commits: a commit, a cherry-pick or a revert on the branch, after its last reset, pull or merge. A merged branch with its own commits is finished. Without its own commit, a merged worktree goes only without agent, after 1 day without activity, as with `wt step prune --min-age=1d`. A forge that gives no answer (no login, no network, a limit of 15 s) never gives a leftover: the row says "not checked".
 
 The agents follow the rules of the observer:
 
 - An agent that works (`working`, `blocked`, `unknown`), or an agent in the focused workspace, keeps the worktree.
-- An idle agent (`idle` or `done`) does not keep a worktree with a proof of the end: a finished pull request, or a merged branch. The deletion closes the agent first, and gives the command that resumes it, for example `claude --resume <session>`.
-- An idle agent keeps an old worktree without a proof of the end.
+- An idle agent (`idle` or `done`) does not keep a worktree with a proof of the end: a finished pull request, or a merged branch with its own commits. The deletion closes the agent first, and gives the command that resumes it, for example `claude --resume <session>`.
+- An idle agent keeps a worktree without a proof of the end: an old worktree, or a merged branch without own commit.
 - An open pull request keeps the worktree, with or without an agent.
 
 ### The forges
@@ -172,7 +176,7 @@ The plugin starts an observer with herdr. Every 2 seconds, it reads the state of
 
 1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell.
 2. **The workspace of a removed worktree closes**, if no agent works in it.
-3. **The worktrees of the finished pull requests go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces on a forge with a backend.
+3. **The worktrees of the finished work go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces: the finished pull requests, and the branches in the default branch.
 4. **The old worktrees**, with `stale_days = <days>`: once a day, the thread opens the cleaner if a worktree is old and the thread did not ask about it in the last `stale_days` days.
 
 <details>
@@ -190,9 +194,16 @@ The agents of a finished worktree:
 - If all its agents are `idle` or `done`, the thread closes their panes, then removes the worktree. The log gives the command that resumes each conversation, for example `claude --resume <session>`.
 - If an agent is `working`, `blocked` or `unknown`, or if its workspace has the focus, the thread keeps the worktree, and tries again at the next pass.
 
-The thread keeps a worktree with an open pull request, with its local commit in the default branch (`wt step prune` removes it), with changes that are not committed, or with a new commit after the check. It also keeps the main worktree, a detached worktree and a locked worktree, and ignores a pull request from a fork.
+The thread also removes the worktree of a branch that the default branch contains (the local branch, or the branch of `origin`). The branch has a finished pull request, or it was never pushed and has no pull request. The thread applies the rule of the cleaner:
 
-The thread removes the worktree and its branch with `wt remove --force-delete`, never with `--force`. It runs no `git fetch`: the CLI of the forge uses its API. `list-merged` prints the worktrees that the thread removes, without a removal:
+- With its own commits, the worktree goes at once, for example after a merge commit, or after `wt merge --no-remove` without a pull request. Idle agents close first.
+- Without its own commit, the worktree is new or unused. It goes only without agent, after 1 day without activity.
+
+A repository without the remote `origin` has no pull request: only this rule applies to it. A pushed branch without a pull request, for example `develop`, stays: the daily question and the cleaner show it. The thread finds a merge only in the history of git: a squash merge without a pull request stays for the cleaner.
+
+The thread keeps a worktree with an open pull request, with changes that are not committed, or with a new commit after the check. It also keeps the main worktree, a detached worktree and a locked worktree, and ignores a pull request from a fork.
+
+The thread removes the worktree of a finished pull request and its branch with `wt remove --force-delete`, never with `--force`. For a merged branch, it runs `wt remove` without `--force-delete`: wt deletes the branch only if it sees it merged. The thread runs no `git fetch`: the CLI of the forge uses its API. `list-merged` prints the worktrees of the finished pull requests and of the merged branches, without a removal:
 
 ```sh
 bin/herdr-worktrunk list-merged <folder of the repository>
@@ -206,7 +217,7 @@ bin/herdr-worktrunk list-merged <folder of the repository>
 - The observer watches only the agents. A shell that changes its folder does not move.
 - A pane moves only if the observer sees the same difference in 2 snapshots in a row. A moved pane gets a new pane ID: address an agent with its herdr name.
 - A workspace where an agent works stays open after the removal of its worktree. Close it with the herdr key `close_workspace`.
-- `prune_merged` checks only a remote `origin` on a forge with a backend (see [The forges](#the-forges)), and only when herdr runs. It stops a command of the forge after 1 minute, and a `git` command after 30 seconds.
+- `prune_merged` asks only the forge of the remote `origin`, with a backend (see [The forges](#the-forges)), and only when herdr runs. It stops a command of the forge after 1 minute, and a `git` command after 30 seconds.
 - The observer never approves the hooks of a project (`--yes`). If a hook has no approval, run `wt config approvals add` in the repository.
 - The observer writes each removal and each new error in `observer.log`, in the state folder of the plugin (by default `~/.local/state/herdr/plugins/herdr-worktrunk/`).
 
@@ -233,7 +244,8 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 # Start the observer (default: true).
 observe = true
 
-# The observer removes the worktree of each merged or closed pull request (default: false).
+# The observer removes the worktree of each merged or closed pull request, and of each branch in
+# the default branch (default: false).
 # Needs gh (GitHub), glab (GitLab), tea (Gitea, Forgejo) or az (Azure DevOps).
 prune_merged = false
 
