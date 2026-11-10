@@ -153,7 +153,7 @@ fn stale_days_of(config: &config::Config) -> u32 {
 }
 
 /// Print the old worktrees without pull request in the repository of
-/// `folder`: the worktrees of the daily question (`stale_days` of the
+/// `folder`: the worktrees that the observer names (`stale_days` of the
 /// config, or 7 days). This command does not know the agents of herdr, and
 /// ignores the last questions.
 fn list_stale(folder: &Path) -> Result<(), Error> {

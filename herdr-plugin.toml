@@ -76,8 +76,8 @@ width = "90%"
 height = "80%"
 command = ["bin/herdr-worktrunk", "pick"]
 
-# The list of all the linked worktrees, with their verdict: the action clean, or the daily pass of
-# the observer (stale_days). A deletion goes through the popup confirm, then the list comes back.
+# The list of all the linked worktrees, with their verdict: the action clean. A deletion goes
+# through the popup confirm, then the list comes back.
 [[panes]]
 id = "cleaner"
 title = "Worktrunk: clean"

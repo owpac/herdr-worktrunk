@@ -56,11 +56,6 @@ const RETURN_TO_CLEANER: &str = "cleaner";
 /// The popup confirm asks before the deletion of all the old worktrees.
 const DELETE_ALL: &str = "delete-all";
 
-/// The observer waits this number of times for a free popup, 2 seconds
-/// each time: 10 minutes at most.
-const ASK_ATTEMPTS: u32 = 300;
-const ASK_INTERVAL: Duration = Duration::from_secs(2);
-
 /// The popup `confirm` asks before one of these operations.
 const DELETE: &str = "delete";
 const MERGE: &str = "merge";
@@ -729,23 +724,6 @@ pub fn cleaner(stale_days: u32, fetch: bool) -> Result<(), Error> {
             open_after_this_popup("confirm", &folder, &environment)
         }
     }
-}
-
-/// Open the popup cleaner for the daily pass of the observer. herdr shows
-/// one popup at a time: wait while another popup is open, for 10 minutes
-/// at most.
-pub fn open_cleaner(folder: &Path) -> Result<(), Error> {
-    let folder_text = folder.to_string_lossy();
-    let environment = [(FOLDER_VARIABLE, folder_text.as_ref())];
-    for _ in 0..ASK_ATTEMPTS {
-        match herdr::open_plugin_pane("cleaner", folder, &environment) {
-            Err(Error::Herdr { code, .. }) if code == "ui_busy" => thread::sleep(ASK_INTERVAL),
-            other => return other,
-        }
-    }
-    Err(Error::Command(
-        "another popup stayed open for 10 minutes".to_owned(),
-    ))
 }
 
 /// Open the popup cleaner from a shell (command clean): for the

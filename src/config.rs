@@ -43,7 +43,7 @@ pub struct Config {
     /// The observer removes the worktrees of the merged or closed pull
     /// requests (default: false).
     pub prune_merged: bool,
-    /// Once a day, the observer asks about the worktrees without pull
+    /// The observer names in a notification the worktrees without pull
     /// request and without change for this number of days (default: 0,
     /// off). It needs `prune_merged`.
     pub stale_days: u32,

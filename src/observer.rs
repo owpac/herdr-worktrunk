@@ -33,7 +33,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::actions;
 use crate::forge::PullRequestState;
 use crate::git::{self, Checkout, LinkedWorktree};
 use crate::herdr::{self, Error, Pane, Snapshot};
@@ -667,9 +666,10 @@ fn start_prune_thread(view: Arc<Mutex<PruneView>>, log: Arc<Log>, settings: Prun
 /// The settings of the thread of the merged pull requests.
 #[derive(Clone, Debug)]
 struct PruneSettings {
-    /// The state folder of the plugin: the files of the daily question.
+    /// The state folder of the plugin: the file of the notifications of
+    /// the old worktrees.
     state_dir: PathBuf,
-    /// The days without activity of an old worktree (0: no question).
+    /// The days without activity of an old worktree (0: no notification).
     stale_days: u32,
 }
 
@@ -692,44 +692,71 @@ fn old_worktrees(
     stale::select_old(main_checkout, worktrees, is_busy, Some(asked), stale_days)
 }
 
-/// Open the popup cleaner with all the old worktrees, in a new thread: an
-/// open popup must not stop the removals. The thread records a question
-/// for each worktree of the list: `Esc` keeps them for `stale_days` days.
-fn ask_about_old_worktrees(
-    old: Vec<OldWorktree>,
-    waiting: usize,
-    settings: PruneSettings,
-    log: Arc<Log>,
+/// Name the new old worktrees in one herdr notification, and record the
+/// time: the thread names them again only after `stale_days` days. The
+/// paths in `waiting` have an idle agent.
+fn notify_old_worktrees(
+    old: &[OldWorktree],
+    waiting: &HashSet<PathBuf>,
+    settings: &PruneSettings,
+    log: &Log,
 ) {
-    let Some(folder) = old.first().map(|worktree| worktree.main_checkout.clone()) else {
+    let (title, body) = old_worktrees_notification(old, waiting);
+    if let Err(error) = herdr::show_notification(&title, &body) {
+        log.write(&format!(
+            "cannot show the notification of the old worktrees: {}",
+            one_line(&error)
+        ));
         return;
-    };
-    let thread_log = Arc::clone(&log);
-    let started = thread::Builder::new()
-        .name("stale_days".to_owned())
-        .spawn(move || {
-            let log = thread_log;
-            if let Err(error) = actions::open_cleaner(&folder) {
-                log.write(&format!(
-                    "cannot open the popup cleaner: {}",
-                    one_line(&error)
-                ));
-                return;
-            }
-            let mut asked = stale::read_asked(&settings.state_dir);
-            let now = stale::now();
-            for worktree in &old {
-                asked.insert(worktree.path.clone(), now);
-            }
-            stale::write_asked(&settings.state_dir, &asked);
-            log.write(&format!(
-                "opened the popup cleaner with {} old worktrees, {waiting} with an idle agent that waits",
-                old.len()
-            ));
-        });
-    if let Err(error) = started {
-        log.write(&format!("cannot start the thread stale_days: {error}"));
     }
+    let mut asked = stale::read_asked(&settings.state_dir);
+    let now = stale::now();
+    for worktree in old {
+        asked.insert(worktree.path.clone(), now);
+    }
+    stale::write_asked(&settings.state_dir, &asked);
+    let branches: Vec<&str> = old
+        .iter()
+        .map(|worktree| worktree.branch.as_str())
+        .collect();
+    log.write(&format!(
+        "named the worktrees to clean: {}",
+        branches.join(", ")
+    ));
+}
+
+/// The title and the body of the notification of the old worktrees: one
+/// line for each worktree, then how to clean them.
+fn old_worktrees_notification(old: &[OldWorktree], waiting: &HashSet<PathBuf>) -> (String, String) {
+    let title = if old.len() == 1 {
+        "1 worktree to clean".to_owned()
+    } else {
+        format!("{} worktrees to clean", old.len())
+    };
+    let mut lines: Vec<String> = old
+        .iter()
+        .map(|worktree| {
+            let project = git::folder_name(&worktree.main_checkout);
+            let days = if worktree.days == 1 {
+                "1 day".to_owned()
+            } else {
+                format!("{} days", worktree.days)
+            };
+            if waiting.contains(&worktree.path) {
+                format!(
+                    "{} ({project}): an idle agent waits, no activity for {days}",
+                    worktree.branch
+                )
+            } else {
+                format!(
+                    "{} ({project}): no pull request, no activity for {days}",
+                    worktree.branch
+                )
+            }
+        })
+        .collect();
+    lines.push("Open the cleaner: action clean of herdr-worktrunk.".to_owned());
+    (title, lines.join("\n"))
 }
 
 /// Check the merged pull requests of each repository, every 5 minutes.
@@ -747,23 +774,20 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
             .iter()
             .map(|repository| git::canonical(repository))
             .collect();
-        let is_stale_pass = settings.stale_days > 0
-            && stale::is_pass_due(stale::read_last_pass(&settings.state_dir), stale::now());
-        let asked = if is_stale_pass {
+        let is_stale_check = settings.stale_days > 0;
+        let asked = if is_stale_check {
             stale::read_asked(&settings.state_dir)
         } else {
             HashMap::new()
         };
         let mut old = Vec::new();
-        let mut is_checked = false;
         let mut notices = HashSet::new();
         for repository in repositories {
             let Some(without_pull_request) = prune_repository(&repository, view, log, &mut notices)
             else {
                 continue;
             };
-            is_checked = true;
-            if is_stale_pass {
+            if is_stale_check {
                 old.extend(old_worktrees(
                     &repository,
                     without_pull_request,
@@ -773,16 +797,13 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
                 ));
             }
         }
-        // A pass without a checked repository (no workspace yet, or the
-        // forge fails for all the branches) does not count: the next pass
-        // tries again.
-        if is_stale_pass && is_checked {
-            stale::write_last_pass(&settings.state_dir, stale::now());
-            let waiting = old
+        if !old.is_empty() {
+            let waiting: HashSet<PathBuf> = old
                 .iter()
                 .filter(|worktree| !lock(view).agents_in(&worktree.path).is_empty())
-                .count();
-            ask_about_old_worktrees(old, waiting, settings.clone(), Arc::clone(log));
+                .map(|worktree| worktree.path.clone())
+                .collect();
+            notify_old_worktrees(&old, &waiting, settings, log);
         }
         for notice in &notices {
             if !previous_notices.contains(notice) {
@@ -796,8 +817,9 @@ fn prune_loop(view: &Mutex<PruneView>, log: &Arc<Log>, settings: &PruneSettings)
 
 /// Remove the finished worktrees of one repository. Write each removal in
 /// the log, and add each error and each worktree that an agent keeps to
-/// `notices`. Return the worktrees without pull request, for the daily
-/// question, or None if the check failed for all the branches.
+/// `notices`. Return the worktrees without pull request, for the
+/// notification of the old worktrees, or None if the check failed for all
+/// the branches.
 ///
 /// The thread asks the forge also about a worktree where an agent works:
 /// the log then tells that the agent keeps a finished worktree. The cost
@@ -844,7 +866,7 @@ fn prune_repository(
             }
         };
         // A merged worktree that the rule keeps, without a pull request,
-        // can wait for the daily question too: for example a fork that
+        // can be an old worktree too: for example a fork that
         // never committed.
         if is_kept_by_rule && !worktree.has_pull_request {
             without_pull_request.push(LinkedWorktree {
@@ -853,8 +875,8 @@ fn prune_repository(
             });
         }
     }
-    // Without any checked branch, the daily question has no list: the
-    // pass does not count for it.
+    // Without any checked branch, the list of the worktrees without pull
+    // request is empty.
     if check.checked == 0 && !check.errors.is_empty() {
         return None;
     }
@@ -1944,5 +1966,29 @@ mod tests {
         assert!(!agent("working", "/work/app.feat", false).waits_in(worktree));
         assert!(!agent("idle", "/work/app.feat", true).waits_in(worktree));
         assert!(!agent("idle", "/work/other", false).waits_in(worktree));
+    }
+
+    #[test]
+    fn one_notification_names_the_worktrees_to_clean() {
+        let old = |branch: &str, days: u64| OldWorktree {
+            main_checkout: PathBuf::from("/work/app"),
+            path: PathBuf::from(format!("/work/app.{branch}")),
+            branch: branch.to_owned(),
+            days,
+        };
+        let waiting = HashSet::from([PathBuf::from("/work/app.fork")]);
+
+        let (title, body) =
+            old_worktrees_notification(&[old("spike", 9), old("fork", 1)], &waiting);
+
+        assert_eq!(title, "2 worktrees to clean");
+        assert_eq!(
+            body,
+            "spike (app): no pull request, no activity for 9 days\n\
+             fork (app): an idle agent waits, no activity for 1 day\n\
+             Open the cleaner: action clean of herdr-worktrunk."
+        );
+        let (title, _) = old_worktrees_notification(&[old("spike", 9)], &HashSet::new());
+        assert_eq!(title, "1 worktree to clean");
     }
 }
