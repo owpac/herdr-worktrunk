@@ -181,7 +181,7 @@ The thread removes the worktree of a branch only if the branch has no open pull 
 - GitHub: `git fetch origin pull/<number>/head:<branch>`.
 - GitLab: `git fetch origin <commit>:refs/heads/<branch>`. GitLab deletes the ref of a merge request 14 days after its close, but keeps its commits.
 - Gitea and Forgejo: `git fetch origin pull/<number>/head:<branch>`.
-- Azure DevOps: `git fetch origin <commit>:refs/heads/<branch>`.
+- Azure DevOps: `git branch <branch> <commit> || git fetch origin <commit>:refs/heads/<branch>`. git keeps the local commit until its next `git gc`.
 
 The agents of a finished worktree:
 
