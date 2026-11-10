@@ -4,7 +4,7 @@ name = "Worktrunk"
 # writes the version in the commit of the tag of each release.
 version = "0.0.0"
 min_herdr_version = "0.9.0"
-description = "Manage the git worktrees with worktrunk (wt), and keep 1 worktree = 1 herdr workspace"
+description = "Worktrees that live and die with the work, from the first commit to the merged pull request"
 platforms = ["linux", "macos"]
 
 # scripts/install.sh puts the binary at bin/herdr-worktrunk: the release binary of this version,

@@ -1,6 +1,8 @@
 # herdr-worktrunk
 
-A [herdr](https://herdr.dev) plugin that manages the git worktrees with [worktrunk](https://worktrunk.dev) (`wt`), and keeps one rule: **1 git worktree = 1 herdr workspace**.
+**Worktrees that live and die with the work.**
+
+Each task gets a git worktree (made by [worktrunk](https://worktrunk.dev)) and its own [herdr](https://herdr.dev) workspace. The agent follows its worktree. When the pull request ends, the plugin removes the worktree and closes its workspace. The cleaner finds the other leftovers, with a proof for each one.
 
 ![The popup cleaner: the checks run, then the leftovers go to the group To delete](docs/cleaner.gif)
 
@@ -15,7 +17,7 @@ worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `pos
 
 ```mermaid
 flowchart LR
-    create["Picker or agent<br/>wt switch --create"] --> worktree["Worktree<br/>= herdr workspace"]
+    create["Picker or agent<br/>wt switch --create"] --> worktree["Worktree<br/>+ herdr workspace"]
     worktree --> work["Commits"]
     work --> pr["Pull request"]
     pr -->|merged or closed| observer["Observer<br/>removes the worktree"]
