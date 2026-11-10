@@ -51,8 +51,8 @@ command = ["bin/herdr-worktrunk", "open", "merger"]
 
 [[actions]]
 id = "clean"
-title = "Worktree: clean the old worktrees"
-description = "List the worktrees without pull request and without change for some days, in all the repositories of the workspaces: Enter deletes one, ctrl-a deletes all"
+title = "Worktree: clean the worktrees"
+description = "List all the linked worktrees of the repositories of the workspaces, with a verdict for each one: Enter deletes one, ctrl-a deletes the visible worktrees of the group To delete"
 contexts = ["global"]
 command = ["bin/herdr-worktrunk", "open", "cleaner"]
 
@@ -76,8 +76,8 @@ width = "90%"
 height = "80%"
 command = ["bin/herdr-worktrunk", "pick"]
 
-# The list of the old worktrees without pull request: the action clean, or the daily pass of the
-# observer (stale_days). A deletion goes through the popup confirm, then the list comes back.
+# The list of all the linked worktrees, with their verdict: the action clean, or the daily pass of
+# the observer (stale_days). A deletion goes through the popup confirm, then the list comes back.
 [[panes]]
 id = "cleaner"
 title = "Worktrunk: clean"
