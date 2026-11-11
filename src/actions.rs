@@ -306,24 +306,6 @@ fn agents_to_close(
     }
 }
 
-/// Close the panes of the agents, then wait until herdr shows no agent in
-/// the worktree, for 10 seconds at most. The conversations stay on the
-/// disk.
-fn close_agents(agents: &[WorktreeAgent], checkout: &Path) -> Result<(), Error> {
-    for agent in agents {
-        herdr::close_pane(&agent.pane_id)?;
-    }
-    for _ in 0..20 {
-        if !herdr::agent_in_checkout(checkout)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    Err(Error::Command(
-        "The agent of this worktree did not close.".to_owned(),
-    ))
-}
-
 /// Popup confirm: ask before a deletion or a merge, then do it. If the
 /// picker opened this popup, the picker comes back after.
 pub fn confirm() -> Result<(), Error> {
@@ -458,45 +440,64 @@ fn ask_and_run() -> Result<(), Error> {
         "Delete the worktree",
         &format!("Deleting the worktree of {branch}…"),
     );
-    record_removal(&checkout.main_checkout(), &checkout.root, &agents);
-    if !agents.is_empty() {
-        close_agents(&agents, &checkout.root)?;
+    let removal = record_removal(
+        &checkout.main_checkout(),
+        &checkout.root,
+        &agents,
+        workspace_id.as_deref(),
+    );
+    // wt first: this popup can run in the workspace of the worktree, and
+    // the close of the workspace stops it. wt refuses changes that are not
+    // committed: then nothing closes.
+    if let Err(error) = wt::remove_quietly(&checkout.main_checkout(), &checkout.root) {
+        if let Some(removal) = &removal {
+            restore::forget(&crate::state_dir(), removal);
+        }
+        return Err(error);
     }
-    wt::remove_quietly(&checkout.main_checkout(), &checkout.root)?;
+    close_agents_elsewhere(&agents);
     if let Some(workspace_id) = &workspace_id {
         close_after_removal(workspace_id, &checkout)?;
     }
     Ok(())
 }
 
+/// Close the agents of a removed worktree whose pane is in another
+/// workspace. The close of the workspace of the worktree closes the
+/// others. A failed close leaves an agent in a removed folder.
+fn close_agents_elsewhere(agents: &[WorktreeAgent]) {
+    for agent in agents.iter().filter(|agent| !agent.in_own_workspace) {
+        let _ = herdr::close_pane(&agent.pane_id);
+    }
+}
+
 /// Record the removal of the worktree `path` before it starts, for the
 /// action restore: its branch, the commit of its branch, and its agents
 /// with their sessions. A worktree without a branch (detached HEAD) cannot
 /// come back.
-fn record_removal(main_checkout: &Path, path: &Path, agents: &[WorktreeAgent]) {
-    let Some(branch) = git::branch_of(path) else {
-        return;
+fn record_removal(
+    main_checkout: &Path,
+    path: &Path,
+    agents: &[WorktreeAgent],
+    workspace_id: Option<&str>,
+) -> Option<restore::Removal> {
+    let branch = git::branch_of(path)?;
+    let commit = git::branch_commit(main_checkout, &branch)?;
+    let removal = restore::Removal {
+        time: stale::now(),
+        main_checkout: main_checkout.to_owned(),
+        path: path.to_owned(),
+        branch,
+        commit,
+        agents: agents
+            .iter()
+            .filter_map(|agent| restore::RemovedAgent::of(&agent.kind, agent.session.as_deref()))
+            .collect(),
+        recover_command: None,
+        tabs: workspace_id.map(restore::capture_tabs).unwrap_or_default(),
     };
-    let Some(commit) = git::branch_commit(main_checkout, &branch) else {
-        return;
-    };
-    restore::record(
-        &crate::state_dir(),
-        &restore::Removal {
-            time: stale::now(),
-            main_checkout: main_checkout.to_owned(),
-            path: path.to_owned(),
-            branch,
-            commit,
-            agents: agents
-                .iter()
-                .filter_map(|agent| {
-                    restore::RemovedAgent::of(&agent.kind, agent.session.as_deref())
-                })
-                .collect(),
-            recover_command: None,
-        },
-    );
+    restore::record(&crate::state_dir(), &removal);
+    Some(removal)
 }
 
 /// Popup restorer: bring back the last removed worktree, then wait for a
@@ -504,19 +505,27 @@ fn record_removal(main_checkout: &Path, path: &Path, agents: &[WorktreeAgent]) {
 pub fn restorer() -> Result<(), Error> {
     let state_dir = crate::state_dir();
     let removals = restore::all(&state_dir);
-    if removals.is_empty() {
-        ui::show_message(RESTORE_TITLE, "No removed worktree to restore.");
-        return Ok(());
-    }
-    let Some(removal) = restorer::choose(&removals)? else {
-        return Ok(());
+    let message = if removals.is_empty() {
+        "No removed worktree to restore.".to_owned()
+    } else {
+        let Some(removal) = restorer::choose(&removals)? else {
+            return Ok(());
+        };
+        match restore_worktree(&state_dir, &removal) {
+            Ok(message) => message,
+            Err(error) => error.to_string(),
+        }
     };
-    let message = match restore_worktree(&state_dir, &removal) {
-        Ok(message) => message,
-        Err(error) => error.to_string(),
-    };
-    ui::show_message(RESTORE_TITLE, &message);
-    Ok(())
+    // The summary goes to a small popup, as the other messages.
+    let folder = popup_folder()?;
+    open_after_this_popup(
+        "summary",
+        &folder,
+        &[
+            (TITLE_VARIABLE, RESTORE_TITLE),
+            (MESSAGE_VARIABLE, &message),
+        ],
+    )
 }
 
 /// The title of the boxes of the restore.
@@ -580,31 +589,126 @@ fn restore_worktree(state_dir: &Path, removal: &restore::Removal) -> Result<Stri
         Some(workspace_id) => workspace_id,
         None => herdr::open_checkout(&path, &removal.main_checkout, false)?.workspace_id,
     };
-    lines.push("✓ herdr workspace".to_owned());
-    let count = removal.agents.len();
-    for (index, agent) in removal.agents.iter().enumerate() {
+    if removal.tabs.is_empty() {
+        lines.push("✓ herdr workspace".to_owned());
+    } else {
+        ui::show_progress(RESTORE_TITLE, "Restoring the tabs and the panes…");
+        match rebuild_tabs(&workspace_id, &path, &removal.tabs) {
+            Ok((panes, mut agent_lines)) => {
+                lines.push(format!(
+                    "✓ {}, {}",
+                    count_text(removal.tabs.len(), "tab", "tabs"),
+                    count_text(panes, "pane", "panes")
+                ));
+                lines.append(&mut agent_lines);
+            }
+            Err(error) => lines.push(format!("✗ tabs: {error}")),
+        }
+    }
+    for agent in removal.agents_without_pane() {
         ui::show_progress(
             RESTORE_TITLE,
-            &format!("Resuming the {} agent ({}/{count})…", agent.kind, index + 1),
+            &format!("Resuming the {} agent…", agent.kind),
         );
-        let Some(arguments) = agent.resume_arguments() else {
-            lines.push(format!(
-                "✗ {} agent: herdr-worktrunk cannot resume it",
-                agent.kind
-            ));
-            continue;
-        };
-        let result = herdr::open_shell_tab_pane(&workspace_id, &path).and_then(|pane_id| {
-            herdr::start_agent(&agent.herdr_name(), &agent.kind, &pane_id, &arguments)
-        });
-        match result {
-            Ok(()) => lines.push(format!("✓ {} agent, with its conversation", agent.kind)),
-            Err(error) => lines.push(format!("✗ {} agent: {error}", agent.kind)),
-        }
+        let result = herdr::open_shell_tab_pane(&workspace_id, &path, "")
+            .and_then(|pane_id| resume_agent(agent, &pane_id));
+        lines.push(agent_line(agent, result));
     }
     lines.push(String::new());
     lines.push("The observer keeps this worktree for 1 day.".to_owned());
     Ok(lines.join("\n"))
+}
+
+/// Build the removed tabs again in the workspace `workspace_id`: the first
+/// tab takes the tab that the hook of wt opened. Return the number of
+/// panes, and one line for each agent.
+fn rebuild_tabs(
+    workspace_id: &str,
+    worktree: &Path,
+    tabs: &[restore::RemovedTab],
+) -> Result<(usize, Vec<String>), Error> {
+    let first_tab = herdr::tabs(workspace_id)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Command("the workspace has no tab".to_owned()))?;
+    let first_pane = herdr::snapshot()?
+        .panes
+        .into_iter()
+        .find(|pane| pane.tab_id == first_tab.tab_id)
+        .map(|pane| pane.pane_id)
+        .ok_or_else(|| Error::Command("the first tab has no pane".to_owned()))?;
+    let mut pane_count = 0;
+    let mut agent_lines = Vec::new();
+    for (index, tab) in tabs.iter().enumerate() {
+        let plan = restore::plan_tab(tab);
+        // A folder that is gone (not in git) gives the folder of the
+        // worktree.
+        let folder_of = |pane: usize| {
+            plan.panes[pane]
+                .as_ref()
+                .map(|pane| pane.cwd.clone())
+                .filter(|cwd| cwd.exists())
+                .unwrap_or_else(|| worktree.to_owned())
+        };
+        let root = if index == 0 {
+            if !tab.label.is_empty() {
+                herdr::rename_tab(&first_tab.tab_id, &tab.label)?;
+            }
+            first_pane.clone()
+        } else {
+            herdr::open_shell_tab_pane(workspace_id, &folder_of(0), &tab.label)?
+        };
+        let mut pane_ids = vec![None; plan.panes.len()];
+        pane_ids[0] = Some(root);
+        for step in &plan.steps {
+            let Some(parent) = pane_ids[step.parent].clone() else {
+                continue;
+            };
+            let pane =
+                herdr::split_pane(&parent, &step.direction, step.ratio, &folder_of(step.child))?;
+            pane_ids[step.child] = Some(pane);
+        }
+        pane_count += pane_ids.iter().flatten().count();
+        for (pane, planned) in plan.panes.iter().enumerate() {
+            let (Some(agent), Some(pane_id)) = (
+                planned.as_ref().and_then(|planned| planned.agent.as_ref()),
+                &pane_ids[pane],
+            ) else {
+                continue;
+            };
+            ui::show_progress(
+                RESTORE_TITLE,
+                &format!("Resuming the {} agent…", agent.kind),
+            );
+            agent_lines.push(agent_line(agent, resume_agent(agent, pane_id)));
+        }
+    }
+    Ok((pane_count, agent_lines))
+}
+
+/// Start `agent` again in the shell of `pane_id`, with its conversation.
+fn resume_agent(agent: &restore::RemovedAgent, pane_id: &str) -> Result<(), Error> {
+    let arguments = agent.resume_arguments().ok_or_else(|| {
+        Error::Command("herdr-worktrunk cannot resume this kind of agent".to_owned())
+    })?;
+    herdr::start_agent(&agent.herdr_name(), &agent.kind, pane_id, &arguments)
+}
+
+/// The line of the summary for an agent.
+fn agent_line(agent: &restore::RemovedAgent, result: Result<(), Error>) -> String {
+    match result {
+        Ok(()) => format!("✓ {} agent, with its conversation", agent.kind),
+        Err(error) => format!("✗ {} agent: {error}", agent.kind),
+    }
+}
+
+/// A number with its word: `1 tab`, `3 tabs`.
+fn count_text(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
 }
 
 /// The first 8 characters of a commit.
@@ -670,38 +774,35 @@ fn delete_all() -> Result<(), Error> {
     let mut deleted = 0;
     let mut kept = Vec::new();
     let mut closed = Vec::new();
+    // This popup runs in the focused workspace: its worktree goes last,
+    // because the close of this workspace stops the popup.
+    let focused: Option<String> = herdr::snapshot().ok().and_then(|snapshot| {
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.focused)
+            .map(|workspace| workspace.workspace_id.clone())
+    });
+    let mut ordered: Vec<(&cleaner::Entry, Option<String>)> = Vec::new();
     for worktree in &old {
+        match herdr::workspace_of_checkout(&worktree.path) {
+            Ok(workspace_id) => ordered.push((worktree, workspace_id)),
+            Err(error) => kept.push(format!("{}: herdr failed: {error}", worktree.branch)),
+        }
+    }
+    ordered.sort_by_key(|(_, workspace_id)| focused.is_some() && *workspace_id == focused);
+    for (worktree, workspace_id) in ordered {
         ui::show_progress(
             "Clean the worktrees",
             &format!("Deleting the worktree of {}…", worktree.branch),
         );
         // An error keeps this worktree, and the loop goes on: the summary
         // tells what happened to each worktree.
-        let workspace_id = match herdr::workspace_of_checkout(&worktree.path) {
-            Ok(workspace_id) => workspace_id,
-            Err(error) => {
-                kept.push(format!("{}: herdr failed: {error}", worktree.branch));
-                continue;
-            }
-        };
-        match agents_to_close(&worktree.path, workspace_id.as_deref()) {
-            Ok(agents) if agents.is_empty() => {
-                record_removal(&worktree.main_checkout, &worktree.path, &[]);
-            }
+        let agents = match agents_to_close(&worktree.path, workspace_id.as_deref()) {
+            Ok(agents) if agents.is_empty() => agents,
             // Only a worktree with a proof of the end closes its idle
             // agents: the age alone keeps them.
-            Ok(agents) if leftover::closes_idle_agents(worktree.reason, &worktree.facts) => {
-                record_removal(&worktree.main_checkout, &worktree.path, &agents);
-                if let Err(error) = close_agents(&agents, &worktree.path) {
-                    kept.push(format!("{}: {error}", worktree.branch));
-                    continue;
-                }
-                closed.extend(
-                    agents
-                        .iter()
-                        .map(|agent| format!("{}: {}", worktree.branch, agent.resume_command())),
-                );
-            }
+            Ok(agents) if leftover::closes_idle_agents(worktree.reason, &worktree.facts) => agents,
             Ok(_) => {
                 kept.push(format!("{}: an idle agent is in it", worktree.branch));
                 continue;
@@ -710,17 +811,33 @@ fn delete_all() -> Result<(), Error> {
                 kept.push(format!("{}: {error}", worktree.branch));
                 continue;
             }
-        }
-        match wt::remove_quietly(&worktree.main_checkout, &worktree.path) {
-            Ok(()) => {
-                deleted += 1;
-                if let (Some(workspace_id), Some(checkout)) =
-                    (&workspace_id, git::checkout_of(&worktree.main_checkout))
-                {
-                    let _ = close_after_removal(workspace_id, &checkout);
-                }
+        };
+        let removal = record_removal(
+            &worktree.main_checkout,
+            &worktree.path,
+            &agents,
+            workspace_id.as_deref(),
+        );
+        // wt first: the close of the workspace closes the agents, and can
+        // stop this popup.
+        if wt::remove_quietly(&worktree.main_checkout, &worktree.path).is_err() {
+            if let Some(removal) = &removal {
+                restore::forget(&crate::state_dir(), removal);
             }
-            Err(_) => kept.push(format!("{}: wt refused it", worktree.branch)),
+            kept.push(format!("{}: wt refused it", worktree.branch));
+            continue;
+        }
+        deleted += 1;
+        closed.extend(
+            agents
+                .iter()
+                .map(|agent| format!("{}: {}", worktree.branch, agent.resume_command())),
+        );
+        close_agents_elsewhere(&agents);
+        if let (Some(workspace_id), Some(checkout)) =
+            (&workspace_id, git::checkout_of(&worktree.main_checkout))
+        {
+            let _ = close_after_removal(workspace_id, &checkout);
         }
     }
     let mut summary = format!("Deleted {}.", worktrees_text(deleted));
@@ -947,6 +1064,12 @@ pub fn merger() -> Result<(), Error> {
             if !checkout.root.exists() {
                 return Ok(());
             }
+            record_removal(
+                &checkout.main_checkout(),
+                &checkout.root,
+                &[],
+                workspace_id.as_deref(),
+            );
             match wt::remove(&checkout.main_checkout(), &checkout.root) {
                 Err(_) if !checkout.root.exists() => Ok(()),
                 other => other,

@@ -206,6 +206,7 @@ mod tests {
                 })
                 .collect(),
             recover_command: None,
+            tabs: Vec::new(),
         }
     }
 

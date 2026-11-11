@@ -345,10 +345,15 @@ pub fn open_shell_tab(workspace_id: &str, folder: &Path) -> Result<(), Error> {
 }
 
 /// Open a tab with a shell in `folder`, in the workspace `workspace_id`,
-/// without the focus, and return its pane.
-pub fn open_shell_tab_pane(workspace_id: &str, folder: &Path) -> Result<String, Error> {
+/// without the focus, and return its pane. An empty `label` keeps the
+/// label of herdr.
+pub fn open_shell_tab_pane(
+    workspace_id: &str,
+    folder: &Path,
+    label: &str,
+) -> Result<String, Error> {
     let folder_text = folder.to_string_lossy();
-    let result = run(&[
+    let mut arguments = vec![
         "tab",
         "create",
         "--workspace",
@@ -356,8 +361,79 @@ pub fn open_shell_tab_pane(workspace_id: &str, folder: &Path) -> Result<String, 
         "--cwd",
         &folder_text,
         "--no-focus",
-    ])?;
+    ];
+    if !label.is_empty() {
+        arguments.extend(["--label", label]);
+    }
+    let result = run(&arguments)?;
     string_field(&result, "/root_pane/pane_id")
+}
+
+/// A tab of a workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabInfo {
+    pub tab_id: String,
+    pub label: String,
+}
+
+/// The tabs of the workspace `workspace_id`, in their order.
+pub fn tabs(workspace_id: &str) -> Result<Vec<TabInfo>, Error> {
+    let result = run(&["tab", "list", "--workspace", workspace_id])?;
+    let mut tabs: Vec<(u64, TabInfo)> = result["tabs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|tab| {
+            Some((
+                tab["number"].as_u64().unwrap_or(u64::MAX),
+                TabInfo {
+                    tab_id: tab["tab_id"].as_str()?.to_owned(),
+                    label: tab["label"].as_str().unwrap_or_default().to_owned(),
+                },
+            ))
+        })
+        .collect();
+    tabs.sort_by_key(|(number, _)| *number);
+    Ok(tabs.into_iter().map(|(_, tab)| tab).collect())
+}
+
+/// The layout of the tab of `pane_id`: its panes and its splits.
+pub fn pane_layout(pane_id: &str) -> Result<Value, Error> {
+    let result = run(&["pane", "layout", "--pane", pane_id])?;
+    Ok(result["layout"].clone())
+}
+
+/// Split the pane `pane_id` (`right` or `down`), with a shell in `folder`,
+/// without the focus, and return the new pane.
+pub fn split_pane(
+    pane_id: &str,
+    direction: &str,
+    ratio: f64,
+    folder: &Path,
+) -> Result<String, Error> {
+    let ratio_text = format!("{ratio:.3}");
+    let folder_text = folder.to_string_lossy();
+    let result = run(&[
+        "pane",
+        "split",
+        "--pane",
+        pane_id,
+        "--direction",
+        direction,
+        "--ratio",
+        &ratio_text,
+        "--cwd",
+        &folder_text,
+        "--no-focus",
+    ])?;
+    string_field(&result, "/pane/pane_id")
+}
+
+/// Give the label `label` to the tab `tab_id`.
+pub fn rename_tab(tab_id: &str, label: &str) -> Result<(), Error> {
+    run(&["tab", "rename", tab_id, label])?;
+    Ok(())
 }
 
 /// Start an agent of `kind` in the shell of `pane_id`. herdr types

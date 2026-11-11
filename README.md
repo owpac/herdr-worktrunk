@@ -241,17 +241,26 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 
 ### Restore a worktree
 
-Before each removal (the cleaner, the action remove, the observer), the plugin records the worktree in `removed.jsonl`, in the state folder: its repository, its folder, its branch, the commit of its branch, and its agents with their sessions. The file keeps the 20 last removals.
+Each removal of the plugin can come back: `Enter` and `ctrl-a` in the cleaner, the actions `remove` and `merge`, and the observer. Before the removal, the plugin records the worktree in `removed.jsonl`, in the state folder:
 
-The action `restore` lists them, the newest first, with the style of the cleaner. The preview tells what comes back: the branch, its commit, and the agents. `Enter` brings back the chosen worktree:
+- its repository, its folder, its branch, and the commit of its branch,
+- its agents, with their sessions,
+- the layout of its herdr workspace: the tabs and their labels, the splits of each tab, and the folder of each pane.
+
+The file keeps the 20 last removals. A removal of wt (`wt remove`, `wt step prune`) by hand has no record.
+
+The action `restore` lists the records, the newest first, with the style of the cleaner. The preview tells what comes back. `Enter` brings back the chosen worktree:
 
 1. If the branch is gone, it creates the branch again on its commit. The commit must still be in the local repository. After the close of a pull request, the popup gives the command that gets the branch back from the forge.
 2. `wt switch` creates the worktree again. Its hooks run, and they open the herdr workspace.
-3. Each agent comes back in a new tab of this workspace, with its conversation: `claude --resume <session>` or `codex resume <session>`.
+3. The same tabs and splits come back, with a shell in the same folder. A folder that git does not keep gives the folder of the worktree.
+4. Each agent comes back in its pane, with its conversation: `claude --resume <session>` or `codex resume <session>`.
 
-The other panes do not come back: a program that ran in a pane stops at the removal, and a file that an editor did not save is lost. The workspace gets its first shell from the hook of wt.
+A small popup gives the summary. A program that ran in a pane stops at the removal, and a file that an editor did not save is lost: they do not come back.
 
 The observer keeps a restored worktree for 1 day, while its branch keeps the restored commit (`restored.jsonl`, in the state folder). Else it removes a finished worktree again at its next pass.
+
+A deletion of the cleaner runs `wt remove` first, then closes the agents and the workspace. Thus a popup in the workspace of the worktree closes only at the end. If wt refuses the removal, nothing closes.
 
 ## Configuration
 

@@ -1112,6 +1112,11 @@ fn prepare_removal(
                 })
                 .collect(),
             recover_command: target.recover_command.map(str::to_owned),
+            tabs: herdr::workspace_of_checkout(target.path)
+                .ok()
+                .flatten()
+                .map(|workspace_id| restore::capture_tabs(&workspace_id))
+                .unwrap_or_default(),
         },
     );
     let mut closed_agents = Vec::new();

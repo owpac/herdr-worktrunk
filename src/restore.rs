@@ -1,17 +1,20 @@
 //! The worktrees that the plugin removed, and their restore (action
 //! restore).
 //!
-//! Before each removal (cleaner, action remove, observer), the plugin
-//! records the worktree in `removed.jsonl` of the state folder: its
-//! repository, its folder, its branch, the commit of its branch, and its
-//! agents with their sessions. The 20 last removals stay. The action
-//! restore lists them (see `restorer`), and brings back the chosen one:
+//! Before each removal (cleaner, actions remove and merge, observer), the
+//! plugin records the worktree in `removed.jsonl` of the state folder: its
+//! repository, its folder, its branch, the commit of its branch, its
+//! agents with their sessions, and the layout of its herdr workspace: the
+//! tabs, their labels, their splits, and the folder of each pane. The 20
+//! last removals stay. The action restore lists them (see `restorer`), and
+//! brings back the chosen one:
 //!
 //! 1. It creates the branch again on its commit, if the branch is gone.
 //! 2. `wt switch` creates the worktree again. The hooks of wt open its
 //!    herdr workspace.
-//! 3. It resumes each agent in a new tab of this workspace:
-//!    `claude --resume <session>` or `codex resume <session>`.
+//! 3. It creates the same tabs and splits again, with a shell in the same
+//!    folder, and resumes each agent in its pane: `claude --resume
+//!    <session>` or `codex resume <session>`.
 //!
 //! A program that ran in a pane, and a file that an editor did not save,
 //! do not come back. The observer keeps a restored worktree for 1 day,
@@ -23,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::herdr::{self, Pane};
 use crate::stale;
 
 /// The number of removals that the file keeps.
@@ -70,8 +74,228 @@ impl RemovedAgent {
     }
 }
 
+/// A rectangle of the layout of a tab, in cells.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Rect {
+    fn area(&self) -> f64 {
+        self.width * self.height
+    }
+
+    fn center(&self) -> (f64, f64) {
+        (self.x + self.width / 2.0, self.y + self.height / 2.0)
+    }
+
+    fn contains(&self, (x, y): (f64, f64)) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+
+    /// The 2 parts of a split: the first part keeps the pane, the second
+    /// part gets the new pane (on the right, or below).
+    fn split(&self, direction: &str, ratio: f64) -> (Rect, Rect) {
+        if direction == "down" {
+            let first = self.height * ratio;
+            (
+                Rect {
+                    height: first,
+                    ..*self
+                },
+                Rect {
+                    y: self.y + first,
+                    height: self.height - first,
+                    ..*self
+                },
+            )
+        } else {
+            let first = self.width * ratio;
+            (
+                Rect {
+                    width: first,
+                    ..*self
+                },
+                Rect {
+                    x: self.x + first,
+                    width: self.width - first,
+                    ..*self
+                },
+            )
+        }
+    }
+}
+
+/// A pane of a removed tab.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RemovedPane {
+    pub rect: Rect,
+    /// The folder of the shell of the pane.
+    pub cwd: PathBuf,
+    /// The agent of the pane, if it can come back.
+    pub agent: Option<RemovedAgent>,
+}
+
+/// A split of a removed tab: `right` or `down`, with the part of the first
+/// pane.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RemovedSplit {
+    pub direction: String,
+    pub ratio: f64,
+    pub rect: Rect,
+}
+
+/// A tab of the herdr workspace of a removed worktree.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RemovedTab {
+    pub label: String,
+    pub panes: Vec<RemovedPane>,
+    pub splits: Vec<RemovedSplit>,
+}
+
+/// One split of the rebuild of a tab: split the pane `parent` (its index
+/// in `TabPlan::panes`); the new pane gets the index `child`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitStep {
+    pub parent: usize,
+    pub child: usize,
+    pub direction: String,
+    pub ratio: f64,
+}
+
+/// The rebuild of a tab: the panes (the first one is the pane of the new
+/// tab), and the splits, in their order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabPlan {
+    pub panes: Vec<Option<RemovedPane>>,
+    pub steps: Vec<SplitStep>,
+}
+
+/// Plan the rebuild of `tab`. The largest split comes first: it splits the
+/// whole tab. The pane of a split keeps the first part, and the new pane
+/// gets the second part. At the end, each part gets the removed pane whose
+/// center is in it.
+pub fn plan_tab(tab: &RemovedTab) -> TabPlan {
+    let area = tab
+        .splits
+        .iter()
+        .map(|split| split.rect)
+        .chain(tab.panes.iter().map(|pane| pane.rect))
+        .fold(None::<Rect>, |largest, rect| match largest {
+            Some(largest) if largest.area() >= rect.area() => Some(largest),
+            _ => Some(rect),
+        })
+        .unwrap_or_default();
+    let mut regions = vec![area];
+    let mut steps = Vec::new();
+    let mut splits: Vec<&RemovedSplit> = tab.splits.iter().collect();
+    splits.sort_by(|a, b| b.rect.area().total_cmp(&a.rect.area()));
+    for split in splits {
+        let center = split.rect.center();
+        let Some(parent) = regions.iter().position(|region| region.contains(center)) else {
+            continue;
+        };
+        let (first, second) = regions[parent].split(&split.direction, split.ratio);
+        regions[parent] = first;
+        regions.push(second);
+        steps.push(SplitStep {
+            parent,
+            child: regions.len() - 1,
+            direction: split.direction.clone(),
+            ratio: split.ratio,
+        });
+    }
+    let panes = regions
+        .iter()
+        .map(|region| {
+            tab.panes
+                .iter()
+                .find(|pane| region.contains(pane.rect.center()))
+                .cloned()
+        })
+        .collect();
+    TabPlan { panes, steps }
+}
+
+/// The tabs of the workspace `workspace_id`, for a record. An error gives
+/// no tab: the restore then opens the agents in new tabs.
+pub fn capture_tabs(workspace_id: &str) -> Vec<RemovedTab> {
+    let (Ok(snapshot), Ok(tabs)) = (herdr::snapshot(), herdr::tabs(workspace_id)) else {
+        return Vec::new();
+    };
+    tabs.iter()
+        .filter_map(|tab| {
+            let panes: Vec<&Pane> = snapshot
+                .panes
+                .iter()
+                .filter(|pane| pane.tab_id == tab.tab_id)
+                .collect();
+            let layout = herdr::pane_layout(&panes.first()?.pane_id).ok()?;
+            Some(tab_of_layout(&tab.label, &layout, &panes))
+        })
+        .collect()
+}
+
+/// A rectangle of the JSON of herdr.
+fn rect_of(json: &serde_json::Value) -> Rect {
+    let number = |name: &str| json[name].as_f64().unwrap_or(0.0);
+    Rect {
+        x: number("x"),
+        y: number("y"),
+        width: number("width"),
+        height: number("height"),
+    }
+}
+
+/// A removed tab from the layout of herdr (`pane layout`) and the panes of
+/// the snapshot. Only the panes of the layout count: a popup of a plugin
+/// is not in it.
+fn tab_of_layout(label: &str, layout: &serde_json::Value, panes: &[&Pane]) -> RemovedTab {
+    let removed_panes = layout["panes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| {
+            let pane_id = item["pane_id"].as_str()?;
+            let pane = panes.iter().find(|pane| pane.pane_id == pane_id)?;
+            Some(RemovedPane {
+                rect: rect_of(&item["rect"]),
+                cwd: pane.folder()?.to_owned(),
+                agent: pane.agent.as_deref().and_then(|kind| {
+                    RemovedAgent::of(
+                        kind,
+                        pane.agent_session
+                            .as_ref()
+                            .map(|session| session.value.as_str()),
+                    )
+                }),
+            })
+        })
+        .collect();
+    let splits = layout["splits"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|split| RemovedSplit {
+            direction: split["direction"].as_str().unwrap_or("right").to_owned(),
+            ratio: split["ratio"].as_f64().unwrap_or(0.5),
+            rect: rect_of(&split["rect"]),
+        })
+        .collect();
+    RemovedTab {
+        label: label.to_owned(),
+        panes: removed_panes,
+        splits,
+    }
+}
+
 /// A removed worktree.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Removal {
     /// The time of the removal, in seconds since 1970.
     pub time: u64,
@@ -85,6 +309,26 @@ pub struct Removal {
     /// pull request.
     #[serde(default)]
     pub recover_command: Option<String>,
+    /// The tabs of the herdr workspace of the worktree, in their order.
+    #[serde(default)]
+    pub tabs: Vec<RemovedTab>,
+}
+
+impl Removal {
+    /// The agents that are not in a pane of `tabs`: they come back in a new
+    /// tab each.
+    pub fn agents_without_pane(&self) -> Vec<&RemovedAgent> {
+        self.agents
+            .iter()
+            .filter(|agent| {
+                !self
+                    .tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| pane.agent.as_ref() == Some(*agent))
+            })
+            .collect()
+    }
 }
 
 fn removed_path(state_dir: &Path) -> PathBuf {
@@ -187,7 +431,162 @@ mod tests {
             commit: "abc123".to_owned(),
             agents,
             recover_command: None,
+            tabs: Vec::new(),
         }
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn pane(rect: Rect, cwd: &str, agent: Option<&str>) -> RemovedPane {
+        RemovedPane {
+            rect,
+            cwd: PathBuf::from(cwd),
+            agent: agent.map(|session| RemovedAgent {
+                kind: "claude".to_owned(),
+                session: session.to_owned(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_layout_of_herdr_gives_a_removed_tab() {
+        let layout = serde_json::json!({
+            "panes": [
+                {"pane_id": "w1:p1", "rect": {"x": 0, "y": 0, "width": 99, "height": 55}},
+                {"pane_id": "w1:p2", "rect": {"x": 99, "y": 0, "width": 98, "height": 55}}
+            ],
+            "splits": [{"direction": "right", "ratio": 0.5, "rect": {"x": 0, "y": 0, "width": 197, "height": 55}}]
+        });
+        let panes: Vec<Pane> = serde_json::from_value(serde_json::json!([
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent": "claude",
+             "agent_session": {"value": "s1"}, "cwd": "/work/app.feat", "foreground_cwd": null},
+            {"pane_id": "w1:p2", "workspace_id": "w1", "tab_id": "w1:t1", "agent": null,
+             "cwd": "/work/app.feat/src", "foreground_cwd": null},
+            {"pane_id": "w1:p9", "workspace_id": "w1", "tab_id": "w1:t1", "agent": null,
+             "cwd": "/tmp", "foreground_cwd": null}
+        ]))
+        .unwrap();
+        let panes: Vec<&Pane> = panes.iter().collect();
+
+        let tab = tab_of_layout("work", &layout, &panes);
+
+        assert_eq!(tab.label, "work");
+        assert_eq!(tab.panes.len(), 2, "the popup w1:p9 is not in the layout");
+        assert_eq!(tab.panes[0].agent.as_ref().unwrap().session, "s1");
+        assert_eq!(tab.panes[1].cwd, PathBuf::from("/work/app.feat/src"));
+        assert_eq!(tab.splits[0].direction, "right");
+    }
+
+    #[test]
+    fn a_tab_with_one_pane_needs_no_split() {
+        let tab = RemovedTab {
+            label: "editor".to_owned(),
+            panes: vec![pane(rect(0.0, 0.0, 197.0, 55.0), "/work/app.feat", None)],
+            splits: vec![],
+        };
+
+        let plan = plan_tab(&tab);
+
+        assert!(plan.steps.is_empty());
+        assert_eq!(plan.panes.len(), 1);
+        assert_eq!(
+            plan.panes[0].as_ref().unwrap().cwd,
+            PathBuf::from("/work/app.feat")
+        );
+    }
+
+    #[test]
+    fn the_plan_rebuilds_nested_splits_and_places_each_pane() {
+        // Left: an agent. Right: a shell above, a shell in src below.
+        let tab = RemovedTab {
+            label: "work".to_owned(),
+            panes: vec![
+                pane(rect(0.0, 0.0, 99.0, 55.0), "/work/app.feat", Some("s1")),
+                pane(rect(99.0, 0.0, 98.0, 27.0), "/work/app.feat", None),
+                pane(rect(99.0, 27.0, 98.0, 28.0), "/work/app.feat/src", None),
+            ],
+            splits: vec![
+                RemovedSplit {
+                    direction: "down".to_owned(),
+                    ratio: 0.5,
+                    rect: rect(99.0, 0.0, 98.0, 55.0),
+                },
+                RemovedSplit {
+                    direction: "right".to_owned(),
+                    ratio: 0.5,
+                    rect: rect(0.0, 0.0, 197.0, 55.0),
+                },
+            ],
+        };
+
+        let plan = plan_tab(&tab);
+
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| (step.parent, step.child, step.direction.as_str()))
+                .collect::<Vec<_>>(),
+            [(0, 1, "right"), (1, 2, "down")]
+        );
+        let cwds: Vec<String> = plan
+            .panes
+            .iter()
+            .map(|pane| pane.as_ref().unwrap().cwd.display().to_string())
+            .collect();
+        assert_eq!(
+            cwds,
+            ["/work/app.feat", "/work/app.feat", "/work/app.feat/src"]
+        );
+        assert_eq!(
+            plan.panes[0]
+                .as_ref()
+                .unwrap()
+                .agent
+                .as_ref()
+                .unwrap()
+                .session,
+            "s1"
+        );
+    }
+
+    #[test]
+    fn an_agent_without_a_pane_of_the_layout_gets_its_own_tab() {
+        let mut removal = removal(
+            "feat",
+            vec![
+                RemovedAgent {
+                    kind: "claude".to_owned(),
+                    session: "s1".to_owned(),
+                },
+                RemovedAgent {
+                    kind: "codex".to_owned(),
+                    session: "s2".to_owned(),
+                },
+            ],
+        );
+        removal.tabs = vec![RemovedTab {
+            label: "work".to_owned(),
+            panes: vec![pane(
+                rect(0.0, 0.0, 10.0, 10.0),
+                "/work/app.feat",
+                Some("s1"),
+            )],
+            splits: vec![],
+        }];
+
+        let alone: Vec<&str> = removal
+            .agents_without_pane()
+            .iter()
+            .map(|agent| agent.session.as_str())
+            .collect();
+        assert_eq!(alone, ["s2"]);
     }
 
     #[test]
