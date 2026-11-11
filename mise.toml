@@ -4,3 +4,5 @@
 [tools]
 rust = { version = "1.99.1", components = ["clippy", "rustfmt"] }
 shellcheck = "0.11.0"
+# The changelog of the release pull request: scripts/release-pr.sh and cliff.toml.
+git-cliff = "2.14.2"

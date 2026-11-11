@@ -1,0 +1,48 @@
+# The configuration of git-cliff. scripts/release-pr.sh writes the section of each release in
+# CHANGELOG.md with it, from the commits of main after the last release.
+# https://git-cliff.org/docs/configuration
+
+[changelog]
+header = """
+# Changelog
+
+The changes of each release of herdr-worktrunk. The workflow release-pr writes this file.
+"""
+# The HTML comment in each group name gives the order of the groups: striptags removes it.
+body = """
+{% if version %}\
+## [{{ version }}](https://github.com/owpac/herdr-worktrunk/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## Unreleased
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+{{ commit.message | split(pat="\n") | first | trim }}
+{% endfor %}\
+{% endfor %}
+"""
+trim = true
+# "(#7)" at the end of a squash commit becomes a link to the pull request.
+postprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/owpac/herdr-worktrunk/pull/${1}))" },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+commit_parsers = [
+  { message = "^chore: release ", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Tests" },
+  { message = "^(ci|build)", group = "<!-- 6 -->Build and CI" },
+  { message = ".*", group = "<!-- 7 -->Other" },
+]
+sort_commits = "oldest"
+tag_pattern = "^[0-9]{4}\\.[0-9]+\\.[0-9]+$"

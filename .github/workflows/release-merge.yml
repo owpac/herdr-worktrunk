@@ -1,0 +1,62 @@
+# Merge the pull request "chore: release YYYY.M.N" each day at 19:00 UTC, like the releases of
+# jdx/mise. The workflow release-pr opens this pull request.
+#
+# The workflow merges only if all the checks pass. A draft pull request stays: convert the pull
+# request to a draft to stop the releases. You can also merge the pull request at any time.
+#
+# The merge uses the token of the GitHub App: its push to main starts the workflow release, like
+# the merge of a person. A merge of GITHUB_TOKEN starts no workflow.
+name: release-merge
+
+on:
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-merge
+  cancel-in-progress: false
+
+jobs:
+  release-merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Merge the release pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          pr=$(gh pr list --head release --base main --state open \
+            --json number,title,isDraft,mergeStateStatus --jq '.[0] // empty')
+          if [ -z "$pr" ]; then
+            echo "No release pull request."
+            exit 0
+          fi
+          number=$(printf '%s' "$pr" | jq -r .number)
+          title=$(printf '%s' "$pr" | jq -r .title)
+          case "$title" in
+            "chore: release "*) ;;
+            *) echo "::warning::#$number from the branch release is not a release pull request: no merge."; exit 0 ;;
+          esac
+          if [ "$(printf '%s' "$pr" | jq -r .isDraft)" = true ]; then
+            echo "#$number is a draft: no merge."
+            exit 0
+          fi
+          state=$(printf '%s' "$pr" | jq -r .mergeStateStatus)
+          if [ "$state" != CLEAN ]; then
+            echo "::warning::#$number is $state, not CLEAN: no merge today."
+            exit 0
+          fi
+          gh pr merge "$number" --squash
+          echo "Merged #$number: $title"
