@@ -1,4 +1,4 @@
-# Keep the pull request "chore: release YYYY.M.N" up to date, like the release of jdx/mise.
+# Keep the pull request "chore: release YYYY.M.N" up to date.
 #
 # scripts/release-pr.sh writes the next version and the section of CHANGELOG.md in the branch
 # release, and opens or updates its pull request. The merge of this pull request puts the version

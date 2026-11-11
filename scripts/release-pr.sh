@@ -1,5 +1,5 @@
 #!/bin/sh
-# Update the pull request "chore: release <version>", like the release of jdx/mise.
+# Update the pull request "chore: release <version>".
 #
 # The workflow release-pr runs this script on main, after each push to main and each day. The
 # script finds the commits of main after the last release. If there are commits, it writes the

@@ -11,7 +11,6 @@
 # release binary, so the script builds with cargo. The version 0.0.0 has no release too.
 # If the release has no binary for this machine, or if the download or the check fails, the script
 # also builds the binary with cargo (Rust 1.89 or later).
-# The same method as the plugin herdr-bar (github.com/jeffarese/herdr-bar) and herdr-fork.
 #
 #   HERDR_WORKTRUNK_BUILD=source   skip the download, and build with cargo
 set -u
