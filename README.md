@@ -403,7 +403,7 @@ The images of this README come from `docs/make-images`: it makes a demo reposito
 
 ## Release
 
-A release comes from the pull request "chore: release YYYY.M.N", like the releases of [mise](https://github.com/jdx/mise). The version is `YYYY.M.N`: the month in UTC, and the number of the release in this month (for example `2026.11.1`). The month has no leading zero, because Cargo and herdr read the version as SemVer.
+A release comes from the pull request "chore: release YYYY.M.N". The version is `YYYY.M.N`: the month in UTC, and the number of the release in this month (for example `2026.11.1`). The month has no leading zero, because Cargo and herdr read the version as SemVer.
 
 1. After each push on `main`, and each day, the workflow `release-pr` runs `scripts/release-pr.sh`. If `main` has commits after the last release, the script writes the next version in `herdr-plugin.toml`, `Cargo.toml` and `Cargo.lock`. [git-cliff](https://git-cliff.org) writes the section of this version in `CHANGELOG.md`, from the conventional commits (`cliff.toml`).
 2. The script pushes the branch `release`, and opens or updates its pull request.
@@ -422,7 +422,6 @@ The App has the permissions Contents and Pull requests (read and write), and an 
 ## Credits
 
 - The behavior of the actions comes from [devashish2203/herdr-worktrunk](https://github.com/devashish2203/herdr-worktrunk) (MIT), a bash plugin for the same purpose. This plugin is a new implementation in Rust, with the observer.
-- The build method comes from [herdr-bar](https://github.com/jeffarese/herdr-bar) (MIT). The release pull request comes from [mise](https://github.com/jdx/mise) (MIT).
 - The design of the popups comes from [herdr-bar](https://github.com/jeffarese/herdr-bar) and [herdr-newtab-plus](https://github.com/jeffarese/herdr-newtab-plus).
 
 ## License

@@ -1,5 +1,5 @@
-# Merge the pull request "chore: release YYYY.M.N" each day at 19:00 UTC, like the releases of
-# jdx/mise. The workflow release-pr opens this pull request.
+# Merge the pull request "chore: release YYYY.M.N" each day at 19:00 UTC. The workflow release-pr
+# opens this pull request.
 #
 # The workflow merges only if all the checks pass. A draft pull request stays: convert the pull
 # request to a draft to stop the releases. You can also merge the pull request at any time.
