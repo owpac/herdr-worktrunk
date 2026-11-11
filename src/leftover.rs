@@ -88,10 +88,12 @@ pub struct WorktreeAgent {
 impl WorktreeAgent {
     /// Return true if a deletion can close this agent.
     fn may_close(&self) -> bool {
+        self.is_idle() && self.works_in_folder && self.in_own_workspace && !self.workspace_focused
+    }
+
+    /// Return true if the agent is idle or done: it waits for the user.
+    pub fn is_idle(&self) -> bool {
         matches!(self.status.as_deref(), Some("idle" | "done"))
-            && self.works_in_folder
-            && self.in_own_workspace
-            && !self.workspace_focused
     }
 
     /// The command that resumes the conversation of the agent.

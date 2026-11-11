@@ -344,6 +344,136 @@ pub fn open_shell_tab(workspace_id: &str, folder: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Open a tab with a shell in `folder`, in the workspace `workspace_id`,
+/// without the focus, and return its pane. An empty `label` keeps the
+/// label of herdr.
+pub fn open_shell_tab_pane(
+    workspace_id: &str,
+    folder: &Path,
+    label: &str,
+) -> Result<String, Error> {
+    let folder_text = folder.to_string_lossy();
+    let mut arguments = vec![
+        "tab",
+        "create",
+        "--workspace",
+        workspace_id,
+        "--cwd",
+        &folder_text,
+        "--no-focus",
+    ];
+    if !label.is_empty() {
+        arguments.extend(["--label", label]);
+    }
+    let result = run(&arguments)?;
+    string_field(&result, "/root_pane/pane_id")
+}
+
+/// A tab of a workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TabInfo {
+    pub tab_id: String,
+    pub label: String,
+}
+
+/// The tabs of the workspace `workspace_id`, in their order.
+pub fn tabs(workspace_id: &str) -> Result<Vec<TabInfo>, Error> {
+    let result = run(&["tab", "list", "--workspace", workspace_id])?;
+    let mut tabs: Vec<(u64, TabInfo)> = result["tabs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|tab| {
+            Some((
+                tab["number"].as_u64().unwrap_or(u64::MAX),
+                TabInfo {
+                    tab_id: tab["tab_id"].as_str()?.to_owned(),
+                    label: tab["label"].as_str().unwrap_or_default().to_owned(),
+                },
+            ))
+        })
+        .collect();
+    tabs.sort_by_key(|(number, _)| *number);
+    Ok(tabs.into_iter().map(|(_, tab)| tab).collect())
+}
+
+/// The layout of the tab of `pane_id`: its panes and its splits.
+pub fn pane_layout(pane_id: &str) -> Result<Value, Error> {
+    let result = run(&["pane", "layout", "--pane", pane_id])?;
+    Ok(result["layout"].clone())
+}
+
+/// Split the pane `pane_id` (`right` or `down`), with a shell in `folder`,
+/// without the focus, and return the new pane.
+pub fn split_pane(
+    pane_id: &str,
+    direction: &str,
+    ratio: f64,
+    folder: &Path,
+) -> Result<String, Error> {
+    let ratio_text = format!("{ratio:.3}");
+    let folder_text = folder.to_string_lossy();
+    let result = run(&[
+        "pane",
+        "split",
+        "--pane",
+        pane_id,
+        "--direction",
+        direction,
+        "--ratio",
+        &ratio_text,
+        "--cwd",
+        &folder_text,
+        "--no-focus",
+    ])?;
+    string_field(&result, "/pane/pane_id")
+}
+
+/// Give the label `label` to the tab `tab_id`.
+pub fn rename_tab(tab_id: &str, label: &str) -> Result<(), Error> {
+    run(&["tab", "rename", tab_id, label])?;
+    Ok(())
+}
+
+/// Start an agent of `kind` in the shell of `pane_id`. herdr types
+/// `<kind> <arguments>` in the shell, so the aliases of the shell apply.
+/// A shell that is not ready yet gets 10 seconds. An agent that waits for
+/// an answer (for example "trust this folder?") counts as started.
+pub fn start_agent(
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+    agent_arguments: &[String],
+) -> Result<(), Error> {
+    let mut arguments = vec![
+        "agent",
+        "start",
+        name,
+        "--kind",
+        kind,
+        "--pane",
+        pane_id,
+        "--timeout",
+        "30000",
+        "--",
+    ];
+    arguments.extend(agent_arguments.iter().map(String::as_str));
+    for _ in 0..20 {
+        match run(&arguments) {
+            Ok(_) => return Ok(()),
+            Err(Error::Herdr { code, .. }) if code == "agent_not_ready" => return Ok(()),
+            Err(Error::Herdr { code, .. }) if code == "agent_pane_busy" => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::Command(format!(
+        "the shell of the pane {pane_id} did not get ready"
+    )))
+}
+
 /// Return true if the shell of `pane_id` waits at its prompt: no command
 /// runs in it. The shell is then the foreground process group of the
 /// terminal.

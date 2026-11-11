@@ -4,7 +4,7 @@
 //! Usage:
 //!   herdr-worktrunk observe                    start the observer in the background
 //!   herdr-worktrunk observe --run              the observer itself
-//!   herdr-worktrunk open picker|remover|merger|cleaner  an action: open a popup
+//!   herdr-worktrunk open picker|remover|merger|cleaner|restorer  an action: open a popup
 //!   herdr-worktrunk pick|confirm|merger|cleaner|message  the command of a popup
 //!   herdr-worktrunk list-merged [<folder>]     list the worktrees of the finished pull requests and of the merged branches
 //!   herdr-worktrunk list-stale [<folder>]      list the old worktrees without pull request
@@ -26,6 +26,8 @@ mod observer;
 mod picker;
 mod process;
 mod prune;
+mod restore;
+mod restorer;
 mod stale;
 mod style;
 mod sync;
@@ -41,7 +43,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner | pick | confirm | merger | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>]";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>]";
 
 /// The days without activity of `list-stale` when `stale_days` is 0.
 const DEFAULT_STALE_DAYS: u32 = 7;
@@ -222,6 +224,10 @@ fn main() -> ExitCode {
             cleaner::print_delete_all(Path::new(state), Path::new(visible));
             return ExitCode::SUCCESS;
         }
+        ["restorer-preview", time, path] => {
+            restorer::print_preview(&state_dir(), time, path);
+            return ExitCode::SUCCESS;
+        }
         ["cleaner-preview", state, stale_days, id, branch, main_checkout, kind] => {
             let stale_days = stale_days.parse().unwrap_or(DEFAULT_STALE_DAYS);
             cleaner::print_preview(
@@ -275,12 +281,14 @@ fn main() -> ExitCode {
         }
         ["observe"] => (observe(false), None),
         ["observe", "--run"] => (observe(true), None),
-        ["open", entrypoint @ ("picker" | "remover" | "merger" | "cleaner")] => {
+        ["open", entrypoint @ ("picker" | "remover" | "merger" | "cleaner" | "restorer")] => {
             (actions::open(entrypoint), None)
         }
         ["pick"] => (actions::pick(), Some("pick")),
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
+        ["restorer"] => (actions::restorer(), Some("restorer")),
+        ["restore-run"] => (actions::restore_run(), Some("restore-run")),
         ["cleaner"] => (
             {
                 let config = load_config();

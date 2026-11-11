@@ -12,6 +12,7 @@ Each task gets a git worktree (made by [worktrunk](https://worktrunk.dev)) and i
 - **[Cleaner](#the-cleaner)**: see all the worktrees, and delete the leftovers. Each leftover has a proof: a finished pull request, a merge into the default branch, or a long time without activity.
 - **[Observer](#the-observer)**: the pane of an agent follows its worktree, the workspace of a removed worktree closes, and the worktrees of the finished pull requests go away.
 - **[Remove and merge](#actions)**: `wt remove` and `wt merge` for the worktree of the focused workspace, after a question.
+- **[Restore](#restore-a-worktree)**: bring back a worktree that the plugin removed, with its tabs, its splits and its agents.
 
 worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `post-start`, `pre-remove`...), and each worktree has the path of `wt`. The plugin replaces the worktree keys of herdr, which use git and `~/.herdr/worktrees`.
 
@@ -52,7 +53,7 @@ The worktrunk picker (`wt switch`) has fixed keys (`alt-c`, `alt-x`), and a term
 | Key | Result |
 |-----|--------|
 | `↑` `↓` | Move to the next worktree, over the titles of the groups. |
-| `Enter` | Asks to delete the worktree. The question gives its reason, for example an open pull request. |
+| `Enter` | Asks to delete the worktree. The question gives its reason, for example an open pull request. If an agent is in the worktree, the question tells it, and the deletion closes the agent first. |
 | `ctrl-a` | Asks to delete the worktrees of the group To delete that the filter shows. A worktree of another group never goes. |
 | `Tab`, `shift-Tab` | Change the tab of the preview: `diff`, `log`, `changes`, and `checks`: the verdict and the result of each layer. |
 | `Esc` | Quits. |
@@ -105,6 +106,8 @@ The agents follow the rules of the observer:
 - An idle agent (`idle` or `done`) does not keep a worktree with a proof of the end: a finished pull request, or a merged branch with its own commits. The deletion closes the agent first, and gives the command that resumes it, for example `claude --resume <session>`.
 - An idle agent keeps a worktree without a proof of the end: an old worktree, or a merged branch without own commit.
 - An open pull request keeps the worktree, with or without an agent.
+
+These rules give the verdict and the group. `Enter` can still delete a kept worktree with an agent: after the question, the deletion closes its agents, also an agent that works. A worktree with changes that are not committed stays, and its agents too.
 
 ### The forges
 
@@ -233,8 +236,34 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 | `herdr-worktrunk.clean` | Opens [the cleaner](#the-cleaner). |
 | `herdr-worktrunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question. Then the focus goes to the main checkout. |
 | `herdr-worktrunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge`, then deletes it, after a question. A large popup shows the output of wt. |
+| `herdr-worktrunk.restore` | Lists the last worktrees that the plugin removed, the newest first: `Enter` brings one back (see [Restore a worktree](#restore-a-worktree)). |
 
 `remove` and `merge` refuse a workspace where an agent works. If an action cannot work, a small popup gives the reason. The question has 2 buttons: `[ Cancel ]` and `[ Delete ]` (or `[ Merge ]`). `←` `→` change the button, `Enter` presses it, `y` confirms, `Esc` cancels.
+
+### Restore a worktree
+
+![The popup restore: the last removed worktrees, and what comes back](docs/restore.gif)
+
+Each removal of the plugin can come back: `Enter` and `ctrl-a` in the cleaner, the actions `remove` and `merge`, and the observer. Before the removal, the plugin records the worktree in `removed.jsonl`, in the state folder:
+
+- its repository, its folder, its branch, and the commit of its branch,
+- its agents, with their sessions,
+- the layout of its herdr workspace: the tabs and their labels, the splits of each tab, and the folder of each pane.
+
+The file keeps the 20 last removals. A removal of wt (`wt remove`, `wt step prune`) by hand has no record.
+
+The action `restore` lists the records, the newest first, with the style of the cleaner. The preview tells what comes back. `Enter` brings back the chosen worktree:
+
+1. If the branch is gone, it creates the branch again on its commit. The commit must still be in the local repository. After the close of a pull request, the popup gives the command that gets the branch back from the forge.
+2. `wt switch` creates the worktree again. Its hooks run, and they open the herdr workspace.
+3. The same tabs and splits come back, with a shell in the same folder. A folder that git does not keep gives the folder of the worktree.
+4. Each agent comes back in its pane, with its conversation: `claude --resume <session>` or `codex resume <session>`.
+
+After `Enter`, the list closes, and a small popup shows each step, then the summary. A program that ran in a pane stops at the removal, and a file that an editor did not save is lost: they do not come back.
+
+The observer keeps a restored worktree for 1 day, while its branch keeps the restored commit (`restored.jsonl`, in the state folder). Else it removes a finished worktree again at its next pass.
+
+A deletion of the cleaner runs `wt remove` first, then closes the agents and the workspace. Thus a popup in the workspace of the worktree closes only at the end. If wt refuses the removal, nothing closes.
 
 ## Configuration
 
@@ -316,6 +345,12 @@ key = "prefix+shift+c"
 type = "plugin_action"
 command = "herdr-worktrunk.clean"
 description = "clean the worktrees (wt)"
+
+[[keys.command]]
+key = "prefix+z"
+type = "plugin_action"
+command = "herdr-worktrunk.restore"
+description = "restore the last removed worktree (wt)"
 ```
 
 ## Development

@@ -23,7 +23,7 @@ pub enum PopupSize {
 
 /// The popups that have 2 sizes: the manifest gives each one a second
 /// pane, `<name>-big`.
-const SIZED_POPUPS: [&str; 3] = ["picker", "cleaner", "merger"];
+const SIZED_POPUPS: [&str; 4] = ["picker", "cleaner", "merger", "restorer"];
 
 impl PopupSize {
     /// The pane of the manifest for the popup `entrypoint` in this size.
