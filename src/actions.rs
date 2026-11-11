@@ -538,11 +538,13 @@ fn restore_worktree(state_dir: &Path, removal: &restore::Removal) -> Result<Stri
             )));
         }
     }
+    // The guard of the observer comes before the worktree: a pass of the
+    // observer between the 2 steps must not remove it again.
+    if let Some(commit) = git::branch_commit(&removal.main_checkout, branch) {
+        restore::mark_restored(state_dir, &git::canonical(&removal.path), &commit);
+    }
     let path = wt::switch(&removal.main_checkout, branch, false)?;
     restore::forget(state_dir, removal);
-    if let Some(commit) = git::branch_commit(&removal.main_checkout, branch) {
-        restore::mark_restored(state_dir, &git::canonical(&path), &commit);
-    }
     // The post-start hook of wt opens the workspace in the background:
     // wait for it, then open it if the hook did not.
     let mut workspace_id = None;

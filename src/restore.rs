@@ -115,9 +115,12 @@ fn write_lines<T: Serialize>(path: &Path, items: &[T]) {
     let _ = stale::write_atomically(path, &text);
 }
 
-/// Record a removal, before it starts: its agents are still there.
+/// Record a removal, before it starts: its agents are still there. A new
+/// record of the same worktree replaces the older one: a removal that
+/// failed comes again at the next pass of the observer.
 pub fn record(state_dir: &Path, removal: &Removal) {
     let mut removals: Vec<Removal> = read_lines(&removed_path(state_dir));
+    removals.retain(|other| other.path != removal.path);
     removals.push(removal.clone());
     let excess = removals.len().saturating_sub(MAX_REMOVALS);
     write_lines(&removed_path(state_dir), &removals[excess..]);
@@ -200,6 +203,24 @@ mod tests {
 
         forget(&folder, &last_one);
         assert_eq!(last(&folder).unwrap().branch, "b23");
+    }
+
+    #[test]
+    fn a_new_record_of_the_same_worktree_replaces_the_older_one() {
+        let folder = test_folder("removal-again");
+        record(&folder, &removal("feat", vec![]));
+        record(&folder, &removal("other", vec![]));
+        let mut again = removal("feat", vec![]);
+        again.time = 20;
+        record(&folder, &again);
+
+        let removals: Vec<Removal> = read_lines(&removed_path(&folder));
+        let branches: Vec<&str> = removals
+            .iter()
+            .map(|removal| removal.branch.as_str())
+            .collect();
+        assert_eq!(branches, ["other", "feat"]);
+        assert_eq!(removals[1].time, 20);
     }
 
     #[test]
