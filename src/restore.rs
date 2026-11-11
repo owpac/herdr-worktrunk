@@ -363,11 +363,53 @@ fn write_lines<T: Serialize>(path: &Path, items: &[T]) {
 /// record of the same worktree replaces the older one: a removal that
 /// failed comes again at the next pass of the observer.
 pub fn record(state_dir: &Path, removal: &Removal) {
+    let _lock = FileLock::take(state_dir);
     let mut removals: Vec<Removal> = read_lines(&removed_path(state_dir));
     removals.retain(|other| other.path != removal.path);
     removals.push(removal.clone());
     let excess = removals.len().saturating_sub(MAX_REMOVALS);
     write_lines(&removed_path(state_dir), &removals[excess..]);
+}
+
+/// A lock of the files of the restore: the observer and the popups change
+/// them. Each change reads, changes and writes a file under the lock.
+struct FileLock(PathBuf);
+
+impl FileLock {
+    /// Take the lock, for 2 seconds at most. A lock of more than 10
+    /// seconds is left by a stopped process: it goes. Without the lock
+    /// after 2 seconds, the change runs anyway.
+    fn take(state_dir: &Path) -> FileLock {
+        let path = state_dir.join("restore.lock");
+        for _ in 0..100 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => break,
+                Err(_) => {
+                    let is_stale = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|time| time.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > 10);
+                    if is_stale {
+                        let _ = fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            }
+        }
+        FileLock(path)
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 /// All the removals of the file, the oldest first.
@@ -377,6 +419,7 @@ pub fn all(state_dir: &Path) -> Vec<Removal> {
 
 /// Remove `removal` from the file: it came back, or its worktree is there.
 pub fn forget(state_dir: &Path, removal: &Removal) {
+    let _lock = FileLock::take(state_dir);
     let removals: Vec<Removal> = read_lines(&removed_path(state_dir));
     let kept: Vec<Removal> = removals
         .into_iter()
@@ -395,6 +438,7 @@ struct Restored {
 
 /// Record a restored worktree, with the commit of its branch.
 pub fn mark_restored(state_dir: &Path, path: &Path, commit: &str) {
+    let _lock = FileLock::take(state_dir);
     let now = stale::now();
     let mut restored: Vec<Restored> = read_lines(&restored_path(state_dir));
     restored.retain(|item| item.path != path && now.saturating_sub(item.time) < stale::DAY);
@@ -602,6 +646,23 @@ mod tests {
 
         forget(&folder, &last_one);
         assert_eq!(all(&folder).pop().unwrap().branch, "b23");
+    }
+
+    #[test]
+    fn records_at_the_same_time_all_stay() {
+        let folder = test_folder("removals-lock");
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let folder = folder.clone();
+                std::thread::spawn(move || record(&folder, &removal(&format!("b{index}"), vec![])))
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(all(&folder).len(), 8);
+        assert!(!folder.join("restore.lock").exists());
     }
 
     #[test]

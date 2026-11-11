@@ -916,8 +916,8 @@ fn finish_worktree(
     };
     let is_closed = worktree.pull_request.state == PullRequestState::Closed;
     let state = if is_closed { "closed" } else { "merged" };
-    let closed_agents = match prepare_removal(&target, view, log, |_| true)? {
-        Preparation::Ready(closed_agents) => closed_agents,
+    let (closed_agents, removal) = match prepare_removal(&target, view, log, |_| true)? {
+        Preparation::Ready(closed_agents, removal) => (closed_agents, removal),
         Preparation::AgentStays => {
             notices.insert(format!(
                 "kept the worktree of {}: its {} is {state}, but an agent works in it, or its workspace has the focus",
@@ -927,7 +927,10 @@ fn finish_worktree(
         }
         Preparation::Refused | Preparation::Kept => return Ok(()),
     };
-    wt::remove_finished(main_checkout, &worktree.path)?;
+    if let Err(error) = wt::remove_finished(main_checkout, &worktree.path) {
+        restore::forget(&crate::state_dir(), &removal);
+        return Err(error);
+    }
     let why = if is_closed {
         format!(
             "its {} is closed. To get the branch back: {}",
@@ -977,12 +980,15 @@ fn finish_merged_worktree(
     };
     // An agent in a new worktree is the usual case: no notice. The agent
     // of a merge without pull request reports, then stops.
-    let closed_agents = match prepare_removal(&target, view, log, may_remove)? {
-        Preparation::Ready(closed_agents) => closed_agents,
+    let (closed_agents, removal) = match prepare_removal(&target, view, log, may_remove)? {
+        Preparation::Ready(closed_agents, removal) => (closed_agents, removal),
         Preparation::AgentStays | Preparation::Refused => return Ok(true),
         Preparation::Kept => return Ok(false),
     };
-    wt::remove_quietly(main_checkout, &worktree.path)?;
+    if let Err(error) = wt::remove_quietly(main_checkout, &worktree.path) {
+        restore::forget(&crate::state_dir(), &removal);
+        return Err(error);
+    }
     let commits = match history.get() {
         Some(leftover::History::OwnCommits) => "its commits",
         _ => "its commit, and the worktree had no use for 1 day",
@@ -1045,11 +1051,12 @@ impl Target<'_> {
 }
 
 /// The result of the preparation of a removal.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Preparation {
     /// The thread can remove the worktree now. The commands that resume
-    /// the agents that it closed.
-    Ready(Vec<String>),
+    /// the agents that it closed, and the record of the removal: it goes
+    /// if the removal fails.
+    Ready(Vec<String>, restore::Removal),
     /// An agent works in the worktree, waits for an answer, or its
     /// workspace has the focus.
     AgentStays,
@@ -1097,28 +1104,24 @@ fn prepare_removal(
     if !may_remove(state) {
         return Ok(Preparation::Refused);
     }
-    restore::record(
-        &crate::state_dir(),
-        &restore::Removal {
-            time: stale::now(),
-            main_checkout: target.main_checkout.to_owned(),
-            path: target.path.to_owned(),
-            branch: target.branch.to_owned(),
-            commit: target.commit.to_owned(),
-            agents: agents
-                .iter()
-                .filter_map(|agent| {
-                    restore::RemovedAgent::of(&agent.kind, agent.session.as_deref())
-                })
-                .collect(),
-            recover_command: target.recover_command.map(str::to_owned),
-            tabs: herdr::workspace_of_checkout(target.path)
-                .ok()
-                .flatten()
-                .map(|workspace_id| restore::capture_tabs(&workspace_id))
-                .unwrap_or_default(),
-        },
-    );
+    let removal = restore::Removal {
+        time: stale::now(),
+        main_checkout: target.main_checkout.to_owned(),
+        path: target.path.to_owned(),
+        branch: target.branch.to_owned(),
+        commit: target.commit.to_owned(),
+        agents: agents
+            .iter()
+            .filter_map(|agent| restore::RemovedAgent::of(&agent.kind, agent.session.as_deref()))
+            .collect(),
+        recover_command: target.recover_command.map(str::to_owned),
+        tabs: herdr::workspace_of_checkout(target.path)
+            .ok()
+            .flatten()
+            .map(|workspace_id| restore::capture_tabs(&workspace_id))
+            .unwrap_or_default(),
+    };
+    restore::record(&crate::state_dir(), &removal);
     let mut closed_agents = Vec::new();
     if state == leftover::Agents::Idle {
         for agent in &agents {
@@ -1137,13 +1140,15 @@ fn prepare_removal(
                 "closed the agents of {}, but herdr still shows one: the worktree stays until the next pass",
                 target.branch
             ));
+            restore::forget(&crate::state_dir(), &removal);
             return Ok(Preparation::Kept);
         }
         if !target.is_unchanged() || !git::is_clean(target.path) {
+            restore::forget(&crate::state_dir(), &removal);
             return Ok(Preparation::Kept);
         }
     }
-    Ok(Preparation::Ready(closed_agents))
+    Ok(Preparation::Ready(closed_agents, removal))
 }
 
 /// Wait until the view shows no agent in `checkout`, for 10 seconds at
