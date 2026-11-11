@@ -505,7 +505,7 @@ pub fn restorer() -> Result<(), Error> {
     let state_dir = crate::state_dir();
     let removals = restore::all(&state_dir);
     if removals.is_empty() {
-        ui::show_message("Restore a worktree", "No removed worktree to restore.");
+        ui::show_message(RESTORE_TITLE, "No removed worktree to restore.");
         return Ok(());
     }
     let Some(removal) = restorer::choose(&removals)? else {
@@ -515,42 +515,57 @@ pub fn restorer() -> Result<(), Error> {
         Ok(message) => message,
         Err(error) => error.to_string(),
     };
-    ui::wait_after_output(&message);
+    ui::show_message(RESTORE_TITLE, &message);
     Ok(())
 }
 
+/// The title of the boxes of the restore.
+const RESTORE_TITLE: &str = "Restore a worktree";
+
 /// Bring back one removed worktree: its branch, its worktree, its herdr
-/// workspace, and its agents. Return the summary for the user.
+/// workspace, and its agents. A box tells each step. Return the summary
+/// for the user.
 fn restore_worktree(state_dir: &Path, removal: &restore::Removal) -> Result<String, Error> {
     let branch = &removal.branch;
     if removal.path.exists() {
         restore::forget(state_dir, removal);
         return Ok(format!(
-            "The worktree of {branch} is already there: {}",
+            "The worktree of {branch} is already there:\n{}",
             home_relative(&removal.path)
         ));
     }
-    println!("Restore the worktree of {branch}…");
+    ui::show_progress(
+        RESTORE_TITLE,
+        &format!("Restoring the worktree of {branch}…"),
+    );
+    let mut lines = Vec::new();
     if git::branch_commit(&removal.main_checkout, branch).is_none() {
         if let Err(error) = git::create_branch(&removal.main_checkout, branch, &removal.commit) {
             let recover = removal
                 .recover_command
                 .as_deref()
-                .map(|command| format!(" To get it from the forge: {command}"))
+                .map(|command| format!("\nTo get it from the forge: {command}"))
                 .unwrap_or_default();
             return Err(Error::Command(format!(
-                "Cannot create the branch {branch} on its commit {}: {error}.{recover}",
-                removal.commit
+                "Cannot create the branch {branch} on its commit {}: {error}{recover}",
+                short_commit(&removal.commit)
             )));
         }
+        lines.push(format!(
+            "✓ Branch {branch}, again on its commit {}",
+            short_commit(&removal.commit)
+        ));
+    } else {
+        lines.push(format!("✓ Branch {branch}"));
     }
     // The guard of the observer comes before the worktree: a pass of the
     // observer between the 2 steps must not remove it again.
     if let Some(commit) = git::branch_commit(&removal.main_checkout, branch) {
         restore::mark_restored(state_dir, &git::canonical(&removal.path), &commit);
     }
-    let path = wt::switch(&removal.main_checkout, branch, false)?;
+    let path = wt::switch_quietly(&removal.main_checkout, branch)?;
     restore::forget(state_dir, removal);
+    lines.push(format!("✓ Worktree {}", home_relative(&path)));
     // The post-start hook of wt opens the workspace in the background:
     // wait for it, then open it if the hook did not.
     let mut workspace_id = None;
@@ -565,14 +580,17 @@ fn restore_worktree(state_dir: &Path, removal: &restore::Removal) -> Result<Stri
         Some(workspace_id) => workspace_id,
         None => herdr::open_checkout(&path, &removal.main_checkout, false)?.workspace_id,
     };
-    let mut lines = vec![format!(
-        "Restored the worktree of {branch}. herdr-worktrunk keeps it for 1 day, while its branch keeps this commit."
-    )];
-    for agent in &removal.agents {
+    lines.push("✓ herdr workspace".to_owned());
+    let count = removal.agents.len();
+    for (index, agent) in removal.agents.iter().enumerate() {
+        ui::show_progress(
+            RESTORE_TITLE,
+            &format!("Resuming the {} agent ({}/{count})…", agent.kind, index + 1),
+        );
         let Some(arguments) = agent.resume_arguments() else {
             lines.push(format!(
-                "Cannot resume a {} agent: {}",
-                agent.kind, agent.session
+                "✗ {} agent: herdr-worktrunk cannot resume it",
+                agent.kind
             ));
             continue;
         };
@@ -580,18 +598,18 @@ fn restore_worktree(state_dir: &Path, removal: &restore::Removal) -> Result<Stri
             herdr::start_agent(&agent.herdr_name(), &agent.kind, &pane_id, &arguments)
         });
         match result {
-            Ok(()) => lines.push(format!(
-                "Resumed the {} agent {}.",
-                agent.kind, agent.session
-            )),
-            Err(error) => lines.push(format!(
-                "Cannot resume the {} agent {}: {error}",
-                agent.kind, agent.session
-            )),
+            Ok(()) => lines.push(format!("✓ {} agent, with its conversation", agent.kind)),
+            Err(error) => lines.push(format!("✗ {} agent: {error}", agent.kind)),
         }
     }
-    lines.push("The programs of the other panes, and the files that an editor did not save, do not come back.".to_owned());
+    lines.push(String::new());
+    lines.push("The observer keeps this worktree for 1 day.".to_owned());
     Ok(lines.join("\n"))
+}
+
+/// The first 8 characters of a commit.
+fn short_commit(commit: &str) -> String {
+    commit.chars().take(8).collect()
 }
 
 /// The lines of the question about the agents that the deletion closes:

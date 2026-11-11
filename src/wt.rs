@@ -64,6 +64,39 @@ pub fn switch(repository: &Path, branch: &str, is_new_branch: bool) -> Result<Pa
     Ok(PathBuf::from(path))
 }
 
+/// Open the worktree of the existing branch `branch` with wt, without the
+/// terminal, and return its path. The hooks of wt run in the background.
+/// On a failure, the error gives the last line of wt: for example a hook
+/// of the project that needs an approval.
+pub fn switch_quietly(repository: &Path, branch: &str) -> Result<PathBuf, Error> {
+    let output = Command::new("wt")
+        .arg("-C")
+        .arg(repository)
+        .args(["switch", branch, "--no-cd", "--format", "json"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| Error::Command(format!("cannot run wt: {error}")))?;
+    if !output.status.success() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        let last_line = details
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("no message")
+            .trim()
+            .to_owned();
+        return Err(Error::Command(format!(
+            "wt did not open the worktree of {branch}: {last_line}"
+        )));
+    }
+    let result: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| Error::Command(format!("wt switch: invalid JSON: {error}")))?;
+    let path = result["path"]
+        .as_str()
+        .ok_or_else(|| Error::Command("wt switch gave no path.".to_owned()))?;
+    Ok(PathBuf::from(path))
+}
+
 /// Run a wt command on the terminal of the user, and fail if it fails.
 fn run_on_terminal(arguments: &[&str], folder: &Path, failure: &str) -> Result<(), Error> {
     let status = Command::new("wt")
