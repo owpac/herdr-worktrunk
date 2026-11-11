@@ -5,7 +5,7 @@
 //! records the worktree in `removed.jsonl` of the state folder: its
 //! repository, its folder, its branch, the commit of its branch, and its
 //! agents with their sessions. The 20 last removals stay. The action
-//! restore takes the last one:
+//! restore lists them (see `restorer`), and brings back the chosen one:
 //!
 //! 1. It creates the branch again on its commit, if the branch is gone.
 //! 2. `wt switch` creates the worktree again. The hooks of wt open its
@@ -126,9 +126,9 @@ pub fn record(state_dir: &Path, removal: &Removal) {
     write_lines(&removed_path(state_dir), &removals[excess..]);
 }
 
-/// The last removal, or None.
-pub fn last(state_dir: &Path) -> Option<Removal> {
-    read_lines(&removed_path(state_dir)).pop()
+/// All the removals of the file, the oldest first.
+pub fn all(state_dir: &Path) -> Vec<Removal> {
+    read_lines(&removed_path(state_dir))
 }
 
 /// Remove `removal` from the file: it came back, or its worktree is there.
@@ -197,12 +197,12 @@ mod tests {
             record(&folder, &removal(&format!("b{index}"), vec![]));
         }
 
-        let last_one = last(&folder).unwrap();
+        let last_one = all(&folder).pop().unwrap();
         assert_eq!(last_one.branch, "b24");
         assert_eq!(read_lines::<Removal>(&removed_path(&folder)).len(), 20);
 
         forget(&folder, &last_one);
-        assert_eq!(last(&folder).unwrap().branch, "b23");
+        assert_eq!(all(&folder).pop().unwrap().branch, "b23");
     }
 
     #[test]

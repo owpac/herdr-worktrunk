@@ -235,13 +235,15 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 | `herdr-worktrunk.clean` | Opens [the cleaner](#the-cleaner). |
 | `herdr-worktrunk.remove` | Deletes the worktree of the focused workspace with `wt remove`, after a question. Then the focus goes to the main checkout. |
 | `herdr-worktrunk.merge` | Merges the worktree of the focused workspace into the default branch with `wt merge`, then deletes it, after a question. A large popup shows the output of wt. |
-| `herdr-worktrunk.restore` | Brings back the last worktree that the plugin removed (see [Restore a worktree](#restore-a-worktree)). A press again brings back the one before. |
+| `herdr-worktrunk.restore` | Lists the last worktrees that the plugin removed, the newest first: `Enter` brings one back (see [Restore a worktree](#restore-a-worktree)). |
 
 `remove` and `merge` refuse a workspace where an agent works. If an action cannot work, a small popup gives the reason. The question has 2 buttons: `[ Cancel ]` and `[ Delete ]` (or `[ Merge ]`). `←` `→` change the button, `Enter` presses it, `y` confirms, `Esc` cancels.
 
 ### Restore a worktree
 
-Before each removal (the cleaner, the action remove, the observer), the plugin records the worktree in `removed.jsonl`, in the state folder: its repository, its folder, its branch, the commit of its branch, and its agents with their sessions. The file keeps the 20 last removals. The action `restore` takes the last one:
+Before each removal (the cleaner, the action remove, the observer), the plugin records the worktree in `removed.jsonl`, in the state folder: its repository, its folder, its branch, the commit of its branch, and its agents with their sessions. The file keeps the 20 last removals.
+
+The action `restore` lists them, the newest first, with the style of the cleaner. The preview tells what comes back: the branch, its commit, and the agents. `Enter` brings back the chosen worktree:
 
 1. If the branch is gone, it creates the branch again on its commit. The commit must still be in the local repository. After the close of a pull request, the popup gives the command that gets the branch back from the forge.
 2. `wt switch` creates the worktree again. Its hooks run, and they open the herdr workspace.

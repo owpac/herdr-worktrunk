@@ -27,6 +27,7 @@ mod picker;
 mod process;
 mod prune;
 mod restore;
+mod restorer;
 mod stale;
 mod style;
 mod sync;
@@ -221,6 +222,10 @@ fn main() -> ExitCode {
         }
         ["cleaner-delete-all", state, visible] => {
             cleaner::print_delete_all(Path::new(state), Path::new(visible));
+            return ExitCode::SUCCESS;
+        }
+        ["restorer-preview", time, path] => {
+            restorer::print_preview(&state_dir(), time, path);
             return ExitCode::SUCCESS;
         }
         ["cleaner-preview", state, stale_days, id, branch, main_checkout, kind] => {

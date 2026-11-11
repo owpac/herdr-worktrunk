@@ -30,6 +30,7 @@ use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, WorktreeAgent};
 use crate::picker::{self, Picked, Row};
 use crate::restore;
+use crate::restorer;
 use crate::stale;
 use crate::ui;
 use crate::wt;
@@ -502,12 +503,17 @@ fn record_removal(main_checkout: &Path, path: &Path, agents: &[WorktreeAgent]) {
 /// key. The output of wt (its hooks) stays on the screen.
 pub fn restorer() -> Result<(), Error> {
     let state_dir = crate::state_dir();
-    let message = match restore::last(&state_dir) {
-        None => "No removed worktree to restore.".to_owned(),
-        Some(removal) => match restore_worktree(&state_dir, &removal) {
-            Ok(message) => message,
-            Err(error) => error.to_string(),
-        },
+    let removals = restore::all(&state_dir);
+    if removals.is_empty() {
+        ui::show_message("Restore a worktree", "No removed worktree to restore.");
+        return Ok(());
+    }
+    let Some(removal) = restorer::choose(&removals)? else {
+        return Ok(());
+    };
+    let message = match restore_worktree(&state_dir, &removal) {
+        Ok(message) => message,
+        Err(error) => error.to_string(),
     };
     ui::wait_after_output(&message);
     Ok(())

@@ -58,8 +58,8 @@ command = ["bin/herdr-worktrunk", "open", "cleaner"]
 
 [[actions]]
 id = "restore"
-title = "Worktree: restore the last removed worktree"
-description = "Bring back the last worktree that the plugin removed: its branch, its worktree, its workspace, and its agents with their conversations"
+title = "Worktree: restore a removed worktree"
+description = "List the last worktrees that the plugin removed: Enter brings one back, with its branch, its workspace, and its agents with their conversations"
 contexts = ["global"]
 command = ["bin/herdr-worktrunk", "open", "restorer"]
 
@@ -128,13 +128,21 @@ width = "90%"
 height = "80%"
 command = ["bin/herdr-worktrunk", "merger"]
 
-# The restore of the last removed worktree, with the output of wt and its hooks.
+# The list of the last removed worktrees: Enter restores one, then the output of wt and its hooks.
 [[panes]]
 id = "restorer"
 title = "Worktrunk: restore"
 placement = "popup"
 width = "74%"
 height = "62%"
+command = ["bin/herdr-worktrunk", "restorer"]
+
+[[panes]]
+id = "restorer-big"
+title = "Worktrunk: restore"
+placement = "popup"
+width = "90%"
+height = "80%"
 command = ["bin/herdr-worktrunk", "restorer"]
 
 # A small popup with a message and an OK button: an action opens it when its popup cannot work,
