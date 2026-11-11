@@ -256,7 +256,7 @@ The action `restore` lists the records, the newest first, with the style of the 
 3. The same tabs and splits come back, with a shell in the same folder. A folder that git does not keep gives the folder of the worktree.
 4. Each agent comes back in its pane, with its conversation: `claude --resume <session>` or `codex resume <session>`.
 
-A small popup gives the summary. A program that ran in a pane stops at the removal, and a file that an editor did not save is lost: they do not come back.
+After `Enter`, the list closes, and a small popup shows each step, then the summary. A program that ran in a pane stops at the removal, and a file that an editor did not save is lost: they do not come back.
 
 The observer keeps a restored worktree for 1 day, while its branch keeps the restored commit (`restored.jsonl`, in the state folder). Else it removes a finished worktree again at its next pass.
 

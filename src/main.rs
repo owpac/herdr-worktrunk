@@ -43,7 +43,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>]";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>]";
 
 /// The days without activity of `list-stale` when `stale_days` is 0.
 const DEFAULT_STALE_DAYS: u32 = 7;
@@ -288,6 +288,7 @@ fn main() -> ExitCode {
         ["confirm"] => (actions::confirm(), Some("confirm")),
         ["merger"] => (actions::merger(), Some("merger")),
         ["restorer"] => (actions::restorer(), Some("restorer")),
+        ["restore-run"] => (actions::restore_run(), Some("restore-run")),
         ["cleaner"] => (
             {
                 let config = load_config();

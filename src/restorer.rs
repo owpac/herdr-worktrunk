@@ -65,7 +65,7 @@ fn line(removal: &Removal, now: u64, width: usize) -> String {
 }
 
 /// The removal of a row: its time and its folder.
-fn find<'a>(removals: &'a [Removal], time: &str, path: &str) -> Option<&'a Removal> {
+pub fn find<'a>(removals: &'a [Removal], time: &str, path: &str) -> Option<&'a Removal> {
     removals
         .iter()
         .find(|removal| removal.time.to_string() == time && removal.path == Path::new(path))

@@ -145,14 +145,15 @@ width = "90%"
 height = "80%"
 command = ["bin/herdr-worktrunk", "restorer"]
 
-# The summary of a restore: a message with an OK button, a bit larger than the popup message.
+# The restore of the worktree that the popup restorer chose: a box for each step, then the summary
+# with an OK button. A bit larger than the popup message.
 [[panes]]
-id = "summary"
-title = "Worktrunk"
+id = "restoring"
+title = "Worktrunk: restore"
 placement = "popup"
 width = 72
 height = 16
-command = ["bin/herdr-worktrunk", "message"]
+command = ["bin/herdr-worktrunk", "restore-run"]
 
 # A small popup with a message and an OK button: an action opens it when its popup cannot work,
 # for example the picker outside a git repository.

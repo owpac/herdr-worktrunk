@@ -103,6 +103,10 @@ pub fn open(entrypoint: &str) -> Result<(), Error> {
         return herdr::open_plugin_pane("cleaner", folder_path, &[(FOLDER_VARIABLE, folder)]);
     }
     if entrypoint == "restorer" {
+        // Without a record, the small popup tells it at once.
+        if restore::all(&crate::state_dir()).is_empty() {
+            return herdr::open_plugin_pane("restoring", folder_path, &[]);
+        }
         return herdr::open_plugin_pane("restorer", folder_path, &[]);
     }
     if entrypoint == "picker" {
@@ -503,29 +507,47 @@ fn record_removal(
 /// Popup restorer: bring back the last removed worktree, then wait for a
 /// key. The output of wt (its hooks) stays on the screen.
 pub fn restorer() -> Result<(), Error> {
-    let state_dir = crate::state_dir();
-    let removals = restore::all(&state_dir);
-    let message = if removals.is_empty() {
-        "No removed worktree to restore.".to_owned()
-    } else {
-        let Some(removal) = restorer::choose(&removals)? else {
-            return Ok(());
-        };
-        match restore_worktree(&state_dir, &removal) {
-            Ok(message) => message,
-            Err(error) => error.to_string(),
-        }
+    let removals = restore::all(&crate::state_dir());
+    let Some(removal) = restorer::choose(&removals)? else {
+        return Ok(());
     };
-    // The summary goes to a small popup, as the other messages.
-    let folder = popup_folder()?;
+    // The restore runs in a small popup: its steps and its summary have
+    // the size of the other messages.
+    let time = removal.time.to_string();
+    let path = removal.path.to_string_lossy();
     open_after_this_popup(
-        "summary",
-        &folder,
+        "restoring",
+        &popup_folder()?,
         &[
-            (TITLE_VARIABLE, RESTORE_TITLE),
-            (MESSAGE_VARIABLE, &message),
+            (RESTORE_TIME_VARIABLE, time.as_str()),
+            (RESTORE_PATH_VARIABLE, path.as_ref()),
         ],
     )
+}
+
+/// The record that the popup restoring brings back: its time and its
+/// folder.
+const RESTORE_TIME_VARIABLE: &str = "TRUNK_RESTORE_TIME";
+const RESTORE_PATH_VARIABLE: &str = "TRUNK_RESTORE_PATH";
+
+/// Popup restoring: bring back the record of the popup restorer, with a
+/// box for each step, then the summary with an OK button. Without a
+/// record, tell it.
+pub fn restore_run() -> Result<(), Error> {
+    let state_dir = crate::state_dir();
+    let removals = restore::all(&state_dir);
+    let time = env::var(RESTORE_TIME_VARIABLE).unwrap_or_default();
+    let path = env::var(RESTORE_PATH_VARIABLE).unwrap_or_default();
+    let message = match restorer::find(&removals, &time, &path) {
+        None if removals.is_empty() => "No removed worktree to restore.".to_owned(),
+        None => "This removed worktree has no record anymore.".to_owned(),
+        Some(removal) => match restore_worktree(&state_dir, removal) {
+            Ok(message) => message,
+            Err(error) => error.to_string(),
+        },
+    };
+    ui::show_message(RESTORE_TITLE, &message);
+    Ok(())
 }
 
 /// The title of the boxes of the restore.
