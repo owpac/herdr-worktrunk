@@ -1,0 +1,58 @@
+# Keep the pull request "chore: release YYYY.M.N" up to date, like the release of jdx/mise.
+#
+# scripts/release-pr.sh writes the next version and the section of CHANGELOG.md in the branch
+# release, and opens or updates its pull request. The merge of this pull request puts the version
+# on main: the marketplace of herdr.dev reads the version of main. Then the workflow release tags
+# this commit of main, builds the binaries and publishes the release.
+#
+# The workflow runs after each push to main, and each day: in a new month, the open pull request
+# gets the version of this month. The workflow release-merge merges the pull request each day.
+#
+# The workflow uses the token of a GitHub App: GitHub starts the checks of its pull request, like
+# for a person. A pull request of GITHUB_TOKEN starts no workflow. The repository needs the
+# variable RELEASE_APP_CLIENT_ID (the client ID of the App) and the secret
+# RELEASE_APP_PRIVATE_KEY (a private key of the App).
+name: release-pr
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pr
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # A token of 1 hour for this repository: push the branch release and open its pull request.
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      # fetch-depth 0 also fetches the tags. git push uses the token of the App.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: jdx/mise-action@8418fedb1110381a0d3ba51a7a415d7c1b884550 # v5.2.2
+        with:
+          version: 2026.10.17
+          install_args: git-cliff
+      - name: Update the release pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: sh scripts/release-pr.sh

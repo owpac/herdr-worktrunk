@@ -1,6 +1,6 @@
 [package]
 name = "herdr-worktrunk"
-# The release workflow writes the version (YYYY.M.N) in the commit of the tag.
+# The version of the last release (YYYY.M.N): the workflow release-pr writes it.
 version = "0.0.0"
 edition = "2021"
 # The oldest toolchain that the cargo fallback of scripts/install.sh supports.

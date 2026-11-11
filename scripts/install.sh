@@ -5,8 +5,10 @@
 # install). `herdr plugin link` does not run it: run it yourself for a local checkout.
 #
 # The script downloads the binary of the manifest version from the GitHub release, and checks it
-# with the SHA256SUMS file of the release. The tag of a release is its version (YYYY.M.N). On main,
-# the version is 0.0.0: no release has this version, so the script builds with cargo.
+# with the SHA256SUMS file of the release. The tag of a release is its version (YYYY.M.N).
+# The download needs the release commit of this version: its subject starts with "chore: release
+# <version>". main keeps the version of its last release: a git checkout of a later commit has no
+# release binary, so the script builds with cargo. The version 0.0.0 has no release too.
 # If the release has no binary for this machine, or if the download or the check fails, the script
 # also builds the binary with cargo (Rust 1.89 or later).
 # The same method as the plugin herdr-bar (github.com/jeffarese/herdr-bar) and herdr-fork.
@@ -99,7 +101,18 @@ build_from_source() {
   say "built herdr-worktrunk $version with cargo"
 }
 
-if [ "${HERDR_WORKTRUNK_BUILD:-}" != source ] && [ "$version" != 0.0.0 ] && download; then
+# True if the checkout is the release commit of the version. A checkout without git, for example
+# an archive, counts as the release commit.
+release_commit() {
+  [ -e .git ] || return 0
+  case "$(git log -1 --format=%s 2>/dev/null)" in
+    "chore: release $version" | "chore: release $version "*) return 0 ;;
+  esac
+  say "this commit is not the release commit of $version: the script builds with cargo"
+  return 1
+}
+
+if [ "${HERDR_WORKTRUNK_BUILD:-}" != source ] && [ "$version" != 0.0.0 ] && release_commit && download; then
   exit 0
 fi
 build_from_source

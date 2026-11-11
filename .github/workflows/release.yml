@@ -1,17 +1,14 @@
-# Release each push on main, like the tools pac, kompose and craft of owpac: the version is
-# YYYY.M.N, the month of the push in UTC and the number of the release in this month.
+# Release the version of main, after the merge of the pull request "chore: release YYYY.M.N".
 #
-# herdr reads the version in herdr-plugin.toml, and scripts/install.sh downloads the release of
-# this version. On main, the version stays 0.0.0. For each release, the job publish writes the
-# version in herdr-plugin.toml, Cargo.toml and Cargo.lock, in a release commit on top of the
-# main commit. The tag points to this release commit, and main does not change. The dotfiles
-# install a tag: `herdr plugin install owpac/herdr-worktrunk --ref <tag>`.
+# The workflow release-pr opens this pull request: it writes the version in herdr-plugin.toml,
+# Cargo.toml and Cargo.lock, and the section of this version in CHANGELOG.md. herdr reads the
+# version in herdr-plugin.toml, and scripts/install.sh downloads the release of this version. The
+# dotfiles install a tag: `herdr plugin install owpac/herdr-worktrunk --ref <tag>`.
 #
-# The month has no leading zero (2027.3.1, not 2027.03.1): Cargo and herdr read the version as
-# SemVer, and SemVer refuses a leading zero.
-#
-# The binary does not read its version, so the build jobs build the main commit. The job publish
-# pushes the tag only after all the builds succeed.
+# A push to main releases the version of herdr-plugin.toml if this version has no tag. The tag
+# points to this commit of main. The job publish pushes the tag only after all the builds
+# succeed, and the notes of the release are the section of CHANGELOG.md. A push to main with a
+# released version releases nothing.
 #
 # A tag that GITHUB_TOKEN pushes does not start other workflows. Thus this workflow also builds
 # and publishes the binaries. Do not change the names of the assets: scripts/install.sh
@@ -42,37 +39,39 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
-      released: ${{ steps.version.outputs.released }}
+      release: ${{ steps.version.outputs.release }}
     steps:
       # fetch-depth 0 also fetches the tags.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Find the version of this push
+      - name: Find the version to release
         id: version
         run: |
-          main_commit=$(git rev-parse HEAD)
-          # A re-run of the same push: reuse the tag of its release commit.
-          for existing in $(git tag --list '[0-9][0-9][0-9][0-9].*.*'); do
-            if [ "$(git rev-parse "$existing^{commit}^")" = "$main_commit" ]; then
-              echo "The commit $main_commit already has the release $existing."
-              echo "version=$existing" >> "$GITHUB_OUTPUT"
-              echo "released=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          month=$(date -u +%Y.%-m)
-          last=$(git tag --list "$month.*" | sed "s/^$month\.//" | sort -n | tail -1)
-          version="$month.$((${last:-0} + 1))"
-          echo "Next version: $version"
+          version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' herdr-plugin.toml | head -n 1)
+          tag_commit=$(git rev-parse -q --verify "refs/tags/$version^{commit}" || true)
+          if [ "$version" = 0.0.0 ]; then
+            echo "main has no version yet: no release."
+            release=false
+          elif [ -z "$tag_commit" ]; then
+            echo "The version $version has no tag: release it."
+            release=true
+          elif [ "$tag_commit" = "$(git rev-parse HEAD)" ]; then
+            # A re-run of the same push: finish the release.
+            echo "The tag $version points to this commit: finish its release."
+            release=true
+          else
+            echo "The version $version is already released: no release."
+            release=false
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "released=false" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
 
   build:
     needs: version
-    # Run when the job version passed, or when it did not run (pull request).
-    if: ${{ !cancelled() && (needs.version.result == 'success' || needs.version.result == 'skipped') }}
+    # Run for a release, or when the job version did not run (pull request).
+    if: ${{ !cancelled() && (needs.version.outputs.release == 'true' || needs.version.result == 'skipped') }}
     name: build ${{ matrix.asset }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -132,7 +131,7 @@ jobs:
 
   publish:
     needs: [version, build]
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -141,31 +140,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - name: Push the release commit and its tag
-        if: needs.version.outputs.released != 'true'
+      - name: Push the tag
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
-          # Change only the first version line of each file: the version of the plugin in
-          # herdr-plugin.toml, and the version of [package] in Cargo.toml.
-          for file in herdr-plugin.toml Cargo.toml; do
-            awk -v version="$VERSION" '
-              !done && /^version = "/ { $0 = "version = \"" version "\""; done = 1 }
-              { print }
-            ' "$file" > "$file.new"
-            mv "$file.new" "$file"
-          done
-          awk -v version="$VERSION" '
-            previous == "name = \"herdr-worktrunk\"" && /^version = / { $0 = "version = \"" version "\"" }
-            { print; previous = $0 }
-          ' Cargo.lock > Cargo.lock.new
-          mv Cargo.lock.new Cargo.lock
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --quiet -am "chore: release $VERSION"
-          git tag "$VERSION"
-          git push origin "refs/tags/$VERSION"
-          echo "Tagged $VERSION"
+          if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
+            echo "The tag $VERSION exists."
+          else
+            git tag "$VERSION"
+            git push origin "refs/tags/$VERSION"
+            echo "Tagged $VERSION"
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
@@ -194,7 +179,16 @@ jobs:
               exit 0
             fi
           else
-            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
+            # The notes: the section of this version in CHANGELOG.md, without its title.
+            awk -v title="## [$TAG]" '
+              index($0, title) == 1 { found = 1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > notes.md
+            if ! grep -q '[^[:space:]]' notes.md; then
+              echo "Release $TAG." > notes.md
+            fi
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file notes.md
           fi
           gh release upload "$TAG" dist/* --clobber
           gh release edit "$TAG" --draft=false
