@@ -293,6 +293,15 @@ pub fn is_ancestor(main_checkout: &Path, commit: &str, branch: &str) -> bool {
     .is_ok()
 }
 
+/// Return true if the local repository has the commit `commit`.
+pub fn commit_exists(main_checkout: &Path, commit: &str) -> bool {
+    run_in(
+        main_checkout,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .is_ok()
+}
+
 /// Create the local branch `branch` on `commit`.
 pub fn create_branch(main_checkout: &Path, branch: &str, commit: &str) -> Result<(), Error> {
     run_in(main_checkout, &["branch", branch, commit])?;

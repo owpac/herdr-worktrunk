@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Make the images of the README: docs/cleaner.gif, docs/cleaner-checks.png and docs/picker.png.
+# Make the images of the README: docs/cleaner.gif, docs/cleaner-checks.png, docs/picker.png and
+# docs/restore.gif.
 #
 # The script makes a demo repository in a temporary folder, with worktrees of each kind, then
 # records the popups with VHS (brew install vhs). Run it from a herdr pane: the cleaner reads the
@@ -68,6 +69,35 @@ printf 'total\n' > "$folder/cart.py"
 folder=$(add_worktree docs/api)
 printf 'api\n' > "$folder/API.md"; g -C "$folder" add .; commit_at "$folder" "$(days_ago 12)" "Describe the API"
 
+# 3 removed worktrees for the popup restore, in a state folder of the demo: a branch that is gone
+# (its commit stays), with an agent and 2 tabs; a merged branch without agent; a branch with a
+# Codex agent.
+state="$demo/state"
+mkdir -p "$state"
+folder=$(add_worktree feat/invoices)
+printf 'invoice\n' > "$folder/invoice.py"; g -C "$folder" add .; commit_at "$folder" "$(days_ago 2)" "Print the invoices"
+invoices=$(g -C "$main" rev-parse feat/invoices)
+g -C "$main" worktree remove "$folder"; g -C "$main" branch -q -D feat/invoices
+folder=$(add_worktree fix/coupon)
+coupon=$(g -C "$main" rev-parse fix/coupon)
+g -C "$main" worktree remove "$folder"
+folder=$(add_worktree docs/guide)
+guide=$(g -C "$main" rev-parse docs/guide)
+g -C "$main" worktree remove "$folder"
+now=$(date +%s)
+# One record: time, branch, commit, agents, tabs.
+record() {
+  local folder="$demo/shop.${2//\//-}"
+  printf '{"time":%s,"main_checkout":"%s","path":"%s","branch":"%s","commit":"%s","agents":%s,"recover_command":null,"tabs":%s}\n' \
+    "$1" "$main" "$folder" "$2" "$3" "$4" "$5"
+}
+{
+  record $((now - 86400)) docs/guide "$guide" '[{"kind":"codex","session":"019a7c2e-guide"}]' '[]'
+  record $((now - 7200)) fix/coupon "$coupon" '[]' '[]'
+  record $((now - 300)) feat/invoices "$invoices" '[{"kind":"claude","session":"6f1d2a90-invoices"}]' \
+    '[{"label":"invoices","panes":[{"rect":{"x":0,"y":0,"width":120,"height":40},"cwd":"'"$demo/shop.feat-invoices"'","agent":{"kind":"claude","session":"6f1d2a90-invoices"}},{"rect":{"x":120,"y":0,"width":80,"height":40},"cwd":"'"$demo/shop.feat-invoices"'","agent":null}],"splits":[{"direction":"right","ratio":0.6,"rect":{"x":0,"y":0,"width":200,"height":40}}]},{"label":"logs","panes":[{"rect":{"x":0,"y":0,"width":200,"height":40},"cwd":"'"$demo/shop.feat-invoices"'","agent":null}],"splits":[]}]'
+} > "$state/removed.jsonl"
+
 tapes="$demo/tapes"
 mkdir -p "$tapes"
 cat > "$tapes/settings.tape" <<TAPE
@@ -125,6 +155,29 @@ Escape
 Sleep 300ms
 TAPE
 
+# The popup restore: the last removed worktrees, and the preview of what comes back. Escape: the
+# GIF restores nothing.
+cat > "$tapes/restore.tape" <<TAPE
+Output "$root/docs/restore.gif"
+Source "$tapes/settings.tape"
+Hide
+Type "export PS1='' HERDR_PLUGIN_STATE_DIR='$state' && cd '$main' && clear && '$binary' restorer"
+Enter
+Sleep 300ms
+Show
+Sleep 2.5s
+Down
+Sleep 2s
+Down
+Sleep 2s
+Up
+Up
+Sleep 1.5s
+Escape
+Sleep 300ms
+TAPE
+
 vhs "$tapes/cleaner.tape"
 vhs "$tapes/picker.tape"
-echo "docs/cleaner.gif, docs/cleaner-checks.png and docs/picker.png are ready."
+vhs "$tapes/restore.tape"
+echo "docs/cleaner.gif, docs/cleaner-checks.png, docs/picker.png and docs/restore.gif are ready."

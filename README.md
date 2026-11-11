@@ -12,6 +12,7 @@ Each task gets a git worktree (made by [worktrunk](https://worktrunk.dev)) and i
 - **[Cleaner](#the-cleaner)**: see all the worktrees, and delete the leftovers. Each leftover has a proof: a finished pull request, a merge into the default branch, or a long time without activity.
 - **[Observer](#the-observer)**: the pane of an agent follows its worktree, the workspace of a removed worktree closes, and the worktrees of the finished pull requests go away.
 - **[Remove and merge](#actions)**: `wt remove` and `wt merge` for the worktree of the focused workspace, after a question.
+- **[Restore](#restore-a-worktree)**: bring back a worktree that the plugin removed, with its tabs, its splits and its agents.
 
 worktrunk creates and removes each worktree, so its hooks run (`pre-start`, `post-start`, `pre-remove`...), and each worktree has the path of `wt`. The plugin replaces the worktree keys of herdr, which use git and `~/.herdr/worktrees`.
 
@@ -240,6 +241,8 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 `remove` and `merge` refuse a workspace where an agent works. If an action cannot work, a small popup gives the reason. The question has 2 buttons: `[ Cancel ]` and `[ Delete ]` (or `[ Merge ]`). `←` `→` change the button, `Enter` presses it, `y` confirms, `Esc` cancels.
 
 ### Restore a worktree
+
+![The popup restore: the last removed worktrees, and what comes back](docs/restore.gif)
 
 Each removal of the plugin can come back: `Enter` and `ctrl-a` in the cleaner, the actions `remove` and `merge`, and the observer. Before the removal, the plugin records the worktree in `removed.jsonl`, in the state folder:
 

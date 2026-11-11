@@ -16,7 +16,9 @@ use crate::herdr::Error;
 use crate::picker::{shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::restore::{self, Removal};
 use crate::stale;
-use crate::style::{self, part, ACCENT, BOLD, DIM, GREEN, MUTED, REPOSITORY, RESET, RULE, YELLOW};
+use crate::style::{
+    self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
+};
 
 const GHOST: &str = "removed worktree — type to filter";
 // The footer has the width of the list: the hints must be short.
@@ -140,24 +142,35 @@ pub fn print_preview(state_dir: &Path, time: &str, path: &str) {
         label("Project"),
         git::folder_name(&removal.main_checkout)
     );
-    println!("{}{}", label("Folder"), home_text(&removal.path));
+    println!("{}{}", label("Folder"), git::folder_name(&removal.path));
     let short_commit: String = removal.commit.chars().take(8).collect();
     let branch_state = if git::branch_commit(&removal.main_checkout, &removal.branch).is_some() {
         format!("{GREEN}the branch is there{RESET}")
-    } else if git::branch_commit(&removal.main_checkout, &removal.commit).is_some() {
-        format!("{YELLOW}the branch comes back on its commit{RESET}")
+    } else if git::commit_exists(&removal.main_checkout, &removal.commit) {
+        format!("{YELLOW}the branch comes back on this commit{RESET}")
     } else {
-        format!("{YELLOW}the branch is gone{RESET}")
+        format!("{RED}the commit is gone{RESET}")
     };
     println!("{}{short_commit}  {branch_state}", label("Commit"));
     if removal.path.exists() {
         println!("{}{YELLOW}already there{RESET}", label("Worktree"));
     }
+    if !removal.tabs.is_empty() {
+        let tabs: Vec<String> = removal
+            .tabs
+            .iter()
+            .map(|tab| match tab.panes.len() {
+                1 => tab.label.clone(),
+                panes => format!("{} ({panes} panes)", tab.label),
+            })
+            .collect();
+        println!("{}{}", label("Tabs"), tabs.join(", "));
+    }
     println!();
     if removal.agents.is_empty() {
         println!("{DIM}No agent comes back.{RESET}");
     } else {
-        println!("{BOLD}Agents{RESET} {DIM}(a new tab each, with its conversation){RESET}");
+        println!("{BOLD}Agents{RESET} {DIM}(each with its conversation){RESET}");
         for agent in &removal.agents {
             let resume = agent
                 .resume_arguments()
@@ -173,17 +186,6 @@ pub fn print_preview(state_dir: &Path, time: &str, path: &str) {
     println!();
     println!("{DIM}The programs of the other panes, and the files{RESET}");
     println!("{DIM}that an editor did not save, do not come back.{RESET}");
-}
-
-/// A path for the user: `~/…` in the home folder.
-fn home_text(path: &Path) -> String {
-    match env::var_os("HOME") {
-        Some(home) => match path.strip_prefix(&home) {
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => path.display().to_string(),
-        },
-        None => path.display().to_string(),
-    }
 }
 
 #[cfg(test)]
