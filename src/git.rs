@@ -293,6 +293,12 @@ pub fn is_ancestor(main_checkout: &Path, commit: &str, branch: &str) -> bool {
     .is_ok()
 }
 
+/// Create the local branch `branch` on `commit`.
+pub fn create_branch(main_checkout: &Path, branch: &str, commit: &str) -> Result<(), Error> {
+    run_in(main_checkout, &["branch", branch, commit])?;
+    Ok(())
+}
+
 /// Return the name of the local default branch (`main`), without network:
 /// the cache of wt (`worktrunk.default-branch` in the git config), else the
 /// default branch of `origin` without its remote.

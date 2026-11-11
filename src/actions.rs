@@ -29,6 +29,8 @@ use crate::git::{self, Checkout};
 use crate::herdr::{self, Error};
 use crate::leftover::{self, Agents, WorktreeAgent};
 use crate::picker::{self, Picked, Row};
+use crate::restore;
+use crate::stale;
 use crate::ui;
 use crate::wt;
 
@@ -98,6 +100,9 @@ pub fn open(entrypoint: &str) -> Result<(), Error> {
     let folder_path = Path::new(folder);
     if entrypoint == "cleaner" {
         return herdr::open_plugin_pane("cleaner", folder_path, &[(FOLDER_VARIABLE, folder)]);
+    }
+    if entrypoint == "restorer" {
+        return herdr::open_plugin_pane("restorer", folder_path, &[]);
     }
     if entrypoint == "picker" {
         if let Err(error) = repository_of(folder_path) {
@@ -452,6 +457,7 @@ fn ask_and_run() -> Result<(), Error> {
         "Delete the worktree",
         &format!("Deleting the worktree of {branch}…"),
     );
+    record_removal(&checkout.main_checkout(), &checkout.root, &agents);
     if !agents.is_empty() {
         close_agents(&agents, &checkout.root)?;
     }
@@ -460,6 +466,124 @@ fn ask_and_run() -> Result<(), Error> {
         close_after_removal(workspace_id, &checkout)?;
     }
     Ok(())
+}
+
+/// Record the removal of the worktree `path` before it starts, for the
+/// action restore: its branch, the commit of its branch, and its agents
+/// with their sessions. A worktree without a branch (detached HEAD) cannot
+/// come back.
+fn record_removal(main_checkout: &Path, path: &Path, agents: &[WorktreeAgent]) {
+    let Some(branch) = git::branch_of(path) else {
+        return;
+    };
+    let Some(commit) = git::branch_commit(main_checkout, &branch) else {
+        return;
+    };
+    restore::record(
+        &crate::state_dir(),
+        &restore::Removal {
+            time: stale::now(),
+            main_checkout: main_checkout.to_owned(),
+            path: path.to_owned(),
+            branch,
+            commit,
+            agents: agents
+                .iter()
+                .filter_map(|agent| {
+                    restore::RemovedAgent::of(&agent.kind, agent.session.as_deref())
+                })
+                .collect(),
+            recover_command: None,
+        },
+    );
+}
+
+/// Popup restorer: bring back the last removed worktree, then wait for a
+/// key. The output of wt (its hooks) stays on the screen.
+pub fn restorer() -> Result<(), Error> {
+    let state_dir = crate::state_dir();
+    let message = match restore::last(&state_dir) {
+        None => "No removed worktree to restore.".to_owned(),
+        Some(removal) => match restore_worktree(&state_dir, &removal) {
+            Ok(message) => message,
+            Err(error) => error.to_string(),
+        },
+    };
+    ui::wait_after_output(&message);
+    Ok(())
+}
+
+/// Bring back one removed worktree: its branch, its worktree, its herdr
+/// workspace, and its agents. Return the summary for the user.
+fn restore_worktree(state_dir: &Path, removal: &restore::Removal) -> Result<String, Error> {
+    let branch = &removal.branch;
+    if removal.path.exists() {
+        restore::forget(state_dir, removal);
+        return Ok(format!(
+            "The worktree of {branch} is already there: {}",
+            home_relative(&removal.path)
+        ));
+    }
+    println!("Restore the worktree of {branch}…");
+    if git::branch_commit(&removal.main_checkout, branch).is_none() {
+        if let Err(error) = git::create_branch(&removal.main_checkout, branch, &removal.commit) {
+            let recover = removal
+                .recover_command
+                .as_deref()
+                .map(|command| format!(" To get it from the forge: {command}"))
+                .unwrap_or_default();
+            return Err(Error::Command(format!(
+                "Cannot create the branch {branch} on its commit {}: {error}.{recover}",
+                removal.commit
+            )));
+        }
+    }
+    let path = wt::switch(&removal.main_checkout, branch, false)?;
+    restore::forget(state_dir, removal);
+    if let Some(commit) = git::branch_commit(&removal.main_checkout, branch) {
+        restore::mark_restored(state_dir, &git::canonical(&path), &commit);
+    }
+    // The post-start hook of wt opens the workspace in the background:
+    // wait for it, then open it if the hook did not.
+    let mut workspace_id = None;
+    for _ in 0..10 {
+        workspace_id = herdr::workspace_of_checkout(&path)?;
+        if workspace_id.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let workspace_id = match workspace_id {
+        Some(workspace_id) => workspace_id,
+        None => herdr::open_checkout(&path, &removal.main_checkout, false)?.workspace_id,
+    };
+    let mut lines = vec![format!(
+        "Restored the worktree of {branch}. herdr-worktrunk keeps it for 1 day, while its branch keeps this commit."
+    )];
+    for agent in &removal.agents {
+        let Some(arguments) = agent.resume_arguments() else {
+            lines.push(format!(
+                "Cannot resume a {} agent: {}",
+                agent.kind, agent.session
+            ));
+            continue;
+        };
+        let result = herdr::open_shell_tab_pane(&workspace_id, &path).and_then(|pane_id| {
+            herdr::start_agent(&agent.herdr_name(), &agent.kind, &pane_id, &arguments)
+        });
+        match result {
+            Ok(()) => lines.push(format!(
+                "Resumed the {} agent {}.",
+                agent.kind, agent.session
+            )),
+            Err(error) => lines.push(format!(
+                "Cannot resume the {} agent {}: {error}",
+                agent.kind, agent.session
+            )),
+        }
+    }
+    lines.push("The programs of the other panes, and the files that an editor did not save, do not come back.".to_owned());
+    Ok(lines.join("\n"))
 }
 
 /// The lines of the question about the agents that the deletion closes:
@@ -535,10 +659,13 @@ fn delete_all() -> Result<(), Error> {
             }
         };
         match agents_to_close(&worktree.path, workspace_id.as_deref()) {
-            Ok(agents) if agents.is_empty() => {}
+            Ok(agents) if agents.is_empty() => {
+                record_removal(&worktree.main_checkout, &worktree.path, &[]);
+            }
             // Only a worktree with a proof of the end closes its idle
             // agents: the age alone keeps them.
             Ok(agents) if leftover::closes_idle_agents(worktree.reason, &worktree.facts) => {
+                record_removal(&worktree.main_checkout, &worktree.path, &agents);
                 if let Err(error) = close_agents(&agents, &worktree.path) {
                     kept.push(format!("{}: {error}", worktree.branch));
                     continue;

@@ -344,6 +344,60 @@ pub fn open_shell_tab(workspace_id: &str, folder: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Open a tab with a shell in `folder`, in the workspace `workspace_id`,
+/// without the focus, and return its pane.
+pub fn open_shell_tab_pane(workspace_id: &str, folder: &Path) -> Result<String, Error> {
+    let folder_text = folder.to_string_lossy();
+    let result = run(&[
+        "tab",
+        "create",
+        "--workspace",
+        workspace_id,
+        "--cwd",
+        &folder_text,
+        "--no-focus",
+    ])?;
+    string_field(&result, "/root_pane/pane_id")
+}
+
+/// Start an agent of `kind` in the shell of `pane_id`. herdr types
+/// `<kind> <arguments>` in the shell, so the aliases of the shell apply.
+/// A shell that is not ready yet gets 10 seconds. An agent that waits for
+/// an answer (for example "trust this folder?") counts as started.
+pub fn start_agent(
+    name: &str,
+    kind: &str,
+    pane_id: &str,
+    agent_arguments: &[String],
+) -> Result<(), Error> {
+    let mut arguments = vec![
+        "agent",
+        "start",
+        name,
+        "--kind",
+        kind,
+        "--pane",
+        pane_id,
+        "--timeout",
+        "30000",
+        "--",
+    ];
+    arguments.extend(agent_arguments.iter().map(String::as_str));
+    for _ in 0..20 {
+        match run(&arguments) {
+            Ok(_) => return Ok(()),
+            Err(Error::Herdr { code, .. }) if code == "agent_not_ready" => return Ok(()),
+            Err(Error::Herdr { code, .. }) if code == "agent_pane_busy" => {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::Command(format!(
+        "the shell of the pane {pane_id} did not get ready"
+    )))
+}
+
 /// Return true if the shell of `pane_id` waits at its prompt: no command
 /// runs in it. The shell is then the foreground process group of the
 /// terminal.

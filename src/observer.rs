@@ -38,6 +38,7 @@ use crate::git::{self, Checkout, LinkedWorktree};
 use crate::herdr::{self, Error, Pane, Snapshot};
 use crate::leftover;
 use crate::prune::{self, FinishedWorktree, MergedWorktree};
+use crate::restore;
 use crate::stale::{self, OldWorktree};
 use crate::sync::lock;
 use crate::wt;
@@ -911,6 +912,7 @@ fn finish_worktree(
         path: &worktree.path,
         branch: &worktree.branch,
         commit: &worktree.commit,
+        recover_command: Some(&worktree.recover_command),
     };
     let is_closed = worktree.pull_request.state == PullRequestState::Closed;
     let state = if is_closed { "closed" } else { "merged" };
@@ -956,6 +958,7 @@ fn finish_merged_worktree(
         path: &worktree.path,
         branch: &worktree.branch,
         commit: &worktree.commit,
+        recover_command: None,
     };
     // The facts of the rule cost 1 to 3 calls to git: the thread reads
     // them only after the cheap checks, and only once.
@@ -1018,6 +1021,7 @@ fn removal_body(why: &str, closed_agents: &[String]) -> String {
     for resume in closed_agents {
         body.push_str(&format!("\nClosed agent, to resume it: {resume}"));
     }
+    body.push_str("\nTo bring it back: action restore of herdr-worktrunk.");
     body
 }
 
@@ -1028,6 +1032,9 @@ struct Target<'a> {
     path: &'a Path,
     branch: &'a str,
     commit: &'a str,
+    /// The command that gets the branch back from the forge, for a closed
+    /// pull request.
+    recover_command: Option<&'a str>,
 }
 
 impl Target<'_> {
@@ -1067,6 +1074,15 @@ fn prepare_removal(
     log: &Log,
     may_remove: impl Fn(leftover::Agents) -> bool,
 ) -> Result<Preparation, Error> {
+    // A worktree that the user restored stays for 1 day, while its branch
+    // keeps the restored commit.
+    if restore::is_kept(
+        &crate::state_dir(),
+        &git::canonical(target.path),
+        target.commit,
+    ) {
+        return Ok(Preparation::Kept);
+    }
     let agents = lock(view).agents_in(target.path);
     let state = match agent_decision(&agents, target.path) {
         AgentDecision::Wait => return Ok(Preparation::AgentStays),
@@ -1081,6 +1097,23 @@ fn prepare_removal(
     if !may_remove(state) {
         return Ok(Preparation::Refused);
     }
+    restore::record(
+        &crate::state_dir(),
+        &restore::Removal {
+            time: stale::now(),
+            main_checkout: target.main_checkout.to_owned(),
+            path: target.path.to_owned(),
+            branch: target.branch.to_owned(),
+            commit: target.commit.to_owned(),
+            agents: agents
+                .iter()
+                .filter_map(|agent| {
+                    restore::RemovedAgent::of(&agent.kind, agent.session.as_deref())
+                })
+                .collect(),
+            recover_command: target.recover_command.map(str::to_owned),
+        },
+    );
     let mut closed_agents = Vec::new();
     if state == leftover::Agents::Idle {
         for agent in &agents {
@@ -1918,6 +1951,7 @@ mod tests {
             path: &folder,
             branch: "feat",
             commit: &checked,
+            recover_command: None,
         };
 
         assert!(target.is_unchanged());
@@ -1935,14 +1969,14 @@ mod tests {
     fn the_notification_of_a_removal_gives_the_resume_commands() {
         assert_eq!(
             removal_body("its pull request #3 is merged", &[]),
-            "Reason: its pull request #3 is merged."
+            "Reason: its pull request #3 is merged.\nTo bring it back: action restore of herdr-worktrunk."
         );
         assert_eq!(
             removal_body(
                 "main contains its commits",
                 &["claude --resume abc".to_owned()]
             ),
-            "Reason: main contains its commits.\nClosed agent, to resume it: claude --resume abc"
+            "Reason: main contains its commits.\nClosed agent, to resume it: claude --resume abc\nTo bring it back: action restore of herdr-worktrunk."
         );
     }
 
