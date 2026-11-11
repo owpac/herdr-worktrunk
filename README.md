@@ -297,6 +297,7 @@ The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`
 
 - herdr 0.9.0 or later, on macOS or Linux.
 - worktrunk (`wt`) and git on the `PATH` of the herdr server.
+- For the commands that resume an agent, and for the restore of its conversation: the herdr integration of the agent, for example `herdr integration install claude`. It gives herdr the session of the agent.
 - [fzf](https://github.com/junegunn/fzf) 0.73 or later (tested with 0.74): the popups use its events `every` and `load`, its server `--listen`, and its options `--footer`, `--ghost` and `--gutter`.
 - For the pull requests on GitHub: [gh](https://cli.github.com) with a login (`gh auth login`).
 - For the merge requests on GitLab: [glab](https://gitlab.com/gitlab-org/cli) with a login (`glab auth login`). A public project on gitlab.com needs no login. Tested with glab 1.128.
@@ -350,8 +351,33 @@ description = "clean the worktrees (wt)"
 key = "prefix+z"
 type = "plugin_action"
 command = "herdr-worktrunk.restore"
-description = "restore the last removed worktree (wt)"
+description = "restore a removed worktree (wt)"
 ```
+
+## Rules for the agents
+
+Your agents do not know the plugin. Copy these rules into their `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+## Worktrees in herdr
+
+- In herdr (`HERDR_ENV=1`), run `herdr --skill` before you control herdr. Obey its output.
+- worktrunk (`wt`) creates and removes each git worktree. In herdr, 1 worktree = 1 workspace.
+- Before you change code, create a worktree for the task: `wt switch --create <branch>`. Then work in this worktree. In Claude Code, use `/worktrunk:wt-switch-create <branch>`.
+- Give each agent that changes code its own worktree.
+- Keep the worktree after you open its pull request. The plugin herdr-worktrunk removes it when the pull request is merged.
+- Without a pull request, run `wt merge --no-remove`. The agent keeps its folder. The plugin removes the worktree when the agent is idle.
+- Do not run `wt step prune`: it ignores the agents in the other worktrees.
+- Address another agent with its herdr name. Its pane ID changes when its pane moves to another workspace.
+
+To start an agent in its own worktree:
+
+1. Run `wt switch --create <branch> --no-cd --format json`. The JSON gives the `path`.
+2. Run `herdr worktree open --cwd <main checkout> --path <path> --no-focus`. The JSON gives `root_pane.pane_id`.
+3. Start the agent in this pane.
+```
+
+The observer removes the merged worktrees with `prune_merged = true`. If `prune_merged` is `false`, the cleaner shows them in the group To delete.
 
 ## Development
 
