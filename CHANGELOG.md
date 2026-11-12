@@ -2,6 +2,20 @@
 
 The changes of each release of herdr-worktrunk. The workflow release-pr writes this file.
 
+## [2026.11.33](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.33) - 2026-11-12
+
+### Features
+
+- the command remove --path removes a worktree for another plugin ([#34](https://github.com/owpac/herdr-worktrunk/pull/34))
+
+### Bug fixes
+
+- the observer keeps the workspace of a worktree when the agent leaves it ([#35](https://github.com/owpac/herdr-worktrunk/pull/35))
+
+### Documentation
+
+- remove the origin of the build and release method ([#32](https://github.com/owpac/herdr-worktrunk/pull/32))
+
 ## [2026.11.32](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.32) - 2026-11-11
 
 ### Build and CI
