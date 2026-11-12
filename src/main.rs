@@ -43,7 +43,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>]";
+const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>] | remove --path <worktree> [--close-agents]";
 
 /// The days without activity of `list-stale` when `stale_days` is 0.
 const DEFAULT_STALE_DAYS: u32 = 7;
@@ -278,6 +278,23 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             return ExitCode::SUCCESS;
+        }
+        // A removal for another plugin: no popup, no notification. The
+        // caller shows the message.
+        ["remove", "--path", path, options @ ..]
+            if options.iter().all(|option| *option == "--close-agents") =>
+        {
+            let close_agents = !options.is_empty();
+            return match actions::remove_from_command(Path::new(path), close_agents) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("herdr-worktrunk: {error}");
+                    ExitCode::FAILURE
+                }
+            };
         }
         ["observe"] => (observe(false), None),
         ["observe", "--run"] => (observe(true), None),

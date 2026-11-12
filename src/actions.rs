@@ -389,30 +389,7 @@ fn ask_and_run() -> Result<(), Error> {
     // A deletion that the user chose in the cleaner closes the agents of
     // the worktree first. The actions remove and merge refuse an agent.
     let close_agents_first = operation != MERGE && env::var_os(CLOSE_AGENTS_VARIABLE).is_some();
-    let agents = if close_agents_first {
-        let snapshot = herdr::snapshot()?;
-        let agents = leftover::agents_of(&snapshot, &checkout.root, workspace_id.as_deref());
-        // wt refuses changes that are not committed: the agents must not
-        // close for nothing.
-        if !agents.is_empty() && !git::is_clean(&checkout.root) {
-            return Err(Error::Command(
-                "This worktree has changes that are not committed. Commit or delete them first: its agent stays."
-                    .to_owned(),
-            ));
-        }
-        agents
-    } else {
-        if let Some(workspace_id) = &workspace_id {
-            refuse_if_agent(workspace_id)?;
-        }
-        if herdr::agent_in_checkout(&checkout.root)? {
-            return Err(Error::Command(
-                "An agent works in the folder of this worktree. Stop the agent first: the deletion removes its folder."
-                    .to_owned(),
-            ));
-        }
-        Vec::new()
-    };
+    let agents = agents_for_removal(&checkout, workspace_id.as_deref(), close_agents_first)?;
     let (branch, folder_name) = describe(&checkout);
     if operation == MERGE {
         let question = format!(
@@ -444,11 +421,58 @@ fn ask_and_run() -> Result<(), Error> {
         "Delete the worktree",
         &format!("Deleting the worktree of {branch}…"),
     );
+    remove_checkout(&checkout, workspace_id.as_deref(), &agents)
+}
+
+/// The agents that a removal closes first, or an error if the removal
+/// must not start.
+///
+/// - `close_agents` true: the agents of the worktree close first. wt
+///   refuses changes that are not committed: then the agents must not
+///   close for nothing, and the removal does not start.
+/// - `close_agents` false: an agent in the worktree or in its workspace
+///   stops the removal.
+fn agents_for_removal(
+    checkout: &Checkout,
+    workspace_id: Option<&str>,
+    close_agents: bool,
+) -> Result<Vec<WorktreeAgent>, Error> {
+    if close_agents {
+        let snapshot = herdr::snapshot()?;
+        let agents = leftover::agents_of(&snapshot, &checkout.root, workspace_id);
+        if !agents.is_empty() && !git::is_clean(&checkout.root) {
+            return Err(Error::Command(
+                "This worktree has changes that are not committed. Commit or delete them first: its agent stays."
+                    .to_owned(),
+            ));
+        }
+        return Ok(agents);
+    }
+    if let Some(workspace_id) = workspace_id {
+        refuse_if_agent(workspace_id)?;
+    }
+    if herdr::agent_in_checkout(&checkout.root)? {
+        return Err(Error::Command(
+            "An agent works in the folder of this worktree. Stop the agent first: the deletion removes its folder."
+                .to_owned(),
+        ));
+    }
+    Ok(Vec::new())
+}
+
+/// Remove the worktree `checkout`: record the removal for the action
+/// restore, remove the worktree with wt, then close its agents and its
+/// workspace.
+fn remove_checkout(
+    checkout: &Checkout,
+    workspace_id: Option<&str>,
+    agents: &[WorktreeAgent],
+) -> Result<(), Error> {
     let removal = record_removal(
         &checkout.main_checkout(),
         &checkout.root,
-        &agents,
-        workspace_id.as_deref(),
+        agents,
+        workspace_id,
     );
     // wt first: this popup can run in the workspace of the worktree, and
     // the close of the workspace stops it. wt refuses changes that are not
@@ -461,13 +485,38 @@ fn ask_and_run() -> Result<(), Error> {
     }
     // An agent can start after the question: read the agents again.
     let agents = herdr::snapshot()
-        .map(|snapshot| leftover::agents_of(&snapshot, &checkout.root, workspace_id.as_deref()))
-        .unwrap_or(agents);
+        .map(|snapshot| leftover::agents_of(&snapshot, &checkout.root, workspace_id))
+        .unwrap_or_else(|_| agents.to_vec());
     close_agents_elsewhere(&agents);
-    if let Some(workspace_id) = &workspace_id {
-        close_after_removal(workspace_id, &checkout)?;
+    if let Some(workspace_id) = workspace_id {
+        close_after_removal(workspace_id, checkout)?;
     }
     Ok(())
+}
+
+/// Command `remove --path <worktree> [--close-agents]`: remove a worktree
+/// without a popup, for another plugin (herdr-omnibar). The other plugin
+/// asks the question itself. The removal follows the rules of the
+/// cleaner: a record for the action restore, wt first, then the agents
+/// and the workspace close. Return the message of the result.
+///
+/// Without `close_agents`, an agent in the worktree stops the removal.
+pub fn remove_from_command(path: &Path, close_agents: bool) -> Result<String, Error> {
+    let checkout = git::checkout_of(path)
+        .ok_or_else(|| Error::Command(format!("{} is not a git checkout.", path.display())))?;
+    if git::canonical(&checkout.root) == git::canonical(&checkout.main_checkout()) {
+        return Err(Error::Command(format!(
+            "{} is the main checkout of its repository: it is not a worktree to remove.",
+            checkout.root.display()
+        )));
+    }
+    let workspace_id = herdr::workspace_of_checkout(&checkout.root)?;
+    let agents = agents_for_removal(&checkout, workspace_id.as_deref(), close_agents)?;
+    let (branch, folder_name) = describe(&checkout);
+    remove_checkout(&checkout, workspace_id.as_deref(), &agents)?;
+    Ok(format!(
+        "Removed the worktree of {branch} ({folder_name}). The action restore brings it back."
+    ))
 }
 
 /// Close the agents of a removed worktree whose pane is in another
@@ -1146,6 +1195,18 @@ pub fn merger() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{git_in, test_folder};
+
+    #[test]
+    fn the_command_remove_refuses_a_folder_outside_git_and_the_main_checkout() {
+        let folder = test_folder("remove-command");
+        let error = remove_from_command(&folder, false).unwrap_err();
+        assert!(error.to_string().contains("is not a git checkout"));
+        git_in(&folder, &["init", "-q", "-b", "main"]);
+        let error = remove_from_command(&folder, true).unwrap_err();
+        assert!(error.to_string().contains("is the main checkout"));
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     #[test]
     fn the_names_of_delete_all_fit_in_2_lines() {
