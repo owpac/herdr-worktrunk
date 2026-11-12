@@ -35,7 +35,7 @@ use serde_json::Value;
 use crate::git;
 use crate::herdr::Error;
 use crate::stale;
-use crate::style::{self, part, ACCENT, DIM, GREEN, MUTED, RED, RESET, RULE, YELLOW};
+use crate::style::{self, part, Code, ACCENT, DIM, GREEN, MUTED, RED, RESET, RULE, YELLOW};
 
 /// fzf exits with 130 when the user cancels.
 pub(crate) const FZF_CANCEL_EXIT_CODE: i32 = 130;
@@ -134,7 +134,7 @@ impl Row {
             }
             Row::Branch { .. } => (part(DIM, "○ "), vec![part(DIM, "no worktree")]),
         };
-        let mut left = vec![state, part("", self.branch())];
+        let mut left = vec![state, part(Code::None, self.branch())];
         let subject = match self {
             Row::Create { .. } => "new worktree from the default branch",
             _ => details.subject.as_str(),
@@ -143,9 +143,9 @@ impl Row {
             left.push(part(RULE, " — "));
             left.push(part(MUTED, subject));
         }
-        right.push(part("", details.lines_text()));
-        right.push(part("", details.commits_text()));
-        right.push(part("", details.marker.clone()));
+        right.push(part(Code::None, details.lines_text()));
+        right.push(part(Code::None, details.commits_text()));
+        right.push(part(Code::None, details.marker.clone()));
         if let Some(time) = details.committed_at {
             right.push(part(MUTED, style::age(now.saturating_sub(time))));
         }
@@ -541,6 +541,7 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
             style::terminal_columns().to_string(),
         )
         .env(CURRENT_VARIABLE, repository)
+        .envs(style::theme_environment())
         .args(style::fzf_arguments(
             GHOST,
             &git::folder_name(&main_checkout),

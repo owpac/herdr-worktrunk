@@ -17,7 +17,7 @@ use crate::picker::{shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_CODE};
 use crate::restore::{self, Removal};
 use crate::stale;
 use crate::style::{
-    self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
+    self, part, Code, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
 
 const GHOST: &str = "removed worktree — type to filter";
@@ -47,9 +47,9 @@ fn agents_words(removal: &Removal) -> String {
 /// The line of fzf for a removal: the 3 hidden fields, then the row.
 fn line(removal: &Removal, now: u64, width: usize) -> String {
     let left = [
-        part("", "  "),
+        part(Code::None, "  "),
         part(ACCENT, "↺ "),
-        part("", removal.branch.clone()),
+        part(Code::None, removal.branch.clone()),
         part(RULE, " — "),
         part(MUTED, agents_words(removal)),
     ];

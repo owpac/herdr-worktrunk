@@ -2,10 +2,12 @@
 //! and a question with a Cancel button and an action button.
 //!
 //! A box uses the whole popup: a title, the message, and the buttons in
-//! the middle.
+//! the middle. The colors come from the herdr theme (see theme.rs).
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
+
+use crate::theme;
 
 const DEFAULT_ROWS: usize = 9;
 const DEFAULT_COLUMNS: usize = 64;
@@ -18,11 +20,47 @@ const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
 const BOLD: &str = "\x1b[1m";
-const REVERSE: &str = "\x1b[7m";
-const DIM: &str = "\x1b[2m";
-const RED: &str = "\x1b[31m";
-const RED_BACKGROUND: &str = "\x1b[1;37;41m";
 const RESET: &str = "\x1b[0m";
+
+/// The palette of the herdr theme.
+fn palette() -> &'static theme::Palette {
+    &theme::current().palette
+}
+
+/// A selected button: bold text on a color. The text takes the background of the panels of herdr,
+/// dark on a dark theme and light on a light theme, else black: it contrasts with the color.
+fn button_on(background: theme::Color) -> String {
+    let text = match palette().panel_bg {
+        theme::Color::Reset => theme::Color::Black,
+        color => color,
+    };
+    format!("{BOLD}{}{}", text.foreground(), background.background())
+}
+
+/// The selected button.
+fn selected_style() -> String {
+    button_on(palette().accent)
+}
+
+/// The selected button that deletes or changes work.
+fn danger_selected_style() -> String {
+    button_on(palette().red)
+}
+
+/// A button that deletes or changes work, not selected.
+fn danger_style() -> String {
+    palette().red.foreground()
+}
+
+/// The title of a box.
+fn title_style() -> String {
+    format!("{BOLD}{}", palette().accent.foreground())
+}
+
+/// The hint under the buttons.
+fn hint_style() -> String {
+    palette().overlay0.foreground()
+}
 
 /// A button of a box.
 #[derive(Clone, Copy)]
@@ -163,10 +201,10 @@ fn button_line(buttons: &[Button], selected: usize) -> (String, usize) {
         let text = format!("[ {} ]", button.label);
         length += text.chars().count();
         let style = match (index == selected, button.is_danger) {
-            (true, true) => RED_BACKGROUND,
-            (true, false) => REVERSE,
-            (false, true) => RED,
-            (false, false) => "",
+            (true, true) => danger_selected_style(),
+            (true, false) => selected_style(),
+            (false, true) => danger_style(),
+            (false, false) => String::new(),
         };
         line.push_str(&format!("{style}{text}{RESET}"));
     }
@@ -219,7 +257,7 @@ fn draw(title: &str, message: &str, buttons: &[Button], selected: usize, hint: &
     screen.push_str(CLEAR_SCREEN);
     screen.push_str(HIDE_CURSOR);
     screen.push_str(&"\r\n".repeat(top_padding));
-    let title_text = format!("{BOLD}{title}{RESET}");
+    let title_text = format!("{}{title}{RESET}", title_style());
     screen.push_str(&centered(&title_text, title.chars().count(), columns));
     screen.push_str("\r\n\r\n");
     for line in &message_lines {
@@ -229,7 +267,7 @@ fn draw(title: &str, message: &str, buttons: &[Button], selected: usize, hint: &
     screen.push_str("\r\n");
     screen.push_str(&centered(&buttons_text, buttons_length, columns));
     screen.push_str("\r\n\r\n");
-    let hint_text = format!("{DIM}{hint}{RESET}");
+    let hint_text = format!("{}{hint}{RESET}", hint_style());
     screen.push_str(&centered(&hint_text, hint.chars().count(), columns));
     let mut stdout = io::stdout();
     // The box is only for the user: a failed write has no other effect.
@@ -271,7 +309,10 @@ pub fn wait_after_output(message: &str) {
     if !is_interactive() {
         return;
     }
-    print!("\r\n{BOLD}{message}{RESET} {DIM}· any key closes{RESET}");
+    print!(
+        "\r\n{BOLD}{message}{RESET} {}· any key closes{RESET}",
+        hint_style()
+    );
     let _ = io::stdout().flush();
     let _raw = RawMode::start();
     read_key();
@@ -366,7 +407,7 @@ mod tests {
             length,
             "[ Cancel ]".len() + BUTTON_GAP.len() + "[ Delete ]".len()
         );
-        assert!(line.contains(&format!("{RED_BACKGROUND}[ Delete ]")));
+        assert!(line.contains(&format!("{}[ Delete ]", danger_selected_style())));
     }
 
     #[test]

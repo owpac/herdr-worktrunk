@@ -43,7 +43,7 @@ use crate::picker::{self, shell_quote, FZF_CANCEL_EXIT_CODE, FZF_NO_MATCH_EXIT_C
 use crate::prune;
 use crate::stale;
 use crate::style::{
-    self, part, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
+    self, part, Code, ACCENT, BOLD, DIM, GREEN, MUTED, RED, REPOSITORY, RESET, RULE, YELLOW,
 };
 use crate::wt;
 
@@ -84,7 +84,7 @@ const TITLE_KIND: &str = "title";
 const WORKTREE_KIND: &str = "worktree";
 
 /// The glyph of a verdict, and its color.
-fn glyph(reason: Reason) -> (&'static str, &'static str) {
+fn glyph(reason: Reason) -> (Code, &'static str) {
     match reason {
         Reason::Checking => (ACCENT, SPINNER[0]),
         // is_leftover decides the group To delete: the color follows it.
@@ -824,9 +824,9 @@ fn line(row: &Row, width: usize) -> String {
                         glyph(entry.reason)
                     };
                     let left = [
-                        part("", "  "),
+                        part(Code::None, "  "),
                         part(color, format!("{glyph} ")),
-                        part("", entry.branch.clone()),
+                        part(Code::None, entry.branch.clone()),
                         part(RULE, " — "),
                         part(reason_color, reason_text.clone()),
                     ];
@@ -1117,6 +1117,7 @@ pub fn choose(
         .env(style::COLUMNS_VARIABLE, columns.to_string())
         // With an API key, fzf refuses the actions of the checks.
         .env_remove("FZF_API_KEY")
+        .envs(style::theme_environment())
         .args(style::fzf_arguments(GHOST, &scope_of(&entries), &HINTS))
         // The first frame of the spinner.
         .args(["--with-nth", &(ROW_FIELDS + 1).to_string()])

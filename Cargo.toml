@@ -14,6 +14,8 @@ publish = false
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The config of herdr, for the colors of its theme (src/theme.rs).
+toml = "1"
 unicode-width = "0.2"
 
 [profile.release]

@@ -3,46 +3,160 @@
 //! the selected row on a grey background after a `▌` in the accent color,
 //! the secondary text in grey, and the hints of the keys at the bottom.
 //!
-//! The colors that carry a meaning are ANSI colors: they follow the theme
-//! of the terminal. The greys are fixed 256 colors, as in the 2 plugins:
-//! some themes give `bright_black` a color near the background.
+//! The colors come from the herdr theme (see theme.rs), like the colors of
+//! herdr-omnibar: each role below takes a color of the palette of herdr.
 
 use std::env;
+use std::fmt;
+use std::sync::OnceLock;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::theme::{self, Color, Theme};
 use crate::ui;
 
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
+
+/// A color of the popups: a role, with the escape code of its color in
+/// the palette of the herdr theme. A role writes its code in a format
+/// string: `format!("{ACCENT}text{RESET}")`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Code {
+    /// No color: the text keeps the color of the terminal.
+    None,
+    Accent,
+    Repository,
+    Green,
+    Yellow,
+    Red,
+    Muted,
+    Dim,
+    Rule,
+    SelectedBackground,
+}
+
 /// The prompt, the pointer, the current tab of the preview, the scope.
-pub const ACCENT: &str = "\x1b[38;5;12m";
+pub const ACCENT: Code = Code::Accent;
 /// The name of a repository.
-pub const REPOSITORY: &str = "\x1b[38;5;14m";
+pub const REPOSITORY: Code = Code::Repository;
 /// A worktree without changes, and the row that creates a worktree.
-pub const GREEN: &str = "\x1b[38;5;10m";
+pub const GREEN: Code = Code::Green;
 /// A worktree with changes that are not committed.
-pub const YELLOW: &str = "\x1b[38;5;11m";
+pub const YELLOW: Code = Code::Yellow;
 /// The deleted lines, and the commits behind the default branch.
-pub const RED: &str = "\x1b[38;5;9m";
+pub const RED: Code = Code::Red;
 /// The secondary text: a commit subject, a folder, an age.
-pub const MUTED: &str = "\x1b[38;5;249m";
+pub const MUTED: Code = Code::Muted;
 /// The labels of the hints, and the tabs of the preview that are not
 /// current.
-pub const DIM: &str = "\x1b[38;5;246m";
+pub const DIM: Code = Code::Dim;
 /// The rules and the separators.
-pub const RULE: &str = "\x1b[38;5;239m";
+pub const RULE: Code = Code::Rule;
 /// The background of the current tab of the preview.
-pub const SELECTED_BACKGROUND: &str = "\x1b[48;5;237m";
+pub const SELECTED_BACKGROUND: Code = Code::SelectedBackground;
 
-/// The colors of fzf: the same values as the constants above. The header
+impl Code {
+    /// Each role, in the order of the enum: `as_str` finds the code of a role at its index.
+    const ALL: [Code; 10] = [
+        Code::None,
+        Code::Accent,
+        Code::Repository,
+        Code::Green,
+        Code::Yellow,
+        Code::Red,
+        Code::Muted,
+        Code::Dim,
+        Code::Rule,
+        Code::SelectedBackground,
+    ];
+
+    /// The color of the role in a herdr theme. The theme terminal uses the ANSI colors of the
+    /// terminal: its overlay1 is white and its surface0 is the color of the text, and some
+    /// terminal schemes give bright black a color near the background. Its greys stay fixed 256
+    /// colors, as before the herdr themes.
+    fn color(self, theme: &Theme) -> Option<Color> {
+        let palette = &theme.palette;
+        let grey = |color, fixed| {
+            if theme.terminal {
+                Color::Indexed(fixed)
+            } else {
+                color
+            }
+        };
+        Some(match self {
+            Code::None => return None,
+            Code::Accent => palette.accent,
+            Code::Repository => palette.teal,
+            Code::Green => palette.green,
+            Code::Yellow => palette.yellow,
+            Code::Red => palette.red,
+            Code::Muted => grey(palette.overlay1, 249),
+            Code::Dim => grey(palette.overlay0, 246),
+            Code::Rule => grey(palette.surface0, 239),
+            Code::SelectedBackground => grey(palette.active_row_bg, 237),
+        })
+    }
+
+    /// The escape code of the role in a theme: a background for SelectedBackground, else a text
+    /// color.
+    fn code(self, theme: &Theme) -> String {
+        match (self, self.color(theme)) {
+            (_, None) => String::new(),
+            (Code::SelectedBackground, Some(color)) => color.background(),
+            (_, Some(color)) => color.foreground(),
+        }
+    }
+
+    /// The color of the role for the option --color of fzf: -1 for no color.
+    fn fzf(self, theme: &Theme) -> String {
+        self.color(theme)
+            .map_or_else(|| "-1".to_owned(), Color::fzf)
+    }
+
+    /// The escape code of the role in the herdr theme, computed one time.
+    pub fn as_str(self) -> &'static str {
+        static CODES: OnceLock<[String; 10]> = OnceLock::new();
+        let codes = CODES.get_or_init(|| Code::ALL.map(|code| code.code(theme::current())));
+        &codes[self as usize]
+    }
+}
+
+impl fmt::Display for Code {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The colors of fzf, with the colors of the roles above. The header
 /// shows a notice, in yellow. The selected row is not bold: fzf cannot
 /// make only the branch bold, and the grey text is easier to read without
 /// bold.
-const FZF_COLORS: &str = "fg:-1,bg:-1,hl:12,fg+:-1:regular,bg+:237,hl+:12:bold,\
-gutter:-1,pointer:12:bold,prompt:12:bold,query:-1:regular,info:246,spinner:12,\
-separator:239,border:239,preview-border:239,ghost:246,header:11,\
-footer:246,footer-border:239";
+fn fzf_colors(theme: &Theme) -> String {
+    let accent = ACCENT.fzf(theme);
+    let dim = DIM.fzf(theme);
+    let rule = RULE.fzf(theme);
+    let selected = SELECTED_BACKGROUND.fzf(theme);
+    let yellow = YELLOW.fzf(theme);
+    format!(
+        "fg:-1,bg:-1,hl:{accent},fg+:-1:regular,bg+:{selected},hl+:{accent}:bold,\
+gutter:-1,pointer:{accent}:bold,prompt:{accent}:bold,query:-1:regular,info:{dim},spinner:{accent},\
+separator:{rule},border:{rule},preview-border:{rule},ghost:{dim},header:{yellow},\
+footer:{dim},footer-border:{rule}"
+    )
+}
+
+/// The variables that fzf gives to the processes of its actions (the rows, the preview): the
+/// appearance of the host, if the theme asked it. These processes then read the herdr config
+/// without a new question to macOS at each key.
+pub fn theme_environment() -> Vec<(&'static str, &'static str)> {
+    // The theme reads the appearance of the host only with auto_switch.
+    theme::current();
+    theme::appearance()
+        .map(|appearance| (theme::APPEARANCE_VARIABLE, appearance))
+        .into_iter()
+        .collect()
+}
 
 /// The error of a popup when fzf fails, for example an fzf without the
 /// options of the design.
@@ -118,7 +232,7 @@ pub fn fzf_arguments(ghost: &str, scope: &str, hints: &[(&str, &str)]) -> Vec<St
         // scrolls.
         &format!("right,{PREVIEW_PERCENT}%,border-left,noinfo,~2"),
         "--color",
-        FZF_COLORS,
+        &fzf_colors(theme::current()),
     ]
     .iter()
     .map(|argument| (*argument).to_owned())
@@ -200,11 +314,11 @@ pub(crate) fn visible(line: &str) -> String {
 /// A part of a row: its color (or "") and its text. The text of a part
 /// on the right side can have its own ANSI codes, with the color "".
 pub struct Part {
-    color: &'static str,
+    color: Code,
     text: String,
 }
 
-pub fn part(color: &'static str, text: impl Into<String>) -> Part {
+pub fn part(color: Code, text: impl Into<String>) -> Part {
     Part {
         color,
         text: text.into(),
@@ -212,7 +326,7 @@ pub fn part(color: &'static str, text: impl Into<String>) -> Part {
 }
 
 fn paint(part: &Part, text: &str) -> String {
-    if part.color.is_empty() {
+    if part.color == Code::None {
         text.to_owned()
     } else {
         format!("{}{text}{RESET}", part.color)
@@ -375,11 +489,46 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Palette;
+
+    #[test]
+    fn the_colors_of_fzf_and_of_the_roles_come_from_the_theme() {
+        let dracula = Theme {
+            palette: Palette::from_name("dracula").unwrap(),
+            terminal: false,
+        };
+        let colors = fzf_colors(&dracula);
+        assert!(colors.starts_with("fg:-1,bg:-1,hl:#bd93f9,fg+:-1:regular,bg+:#373c52,"));
+        assert!(colors.contains("header:#f1fa8c"));
+        assert!(colors.ends_with("footer:#6272a4,footer-border:#44475a"));
+        assert_eq!(Code::None.code(&dracula), "");
+        assert_eq!(Code::Accent.code(&dracula), "\x1b[38;2;189;147;249m");
+        assert_eq!(
+            Code::SelectedBackground.code(&dracula),
+            "\x1b[48;2;55;60;82m"
+        );
+        // The theme terminal keeps the ANSI colors, and fixed greys.
+        let terminal = Theme {
+            palette: Palette::from_name("terminal").unwrap(),
+            terminal: true,
+        };
+        let colors = fzf_colors(&terminal);
+        assert!(colors.starts_with("fg:-1,bg:-1,hl:4,fg+:-1:regular,bg+:237,"));
+        assert!(colors.contains("separator:239"));
+        assert_eq!(Code::Muted.code(&terminal), "\x1b[38;5;249m");
+    }
+
+    #[test]
+    fn the_codes_are_in_the_order_of_the_enum() {
+        for (index, code) in Code::ALL.iter().enumerate() {
+            assert_eq!(*code as usize, index);
+        }
+    }
 
     #[test]
     fn a_row_puts_the_right_side_at_the_end() {
         let line = row(
-            &[part("", "feat-a"), part(MUTED, " — Add a parser")],
+            &[part(Code::None, "feat-a"), part(MUTED, " — Add a parser")],
             &[part(MUTED, "repo.feat-a"), part(MUTED, "3h")],
             40,
         );
@@ -394,7 +543,7 @@ mod tests {
     fn a_long_left_side_ends_with_an_ellipsis() {
         let line = row(
             &[
-                part("", "feat-a"),
+                part(Code::None, "feat-a"),
                 part(MUTED, " — a very long subject of a commit"),
             ],
             &[part(MUTED, "3h")],
@@ -410,7 +559,7 @@ mod tests {
     #[test]
     fn a_small_popup_drops_the_right_side() {
         let line = row(
-            &[part("", "feat-a")],
+            &[part(Code::None, "feat-a")],
             &[part(MUTED, "a-long-folder-name")],
             20,
         );
@@ -421,7 +570,7 @@ mod tests {
     #[test]
     fn the_first_parts_of_the_right_side_go_away_first() {
         let line = row(
-            &[part("", "feat/popup-design")],
+            &[part(Code::None, "feat/popup-design")],
             &[
                 part(MUTED, "herdr-worktrunk.feat-popup-design"),
                 part(MUTED, "↑1"),
@@ -439,14 +588,14 @@ mod tests {
     #[test]
     fn a_right_part_with_ansi_codes_counts_its_visible_width() {
         let diff = format!("{GREEN}+804{RESET} {RED}-163{RESET}");
-        let line = row(&[part("", "feat-a")], &[part("", diff)], 30);
+        let line = row(&[part(Code::None, "feat-a")], &[part(Code::None, diff)], 30);
 
         assert_eq!(visible(&line).width(), 30);
     }
 
     #[test]
     fn the_width_counts_a_wide_character_twice() {
-        let line = row(&[part("", "feat-a")], &[part(MUTED, "↑💬")], 30);
+        let line = row(&[part(Code::None, "feat-a")], &[part(MUTED, "↑💬")], 30);
 
         assert_eq!(visible(&line).width(), 30);
     }
