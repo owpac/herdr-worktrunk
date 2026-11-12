@@ -240,11 +240,27 @@ herdr runs `[[startup]]` when the server starts, and the event `pane.agent_detec
 
 `remove` and `merge` refuse a workspace where an agent works. If an action cannot work, a small popup gives the reason. The question has 2 buttons: `[ Cancel ]` and `[ Delete ]` (or `[ Merge ]`). `←` `→` change the button, `Enter` presses it, `y` confirms, `Esc` cancels.
 
+### Remove a worktree from another plugin
+
+Another plugin (for example herdr-omnibar) asks its own question, then runs this command:
+
+```sh
+bin/herdr-worktrunk remove --path <folder of the worktree> [--close-agents]
+```
+
+The command opens no popup. It removes the worktree with the rules of the cleaner: a record for the action restore, `wt remove` first, then the agents and the workspace close.
+
+- The path must be the root of a linked worktree: the command refuses a subfolder and the main checkout.
+- Without `--close-agents`, an agent in the worktree stops the removal.
+- With `--close-agents`, the idle agents close. An agent that works or waits for an answer stops the removal. Changes that are not committed also stop it.
+
+The command prints the result on stdout, with the exit code 0. A failed close of the workspace after the removal is part of this message. If the removal does not start or fails, the command prints the error on stderr, with the exit code 1.
+
 ### Restore a worktree
 
 ![The popup restore: the last removed worktrees, and what comes back](docs/restore.gif)
 
-Each removal of the plugin can come back: `Enter` and `ctrl-a` in the cleaner, the actions `remove` and `merge`, and the observer. Before the removal, the plugin records the worktree in `removed.jsonl`, in the state folder:
+Each removal of the plugin can come back: `Enter` and `ctrl-a` in the cleaner, the actions `remove` and `merge`, the command `remove --path`, and the observer. Before the removal, the plugin records the worktree in `removed.jsonl`, in the state folder:
 
 - its repository, its folder, its branch, and the commit of its branch,
 - its agents, with their sessions,
