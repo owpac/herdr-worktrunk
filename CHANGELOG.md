@@ -2,6 +2,12 @@
 
 The changes of each release of herdr-worktrunk. The workflow release-pr writes this file.
 
+## [2026.11.34](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.34) - 2026-11-12
+
+### Features
+
+- the popups take the colors of the herdr theme ([#36](https://github.com/owpac/herdr-worktrunk/pull/36))
+
 ## [2026.11.33](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.33) - 2026-11-12
 
 ### Features
