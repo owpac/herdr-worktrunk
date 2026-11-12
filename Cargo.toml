@@ -1,7 +1,7 @@
 [package]
 name = "herdr-worktrunk"
 # The version of the last release (YYYY.M.N): the workflow release-pr writes it.
-version = "2026.11.32"
+version = "2026.11.33"
 edition = "2021"
 # The oldest toolchain that the cargo fallback of scripts/install.sh supports.
 # File::try_lock (the single observer) needs 1.89.
