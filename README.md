@@ -248,7 +248,13 @@ Another plugin (for example herdr-omnibar) asks its own question, then runs this
 bin/herdr-worktrunk remove --path <folder of the worktree> [--close-agents]
 ```
 
-The command opens no popup. It removes the worktree with the rules of the cleaner: a record for the action restore, `wt remove` first, then the agents and the workspace close. It refuses the main checkout. Without `--close-agents`, an agent in the worktree stops the removal. With `--close-agents`, the agents close first, but changes that are not committed stop the removal. The command prints the result on stdout, or the error on stderr with the exit code 1.
+The command opens no popup. It removes the worktree with the rules of the cleaner: a record for the action restore, `wt remove` first, then the agents and the workspace close.
+
+- The path must be the root of a linked worktree: the command refuses a subfolder and the main checkout.
+- Without `--close-agents`, an agent in the worktree stops the removal.
+- With `--close-agents`, the idle agents close. An agent that works or waits for an answer stops the removal. Changes that are not committed also stop it.
+
+The command prints the result on stdout, with the exit code 0. A failed close of the workspace after the removal is part of this message. If the removal does not start or fails, the command prints the error on stderr, with the exit code 1.
 
 ### Restore a worktree
 

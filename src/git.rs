@@ -188,6 +188,29 @@ pub fn branch_commit(main_checkout: &Path, branch: &str) -> Option<String> {
     .ok()
 }
 
+/// Return true if `root` is a linked worktree: its git folder is not the
+/// common git folder of the repository. A main checkout, a submodule and a
+/// separate git folder give false.
+pub fn is_linked_worktree(root: &Path) -> bool {
+    run_in(
+        root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()
+    .and_then(|text| {
+        let mut lines = text.lines();
+        let git_dir = canonical(Path::new(lines.next()?));
+        let common_dir = canonical(Path::new(lines.next()?));
+        Some(git_dir != common_dir)
+    })
+    .unwrap_or(false)
+}
+
 /// Return true if the worktree `checkout` has no change that is not
 /// committed. With `--no-optional-locks`, git does not write the index:
 /// the check does not change the last activity of the worktree.

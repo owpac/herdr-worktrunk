@@ -281,11 +281,12 @@ fn main() -> ExitCode {
         }
         // A removal for another plugin: no popup, no notification. The
         // caller shows the message.
-        ["remove", "--path", path, options @ ..]
-            if options.iter().all(|option| *option == "--close-agents") =>
-        {
-            let close_agents = !options.is_empty();
-            return match actions::remove_from_command(Path::new(path), close_agents) {
+        ["remove", arguments @ ..] => {
+            let Some((path, close_agents)) = actions::parse_remove_arguments(arguments) else {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            };
+            return match actions::remove_from_command(&path, close_agents) {
                 Ok(message) => {
                     println!("{message}");
                     ExitCode::SUCCESS

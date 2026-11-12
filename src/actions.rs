@@ -421,7 +421,8 @@ fn ask_and_run() -> Result<(), Error> {
         "Delete the worktree",
         &format!("Deleting the worktree of {branch}…"),
     );
-    remove_checkout(&checkout, workspace_id.as_deref(), &agents)
+    remove_checkout(&checkout, workspace_id.as_deref(), &agents)?;
+    close_after_checkout(&checkout, workspace_id.as_deref(), &agents)
 }
 
 /// The agents that a removal closes first, or an error if the removal
@@ -461,28 +462,39 @@ fn agents_for_removal(
 }
 
 /// Remove the worktree `checkout`: record the removal for the action
-/// restore, remove the worktree with wt, then close its agents and its
-/// workspace.
+/// restore, then remove the worktree with wt. Return true if the action
+/// restore has a record: a detached HEAD has none.
+///
+/// wt runs before the close of the agents and of the workspace (see
+/// `close_after_checkout`): a popup in the workspace of the worktree stops
+/// at this close. wt refuses changes that are not committed: then nothing
+/// closes.
 fn remove_checkout(
     checkout: &Checkout,
     workspace_id: Option<&str>,
     agents: &[WorktreeAgent],
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let removal = record_removal(
         &checkout.main_checkout(),
         &checkout.root,
         agents,
         workspace_id,
     );
-    // wt first: this popup can run in the workspace of the worktree, and
-    // the close of the workspace stops it. wt refuses changes that are not
-    // committed: then nothing closes.
     if let Err(error) = wt::remove_quietly(&checkout.main_checkout(), &checkout.root) {
         if let Some(removal) = &removal {
             restore::forget(&crate::state_dir(), removal);
         }
         return Err(error);
     }
+    Ok(removal.is_some())
+}
+
+/// Close the agents and the workspace of a removed worktree.
+fn close_after_checkout(
+    checkout: &Checkout,
+    workspace_id: Option<&str>,
+    agents: &[WorktreeAgent],
+) -> Result<(), Error> {
     // An agent can start after the question: read the agents again.
     let agents = herdr::snapshot()
         .map(|snapshot| leftover::agents_of(&snapshot, &checkout.root, workspace_id))
@@ -494,17 +506,46 @@ fn remove_checkout(
     Ok(())
 }
 
+/// The arguments of the command `remove`: `--path <worktree>` and the
+/// option `--close-agents`, in any order. None for other arguments.
+pub fn parse_remove_arguments(arguments: &[&str]) -> Option<(PathBuf, bool)> {
+    let mut path = None;
+    let mut close_agents = false;
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        match *argument {
+            "--path" if path.is_none() => {
+                let value = rest.next().filter(|value| !value.starts_with("--"))?;
+                path = Some(PathBuf::from(value));
+            }
+            "--close-agents" if !close_agents => close_agents = true,
+            _ => return None,
+        }
+    }
+    Some((path?, close_agents))
+}
+
 /// Command `remove --path <worktree> [--close-agents]`: remove a worktree
 /// without a popup, for another plugin (herdr-omnibar). The other plugin
 /// asks the question itself. The removal follows the rules of the
 /// cleaner: a record for the action restore, wt first, then the agents
 /// and the workspace close. Return the message of the result.
 ///
-/// Without `close_agents`, an agent in the worktree stops the removal.
+/// The path must be the root of a linked worktree. Without
+/// `close_agents`, an agent in the worktree stops the removal. With
+/// `close_agents`, the idle agents close, but an agent that works or waits
+/// for an answer stops the removal: the caller cannot see it.
 pub fn remove_from_command(path: &Path, close_agents: bool) -> Result<String, Error> {
     let checkout = git::checkout_of(path)
         .ok_or_else(|| Error::Command(format!("{} is not a git checkout.", path.display())))?;
-    if git::canonical(&checkout.root) == git::canonical(&checkout.main_checkout()) {
+    if git::canonical(path) != git::canonical(&checkout.root) {
+        return Err(Error::Command(format!(
+            "{} is not the root of its worktree ({}).",
+            path.display(),
+            checkout.root.display()
+        )));
+    }
+    if !git::is_linked_worktree(&checkout.root) {
         return Err(Error::Command(format!(
             "{} is the main checkout of its repository: it is not a worktree to remove.",
             checkout.root.display()
@@ -512,11 +553,29 @@ pub fn remove_from_command(path: &Path, close_agents: bool) -> Result<String, Er
     }
     let workspace_id = herdr::workspace_of_checkout(&checkout.root)?;
     let agents = agents_for_removal(&checkout, workspace_id.as_deref(), close_agents)?;
-    let (branch, folder_name) = describe(&checkout);
-    remove_checkout(&checkout, workspace_id.as_deref(), &agents)?;
-    Ok(format!(
-        "Removed the worktree of {branch} ({folder_name}). The action restore brings it back."
-    ))
+    if !agents.iter().all(WorktreeAgent::is_idle) {
+        return Err(Error::Command(
+            "An agent works in this worktree, or waits for an answer. Stop it first: the removal closes it."
+                .to_owned(),
+        ));
+    }
+    let folder_name = git::folder_name(&checkout.root);
+    let name = match git::branch_of(&checkout.root) {
+        Some(branch) => format!("the worktree of {branch} ({folder_name})"),
+        None => format!("the worktree {folder_name}"),
+    };
+    let recorded = remove_checkout(&checkout, workspace_id.as_deref(), &agents)?;
+    let mut message = format!("Removed {name}.");
+    message.push_str(if recorded {
+        " The action restore brings it back."
+    } else {
+        " It has no branch: the action restore cannot bring it back."
+    });
+    // The worktree is gone: a failed close is not a failed removal.
+    if let Err(error) = close_after_checkout(&checkout, workspace_id.as_deref(), &agents) {
+        message.push_str(&format!(" Its workspace did not close: {error}"));
+    }
+    Ok(message)
 }
 
 /// Close the agents of a removed worktree whose pane is in another
@@ -1198,14 +1257,56 @@ mod tests {
     use crate::test_support::{git_in, test_folder};
 
     #[test]
-    fn the_command_remove_refuses_a_folder_outside_git_and_the_main_checkout() {
-        let folder = test_folder("remove-command");
-        let error = remove_from_command(&folder, false).unwrap_err();
-        assert!(error.to_string().contains("is not a git checkout"));
-        git_in(&folder, &["init", "-q", "-b", "main"]);
-        let error = remove_from_command(&folder, true).unwrap_err();
-        assert!(error.to_string().contains("is the main checkout"));
-        let _ = std::fs::remove_dir_all(&folder);
+    fn the_command_remove_refuses_a_missing_folder_a_main_checkout_and_a_subfolder() {
+        let base = test_folder("remove-command");
+        let main = base.join("repo");
+        let worktree = base.join("repo.feature");
+        std::fs::create_dir_all(&main).unwrap();
+        git_in(&main, &["init", "-q", "-b", "main"]);
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "start"]);
+        git_in(
+            &main,
+            &["worktree", "add", "-q", "-b", "feature", "../repo.feature"],
+        );
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        let missing = remove_from_command(&base.join("missing"), false);
+        let of_main = remove_from_command(&main, true);
+        let of_subfolder = remove_from_command(&worktree.join("src"), true);
+        let linked = git::is_linked_worktree(&worktree);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("is not a git checkout"));
+        assert!(of_main
+            .unwrap_err()
+            .to_string()
+            .contains("is the main checkout"));
+        assert!(of_subfolder
+            .unwrap_err()
+            .to_string()
+            .contains("is not the root"));
+        assert!(linked);
+    }
+
+    #[test]
+    fn the_arguments_of_remove_come_in_any_order() {
+        let path = PathBuf::from("/work/repo.feature");
+        assert_eq!(
+            parse_remove_arguments(&["--path", "/work/repo.feature"]),
+            Some((path.clone(), false))
+        );
+        assert_eq!(
+            parse_remove_arguments(&["--close-agents", "--path", "/work/repo.feature"]),
+            Some((path, true))
+        );
+        assert_eq!(parse_remove_arguments(&["--path", "--close-agents"]), None);
+        assert_eq!(parse_remove_arguments(&["--close-agents"]), None);
+        assert_eq!(
+            parse_remove_arguments(&["--path", "/a", "--close-agents", "--close-agents"]),
+            None
+        );
+        assert_eq!(parse_remove_arguments(&["--path", "/a", "--force"]), None);
     }
 
     #[test]
