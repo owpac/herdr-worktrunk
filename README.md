@@ -177,7 +177,7 @@ bin/herdr-worktrunk list-stale <folder of the repository>
 
 The plugin starts an observer with herdr. Every 2 seconds, it reads the state of herdr:
 
-1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell.
+1. **The pane follows its agent.** An agent that enters another checkout of the same repository moves to the workspace of this checkout, for example after `/worktrunk:wt-switch-create`. A new workspace with only one shell gets the pane of the agent in place of this shell. If the pane of the agent is the last pane of its old workspace, the observer first opens a shell there: the workspace of a main checkout and the workspace of a worktree stay. The workspace of a worktree closes only after the removal of the worktree.
 2. **The workspace of a removed worktree closes**, if no agent works in it.
 3. **The worktrees of the finished work go away**, with `prune_merged = true`. Every 5 minutes, a thread checks the repositories of the herdr workspaces: the finished pull requests, and the branches in the default branch.
 4. **The worktrees to clean**, with `stale_days = <days>`: when a worktree has no pull request and no activity for `stale_days` days, a herdr notification names it. Open the cleaner to delete it. The thread names a worktree again only after `stale_days` days. A worktree where an idle agent waits counts too: the notification tells it, and the cleaner shows it in the group Waiting. The check needs a forge with a backend, or no remote `origin`.

@@ -6,7 +6,10 @@
 //! 1. If an agent works in another checkout of the same repository than
 //!    its workspace (for example, Claude Code entered a worktree), the
 //!    observer moves the pane of the agent to the workspace of this
-//!    checkout. herdr opens the workspace if necessary.
+//!    checkout. herdr opens the workspace if necessary. If the pane is
+//!    the last pane of its old workspace, the observer first opens a shell
+//!    there: a workspace of a main checkout or of an existing worktree
+//!    stays.
 //! 2. If the worktree of a workspace is removed (`wt remove`, `wt merge`)
 //!    and no agent works in the workspace, the observer closes it.
 //!
@@ -183,26 +186,49 @@ struct FreshShell {
     tab_id: String,
 }
 
-/// Return true if the move of `pane_id` out of the workspace
-/// `workspace_id` empties a workspace of a main checkout.
+/// A workspace that must stay after the move of its last pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeptWorkspace {
+    /// The workspace of a main checkout: the first workspace of the group
+    /// of its project. Without it, the workspaces of the worktrees leave
+    /// the group.
+    Main,
+    /// The workspace of a linked worktree that still exists: 1 git
+    /// worktree = 1 herdr workspace. The rule 2 closes it after the
+    /// removal of the worktree.
+    Worktree,
+}
+
+/// Return the kind of the workspace `workspace_id` if the move of
+/// `pane_id` empties it, and if this workspace must stay.
 ///
-/// herdr closes a workspace without pane. The workspace of a main checkout
-/// is the first workspace of the group of its project: without it, the
-/// workspaces of the worktrees leave the group. Thus the observer opens a
-/// shell in it first.
-fn empties_main_workspace(
+/// herdr closes a workspace without pane. Thus the observer opens a shell
+/// in a workspace that must stay, before it moves its last pane.
+/// `checkout_exists` tells if the folder of the workspace still exists: a
+/// removed worktree does not keep its workspace.
+fn kept_after_move(
     first: Option<&FirstCheckout>,
+    checkout_exists: bool,
     workspace_id: &str,
     pane_id: &str,
     panes: &[Pane],
-) -> bool {
-    let is_main = first.is_some_and(|first| first.root.is_some() && !first.is_linked_worktree);
+) -> Option<KeptWorkspace> {
+    let first = first.filter(|first| first.root.is_some())?;
     let mut panes = panes
         .iter()
         .filter(|pane| pane.workspace_id == workspace_id);
     let is_last_pane =
         panes.next().is_some_and(|only| only.pane_id == pane_id) && panes.next().is_none();
-    is_main && is_last_pane
+    if !is_last_pane {
+        return None;
+    }
+    if !first.is_linked_worktree {
+        Some(KeptWorkspace::Main)
+    } else if checkout_exists {
+        Some(KeptWorkspace::Worktree)
+    } else {
+        None
+    }
 }
 
 /// Return the only pane of a new workspace, if this pane is a shell
@@ -566,8 +592,9 @@ impl Observer {
     /// If a workspace shows this checkout, the pane goes to a new tab of
     /// it, or replaces its shell if the workspace is new (see
     /// `fresh_shell`). Else, herdr opens the workspace, and the pane
-    /// replaces its first shell. herdr closes the old workspace if the
-    /// pane was its last pane.
+    /// replaces its first shell. If the pane is the last pane of its old
+    /// workspace, the observer first opens a shell there when this
+    /// workspace must stay (see `kept_after_move`). Else herdr closes it.
     ///
     /// `panes` is the copy of the panes of the snapshot: each change of
     /// this function updates it.
@@ -580,12 +607,26 @@ impl Observer {
         panes: &mut Vec<Pane>,
     ) -> Result<(), Error> {
         let source_first = self.workspaces.get(source_workspace);
-        if empties_main_workspace(source_first, source_workspace, pane_id, panes) {
+        let checkout_exists = source_first
+            .and_then(|first| first.root.as_deref())
+            .is_some_and(Path::exists);
+        let kept = kept_after_move(
+            source_first,
+            checkout_exists,
+            source_workspace,
+            pane_id,
+            panes,
+        );
+        if let Some(kept) = kept {
             if let Some(root) = source_first.and_then(|first| first.root.clone()) {
                 herdr::open_shell_tab(source_workspace, &root)?;
                 panes.push(opened_shell(source_workspace, &root));
+                let reason = match kept {
+                    KeptWorkspace::Main => "it keeps the group of its project",
+                    KeptWorkspace::Worktree => "it keeps the workspace of its worktree",
+                };
                 self.log.write(&format!(
-                    "opened a shell in the workspace {source_workspace}: it keeps the group of its project"
+                    "opened a shell in the workspace {source_workspace}: {reason}"
                 ));
             }
         }
@@ -1702,11 +1743,20 @@ mod tests {
             pane("w1:p2", "w1", Some("claude")),
         ];
 
-        assert!(!empties_main_workspace(Some(&first), "w1", "w1:p1", &panes));
+        assert_eq!(
+            kept_after_move(Some(&first), true, "w1", "w1:p1", &panes),
+            None
+        );
         set_workspace(&mut panes, "w1:p1", "w2");
-        assert!(empties_main_workspace(Some(&first), "w1", "w1:p2", &panes));
+        assert_eq!(
+            kept_after_move(Some(&first), true, "w1", "w1:p2", &panes),
+            Some(KeptWorkspace::Main)
+        );
         panes.push(opened_shell("w1", Path::new("/work/repo")));
-        assert!(!empties_main_workspace(Some(&first), "w1", "w1:p2", &panes));
+        assert_eq!(
+            kept_after_move(Some(&first), true, "w1", "w1:p2", &panes),
+            None
+        );
     }
 
     #[test]
@@ -1783,7 +1833,10 @@ mod tests {
         let main = first_checkout(Some("/work/repo"));
         let panes = [pane("w1:p1", "w1", Some("claude"))];
 
-        assert!(empties_main_workspace(Some(&main), "w1", "w1:p1", &panes));
+        assert_eq!(
+            kept_after_move(Some(&main), true, "w1", "w1:p1", &panes),
+            Some(KeptWorkspace::Main)
+        );
     }
 
     #[test]
@@ -1794,21 +1847,40 @@ mod tests {
             pane("w1:p2", "w1", None),
         ];
 
-        assert!(!empties_main_workspace(Some(&main), "w1", "w1:p1", &panes));
+        assert_eq!(
+            kept_after_move(Some(&main), true, "w1", "w1:p1", &panes),
+            None
+        );
     }
 
     #[test]
-    fn a_worktree_workspace_can_close_after_its_last_pane() {
+    fn the_last_pane_of_an_existing_worktree_workspace_leaves_a_shell() {
+        // The agent leaves the worktree: the workspace of the worktree
+        // stays until the removal of the worktree.
         let worktree = first_checkout(Some("/work/repo.feature"));
         let panes = [pane("w2:p1", "w2", Some("claude"))];
 
-        assert!(!empties_main_workspace(
-            Some(&worktree),
-            "w2",
-            "w2:p1",
-            &panes
-        ));
-        assert!(!empties_main_workspace(None, "w2", "w2:p1", &panes));
+        assert_eq!(
+            kept_after_move(Some(&worktree), true, "w2", "w2:p1", &panes),
+            Some(KeptWorkspace::Worktree)
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_or_an_unknown_workspace_can_close_after_its_last_pane() {
+        let worktree = first_checkout(Some("/work/repo.feature"));
+        let panes = [pane("w2:p1", "w2", Some("claude"))];
+
+        assert_eq!(
+            kept_after_move(Some(&worktree), false, "w2", "w2:p1", &panes),
+            None
+        );
+        assert_eq!(kept_after_move(None, true, "w2", "w2:p1", &panes), None);
+        let outside_git = first_checkout(None);
+        assert_eq!(
+            kept_after_move(Some(&outside_git), true, "w2", "w2:p1", &panes),
+            None
+        );
     }
 
     #[test]
