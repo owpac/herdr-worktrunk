@@ -47,7 +47,7 @@ use crate::forge::Provider;
 use crate::git;
 use crate::herdr::Snapshot;
 use crate::prune::{BranchStatus, KeptWhy};
-use crate::style::{ACCENT, DIM, GREEN, RED, YELLOW};
+use crate::style::{Code, ACCENT, DIM, GREEN, RED, YELLOW};
 
 /// The days without activity before a merged worktree without own commit
 /// is a leftover: a new worktree has the commit of the default branch, so
@@ -656,7 +656,7 @@ pub enum Mark {
 }
 
 impl Mark {
-    pub fn glyph(self) -> (&'static str, &'static str) {
+    pub fn glyph(self) -> (Code, &'static str) {
         match self {
             Mark::Pass => (GREEN, "✓"),
             Mark::Fail => (RED, "✗"),

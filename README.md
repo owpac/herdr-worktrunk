@@ -309,6 +309,10 @@ fetch_before_check = false
 
 The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`, `popup_size` and `fetch_before_check`.
 
+### Colors
+
+The popups take the colors of the herdr theme, like herdr-omnibar. herdr gives no color to its plugins: the plugin reads `[theme]` and `[ui] accent` in the config of herdr (`HERDR_CONFIG_PATH`, else `~/.config/herdr/config.toml`). It builds the palette with the rules of herdr: the theme `name` (catppuccin by default), `dark_name` and `light_name` with `auto_switch`, `[theme.custom]`, then `[theme.custom.dark]` or `[theme.custom.light]`. With `auto_switch`, the plugin asks macOS for its appearance. With the theme `terminal`, the popups use the ANSI colors of the terminal. Each popup reads the config when it opens: after a change of theme, the next popup has the new colors.
+
 ## Requirements
 
 - herdr 0.9.0 or later, on macOS or Linux.
