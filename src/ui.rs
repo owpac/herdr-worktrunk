@@ -22,48 +22,44 @@ const SHOW_CURSOR: &str = "\x1b[?25h";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
-/// The text on a colored background: the background of the panels of
-/// herdr, else black.
-fn on_color() -> theme::Color {
-    match theme::palette().panel_bg {
+/// The palette of the herdr theme.
+fn palette() -> &'static theme::Palette {
+    &theme::current().palette
+}
+
+/// A selected button: bold text on a color. The text takes the background of the panels of herdr,
+/// dark on a dark theme and light on a light theme, else black: it contrasts with the color.
+fn button_on(background: theme::Color) -> String {
+    let text = match palette().panel_bg {
         theme::Color::Reset => theme::Color::Black,
         color => color,
-    }
+    };
+    format!("{BOLD}{}{}", text.foreground(), background.background())
 }
 
-/// The selected button: the dark text on the accent.
+/// The selected button.
 fn selected_style() -> String {
-    let palette = theme::palette();
-    format!(
-        "{BOLD}{}{}",
-        on_color().foreground(),
-        palette.accent.background()
-    )
+    button_on(palette().accent)
 }
 
-/// The selected button that deletes or changes work: the dark text on red.
+/// The selected button that deletes or changes work.
 fn danger_selected_style() -> String {
-    let palette = theme::palette();
-    format!(
-        "{BOLD}{}{}",
-        on_color().foreground(),
-        palette.red.background()
-    )
+    button_on(palette().red)
 }
 
 /// A button that deletes or changes work, not selected.
 fn danger_style() -> String {
-    theme::palette().red.foreground()
+    palette().red.foreground()
 }
 
 /// The title of a box.
 fn title_style() -> String {
-    format!("{BOLD}{}", theme::palette().accent.foreground())
+    format!("{BOLD}{}", palette().accent.foreground())
 }
 
 /// The hint under the buttons.
 fn hint_style() -> String {
-    theme::palette().overlay0.foreground()
+    palette().overlay0.foreground()
 }
 
 /// A button of a box.

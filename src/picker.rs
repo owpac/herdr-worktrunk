@@ -541,6 +541,7 @@ pub fn pick(repository: &Path) -> Result<Option<Picked>, Error> {
             style::terminal_columns().to_string(),
         )
         .env(CURRENT_VARIABLE, repository)
+        .envs(style::theme_environment())
         .args(style::fzf_arguments(
             GHOST,
             &git::folder_name(&main_checkout),

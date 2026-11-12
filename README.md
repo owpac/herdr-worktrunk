@@ -311,7 +311,9 @@ The plugin reads only the top-level keys `observe`, `prune_merged`, `stale_days`
 
 ### Colors
 
-The popups take the colors of the herdr theme, like herdr-omnibar. herdr gives no color to its plugins: the plugin reads `[theme]` and `[ui] accent` in the config of herdr (`HERDR_CONFIG_PATH`, else `~/.config/herdr/config.toml`). It builds the palette with the rules of herdr: the theme `name` (catppuccin by default), `dark_name` and `light_name` with `auto_switch`, `[theme.custom]`, then `[theme.custom.dark]` or `[theme.custom.light]`. With `auto_switch`, the plugin asks macOS for its appearance. With the theme `terminal`, the popups use the ANSI colors of the terminal. Each popup reads the config when it opens: after a change of theme, the next popup has the new colors.
+The popups take the colors of the herdr theme, like herdr-omnibar. herdr gives no color to its plugins: the plugin reads `[theme]` and `[ui] accent` in the config of herdr (`HERDR_CONFIG_PATH`, else `~/.config/herdr/config.toml`). It builds the palette with the rules of herdr: the theme `name` (catppuccin by default), `dark_name` and `light_name` with `auto_switch`, `[theme.custom]`, then `[theme.custom.dark]` or `[theme.custom.light]`. With the theme `terminal`, the popups use the ANSI colors of the terminal, and fixed greys for the secondary text, the rules and the selected row. Each popup reads the config when it opens: after a change of theme, the next popup has the new colors.
+
+With `auto_switch`, herdr asks the terminal for its appearance (dark or light), but the plugin asks macOS. If the appearance of the terminal differs from the appearance of macOS, the popups can use the other theme of the pair. On Linux, the plugin takes the dark theme. A key with a wrong type in the config of herdr stays without effect.
 
 ## Requirements
 

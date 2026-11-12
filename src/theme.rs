@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use serde::Deserialize;
+use toml::{Table, Value};
 
 /// A color of herdr: the default color of the terminal, an ANSI color, or an RGB color. The names
 /// are the names of ratatui, that herdr uses.
@@ -38,11 +38,14 @@ pub enum Color {
     LightMagenta,
     LightCyan,
     White,
+    /// A color of the 256 colors of the terminal.
+    Indexed(u8),
     Rgb(u8, u8, u8),
 }
 
 impl Color {
-    /// The number of an ANSI color, from 0 to 15, as ratatui gives it to the terminal.
+    /// The number of an ANSI color, as ratatui gives it to the terminal: 0 to 15 for a named color,
+    /// or the number of a 256 color.
     fn ansi(self) -> Option<u8> {
         Some(match self {
             Color::Black => 0,
@@ -61,6 +64,7 @@ impl Color {
             Color::LightMagenta => 13,
             Color::LightCyan => 14,
             Color::White => 15,
+            Color::Indexed(number) => number,
             Color::Reset | Color::Rgb(..) => return None,
         })
     }
@@ -593,124 +597,38 @@ impl Palette {
         })
     }
 
-    /// Replace the colors that the config gives.
-    fn apply(&mut self, colors: &Colors) {
-        if let Some(color) = &colors.accent {
-            self.accent = parse_color(color);
-        }
-        if let Some(color) = &colors.panel_bg {
-            self.panel_bg = parse_color(color);
-        }
-        if let Some(color) = &colors.sidebar_bg {
-            self.sidebar_bg = parse_color(color);
-        }
-        if let Some(color) = &colors.active_row_bg {
-            self.active_row_bg = parse_color(color);
-        }
-        if let Some(color) = &colors.selection_bg {
-            self.selection_bg = parse_color(color);
-        }
-        if let Some(color) = &colors.surface0 {
-            self.surface0 = parse_color(color);
-        }
-        if let Some(color) = &colors.surface1 {
-            self.surface1 = parse_color(color);
-        }
-        if let Some(color) = &colors.surface_dim {
-            self.surface_dim = parse_color(color);
-        }
-        if let Some(color) = &colors.overlay0 {
-            self.overlay0 = parse_color(color);
-        }
-        if let Some(color) = &colors.overlay1 {
-            self.overlay1 = parse_color(color);
-        }
-        if let Some(color) = &colors.text {
-            self.text = parse_color(color);
-        }
-        if let Some(color) = &colors.subtext0 {
-            self.subtext0 = parse_color(color);
-        }
-        if let Some(color) = &colors.mauve {
-            self.mauve = parse_color(color);
-        }
-        if let Some(color) = &colors.green {
-            self.green = parse_color(color);
-        }
-        if let Some(color) = &colors.yellow {
-            self.yellow = parse_color(color);
-        }
-        if let Some(color) = &colors.red {
-            self.red = parse_color(color);
-        }
-        if let Some(color) = &colors.blue {
-            self.blue = parse_color(color);
-        }
-        if let Some(color) = &colors.teal {
-            self.teal = parse_color(color);
-        }
-        if let Some(color) = &colors.peach {
-            self.peach = parse_color(color);
+    /// Replace the colors that a table of the config gives: `[theme.custom]`, or its table `dark`
+    /// or `light`. A key that is not a string, or not a color of the palette, stays without effect.
+    fn apply(&mut self, table: &Table) {
+        for (key, value) in table {
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            let color = parse_color(text);
+            match key.as_str() {
+                "accent" => self.accent = color,
+                "panel_bg" => self.panel_bg = color,
+                "sidebar_bg" => self.sidebar_bg = color,
+                "active_row_bg" => self.active_row_bg = color,
+                "selection_bg" => self.selection_bg = color,
+                "surface0" => self.surface0 = color,
+                "surface1" => self.surface1 = color,
+                "surface_dim" => self.surface_dim = color,
+                "overlay0" => self.overlay0 = color,
+                "overlay1" => self.overlay1 = color,
+                "text" => self.text = color,
+                "subtext0" => self.subtext0 = color,
+                "mauve" => self.mauve = color,
+                "green" => self.green = color,
+                "yellow" => self.yellow = color,
+                "red" => self.red = color,
+                "blue" => self.blue = color,
+                "teal" => self.teal = color,
+                "peach" => self.peach = color,
+                _ => {}
+            }
         }
     }
-}
-
-/// The colors of `[theme.custom]`, `[theme.custom.dark]` and `[theme.custom.light]`.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-struct Colors {
-    accent: Option<String>,
-    panel_bg: Option<String>,
-    sidebar_bg: Option<String>,
-    active_row_bg: Option<String>,
-    selection_bg: Option<String>,
-    surface0: Option<String>,
-    surface1: Option<String>,
-    surface_dim: Option<String>,
-    overlay0: Option<String>,
-    overlay1: Option<String>,
-    text: Option<String>,
-    subtext0: Option<String>,
-    mauve: Option<String>,
-    green: Option<String>,
-    yellow: Option<String>,
-    red: Option<String>,
-    blue: Option<String>,
-    teal: Option<String>,
-    peach: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-struct Custom {
-    #[serde(flatten)]
-    colors: Colors,
-    dark: Option<Colors>,
-    light: Option<Colors>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-struct Theme {
-    name: Option<String>,
-    auto_switch: bool,
-    dark_name: Option<String>,
-    light_name: Option<String>,
-    custom: Option<Custom>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-struct Ui {
-    accent: Option<String>,
-}
-
-/// The parts of the config of herdr that give its colors.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-struct HerdrConfig {
-    theme: Theme,
-    ui: Ui,
 }
 
 /// The canonical name of a theme, with the aliases of herdr.
@@ -807,66 +725,96 @@ fn parse_color(text: &str) -> Color {
     }
 }
 
-/// The palette of a config of herdr. `dark` tells the appearance of the host, for `auto_switch`.
-fn resolve(text: &str, dark: bool) -> Palette {
-    let config: HerdrConfig = toml::from_str(text).unwrap_or_default();
-    let theme = &config.theme;
-    let manual = theme
-        .name
-        .clone()
-        .unwrap_or_else(|| "catppuccin".to_string());
-    let (default_dark, default_light) = siblings(&manual);
-    let custom = theme.custom.as_ref();
-    let (name, fallback, mode) = match (theme.auto_switch, dark) {
-        (true, true) => (
-            theme
-                .dark_name
-                .clone()
-                .unwrap_or_else(|| default_dark.to_string()),
-            "catppuccin",
-            custom.and_then(|custom| custom.dark.as_ref()),
-        ),
-        (true, false) => (
-            theme
-                .light_name
-                .clone()
-                .unwrap_or_else(|| default_light.to_string()),
-            "catppuccin-latte",
-            custom.and_then(|custom| custom.light.as_ref()),
-        ),
-        (false, _) => (manual.clone(), "catppuccin", None),
+/// A theme of herdr: its palette, and true for the theme `terminal`. The theme `terminal` uses the
+/// ANSI colors of the terminal: the roles of the popups then keep fixed greys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Theme {
+    pub palette: Palette,
+    pub terminal: bool,
+}
+
+/// The variable that gives the appearance of the host (dark or light) to the processes that a
+/// popup starts: they do not ask macOS again.
+pub const APPEARANCE_VARIABLE: &str = "THEME_HOST_APPEARANCE";
+
+/// The appearance of the host, if a popup asked it: only `auto_switch` asks it.
+static HOST_IS_DARK: OnceLock<bool> = OnceLock::new();
+
+/// The appearance to give to the processes of a popup: "dark", "light", or None if the popup did
+/// not ask it.
+pub fn appearance() -> Option<&'static str> {
+    HOST_IS_DARK
+        .get()
+        .map(|dark| if *dark { "dark" } else { "light" })
+}
+
+/// A string of a table of the config.
+fn text_of<'a>(table: Option<&'a Table>, key: &str) -> Option<&'a str> {
+    table?.get(key)?.as_str()
+}
+
+/// A table of a table of the config.
+fn table_of<'a>(table: Option<&'a Table>, key: &str) -> Option<&'a Table> {
+    table?.get(key)?.as_table()
+}
+
+/// The theme of a config of herdr. `host_is_dark` gives the appearance of the host: only
+/// `auto_switch` asks it.
+fn resolve(text: &str, host_is_dark: impl FnOnce() -> bool) -> Theme {
+    // A config with a wrong syntax gives the defaults, like herdr. A key with a wrong type stays
+    // without effect: the other keys still count.
+    let config: Table = toml::from_str(text).unwrap_or_default();
+    let theme = table_of(Some(&config), "theme");
+    let custom = table_of(theme, "custom");
+    let manual = text_of(theme, "name").unwrap_or("catppuccin");
+    let auto_switch = theme
+        .and_then(|theme| theme.get("auto_switch"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (name, fallback, mode) = if !auto_switch {
+        (manual, "catppuccin", None)
+    } else {
+        let (default_dark, default_light) = siblings(manual);
+        if host_is_dark() {
+            let name = text_of(theme, "dark_name").unwrap_or(default_dark);
+            (name, "catppuccin", Some("dark"))
+        } else {
+            let name = text_of(theme, "light_name").unwrap_or(default_light);
+            (name, "catppuccin-latte", Some("light"))
+        }
     };
-    let mut palette = Palette::from_name(&name)
+    let mut palette = Palette::from_name(name)
         .or_else(|| Palette::from_name(fallback))
         .unwrap_or_else(Palette::catppuccin);
     if let Some(custom) = custom {
-        palette.apply(&custom.colors);
+        palette.apply(custom);
     }
     // [ui] accent is the old key of the accent: herdr uses it if it is not cyan and if
     // [theme.custom] has no accent.
-    if let Some(accent) = config.ui.accent.as_deref() {
-        if accent != "cyan"
-            && custom
-                .and_then(|custom| custom.colors.accent.as_ref())
-                .is_none()
-        {
+    if let Some(accent) = text_of(table_of(Some(&config), "ui"), "accent") {
+        if accent != "cyan" && text_of(custom, "accent").is_none() {
             palette.accent = parse_color(accent);
         }
     }
-    if let Some(mode) = mode {
+    if let Some(mode) = mode.and_then(|mode| table_of(custom, mode)) {
         palette.apply(mode);
     }
-    palette
+    Theme {
+        palette,
+        terminal: canonical_name(name) == Some("terminal"),
+    }
 }
 
-/// The config file of herdr: HERDR_CONFIG_PATH, else config.toml in the config folder of herdr.
+/// The config file of herdr: HERDR_CONFIG_PATH, else config.toml in the config folder of herdr
+/// (XDG_CONFIG_HOME, else ~/.config).
 fn config_path() -> PathBuf {
-    if let Some(path) = env::var_os("HERDR_CONFIG_PATH") {
+    let set = |name: &str| env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(path) = set("HERDR_CONFIG_PATH") {
         return PathBuf::from(path);
     }
-    let folder = match env::var_os("XDG_CONFIG_HOME") {
+    let folder = match set("XDG_CONFIG_HOME") {
         Some(folder) => PathBuf::from(folder),
-        None => env::var_os("HOME")
+        None => set("HOME")
             .map(|home| PathBuf::from(home).join(".config"))
             .unwrap_or_default(),
     };
@@ -874,32 +822,36 @@ fn config_path() -> PathBuf {
 }
 
 /// True if the host is dark. herdr asks the terminal: the popup asks macOS, else it says dark,
-/// like herdr without an answer.
+/// like herdr without an answer. A process that a popup starts gets the answer in a variable.
 fn host_is_dark() -> bool {
-    if !cfg!(target_os = "macos") {
-        return true;
-    }
-    Command::new("defaults")
-        .args(["read", "-g", "AppleInterfaceStyle"])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "Dark")
-        .unwrap_or(true)
+    *HOST_IS_DARK.get_or_init(|| match env::var(APPEARANCE_VARIABLE).as_deref() {
+        Ok("dark") => true,
+        Ok("light") => false,
+        _ if !cfg!(target_os = "macos") => true,
+        _ => Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "Dark")
+            .unwrap_or(true),
+    })
 }
 
-/// The palette of the running herdr, from its config file.
-pub fn load() -> Palette {
+/// The theme of the running herdr, from its config file.
+pub fn load() -> Theme {
     let text = fs::read_to_string(config_path()).unwrap_or_default();
-    let auto = text.contains("auto_switch");
-    resolve(&text, !auto || host_is_dark())
+    resolve(&text, host_is_dark)
 }
 
-/// The palette of the popups, read one time for each process. The tests use the palette dracula:
+/// The theme of the popups, read one time for each process. The tests use the palette dracula:
 /// the config of the machine does not change them.
-pub fn palette() -> &'static Palette {
-    static PALETTE: OnceLock<Palette> = OnceLock::new();
-    PALETTE.get_or_init(|| {
+pub fn current() -> &'static Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(|| {
         if cfg!(test) {
-            Palette::dracula()
+            Theme {
+                palette: Palette::dracula(),
+                terminal: false,
+            }
         } else {
             load()
         }
@@ -912,15 +864,15 @@ mod tests {
 
     #[test]
     fn the_theme_of_the_config_gives_its_palette() {
-        let palette = resolve("[theme]\nname = \"dracula\"\n", true);
+        let palette = resolve("[theme]\nname = \"dracula\"\n", || true).palette;
         assert_eq!(palette.accent, Color::Rgb(189, 147, 249));
-        assert_eq!(resolve("", true), Palette::catppuccin());
+        assert_eq!(resolve("", || true).palette, Palette::catppuccin());
         assert_eq!(
-            resolve("[theme]\nname = \"unknown\"\n", true),
+            resolve("[theme]\nname = \"unknown\"\n", || true).palette,
             Palette::catppuccin()
         );
         assert_eq!(
-            resolve("[theme]\nname = \"Tokyo Night\"\n", true),
+            resolve("[theme]\nname = \"Tokyo Night\"\n", || true).palette,
             Palette::tokyo_night()
         );
     }
@@ -928,7 +880,7 @@ mod tests {
     #[test]
     fn the_custom_colors_and_the_accent_of_ui_change_the_palette() {
         let text = "[theme]\nname = \"nord\"\n[theme.custom]\nred = \"#ff0000\"\ngreen = \"rgb(1, 2, 3)\"\n[ui]\naccent = \"#0f0\"\n";
-        let palette = resolve(text, true);
+        let palette = resolve(text, || true).palette;
         assert_eq!(palette.red, Color::Rgb(255, 0, 0));
         assert_eq!(palette.green, Color::Rgb(1, 2, 3));
         assert_eq!(palette.accent, Color::Rgb(0, 255, 0));
@@ -936,10 +888,21 @@ mod tests {
     }
 
     #[test]
+    fn a_key_with_a_wrong_type_keeps_the_other_keys_and_terminal_is_known() {
+        let text = "[theme]\nname = \"nord\"\nauto_switch = \"yes\"\n[theme.custom]\nred = 1\ngreen = \"#000\"\n";
+        let theme = resolve(text, || panic!("auto_switch is not a boolean"));
+        assert_eq!(theme.palette.red, Palette::nord().red);
+        assert_eq!(theme.palette.green, Color::Rgb(0, 0, 0));
+        assert!(!theme.terminal);
+        assert!(resolve("[theme]\nname = \"terminal\"\n", || true).terminal);
+        assert_eq!(resolve("[theme\n", || true).palette, Palette::catppuccin());
+    }
+
+    #[test]
     fn auto_switch_takes_the_light_sibling_on_a_light_host() {
         let text = "[theme]\nname = \"gruvbox\"\nauto_switch = true\n[theme.custom.light]\nred = \"blue\"\n";
-        assert_eq!(resolve(text, true), Palette::gruvbox());
-        let light = resolve(text, false);
+        assert_eq!(resolve(text, || true).palette, Palette::gruvbox());
+        let light = resolve(text, || false).palette;
         assert_eq!(light.text, Palette::gruvbox_light().text);
         assert_eq!(light.red, Color::Blue);
     }

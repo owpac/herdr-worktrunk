@@ -1117,6 +1117,7 @@ pub fn choose(
         .env(style::COLUMNS_VARIABLE, columns.to_string())
         // With an API key, fzf refuses the actions of the checks.
         .env_remove("FZF_API_KEY")
+        .envs(style::theme_environment())
         .args(style::fzf_arguments(GHOST, &scope_of(&entries), &HINTS))
         // The first frame of the spinner.
         .args(["--with-nth", &(ROW_FIELDS + 1).to_string()])
