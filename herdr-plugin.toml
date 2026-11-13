@@ -18,9 +18,11 @@ command = ["sh", "scripts/install.sh"]
 # stops it.
 # `observe` starts the observer in the background and returns. herdr runs [[startup]] when the
 # server starts, but not when the plugin is installed or linked: the event pane.agent_detected
-# also starts the observer. A lock keeps one observer for each herdr server. `observe` also gives
-# the path of its binary to a running observer (file observer.binary): herdr installs each version
-# in a new folder, so the observer runs the binary of the last `observe` command.
+# and each action also start the observer. A lock keeps one observer for each herdr server.
+# `observe` also gives the path of its binary to a running observer (file observer.binary): herdr
+# installs each version in a new folder, so the observer runs the binary of the last `observe`
+# command. After an install, scripts/install.sh runs `observe --hand-over`: it gives the new
+# binary to the running observer, and starts no observer.
 [[startup]]
 command = ["bin/herdr-worktrunk", "observe"]
 

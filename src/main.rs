@@ -44,7 +44,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>] | remove --path <worktree> [--close-agents]";
+const USAGE: &str = "usage: herdr-worktrunk observe [--run | --hand-over] | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>] | remove --path <worktree> [--close-agents]";
 
 /// The days without activity of `list-stale` when `stale_days` is 0.
 const DEFAULT_STALE_DAYS: u32 = 7;
@@ -80,17 +80,28 @@ fn main_checkout_of(folder: &Path) -> Result<PathBuf, Error> {
         .ok_or_else(|| Error::Command(format!("{} is not in a git repository", folder.display())))
 }
 
-/// Start the observer (`observe`), or be the observer (`observe --run`).
-fn observe(is_observer: bool) -> Result<(), Error> {
+/// What the command `observe` does.
+enum Observe {
+    /// Start the observer in the background (`observe`).
+    Start,
+    /// Be the observer (`observe --run`).
+    Run,
+    /// Give the path of this binary to the running observer, without a
+    /// start (`observe --hand-over`).
+    HandOver,
+}
+
+/// The command `observe`. `observe = false` in config.toml turns it off.
+fn observe(what: Observe) -> Result<(), Error> {
     let config = load_config();
     if !config.observe {
         return Ok(());
     }
     let state_dir = state_dir();
-    if is_observer {
-        observer::run(&state_dir, config.prune_merged, config.stale_days)
-    } else {
-        observer::start(&state_dir)
+    match what {
+        Observe::Start => observer::start(&state_dir),
+        Observe::Run => observer::run(&state_dir, config.prune_merged, config.stale_days),
+        Observe::HandOver => observer::hand_over(&state_dir),
     }
 }
 
@@ -298,9 +309,17 @@ fn main() -> ExitCode {
                 }
             };
         }
-        ["observe"] => (observe(false), None),
-        ["observe", "--run"] => (observe(true), None),
+        ["observe"] => (observe(Observe::Start), None),
+        ["observe", "--run"] => (observe(Observe::Run), None),
+        ["observe", "--hand-over"] => (observe(Observe::HandOver), None),
         ["open", entrypoint @ ("picker" | "remover" | "merger" | "cleaner" | "restorer")] => {
+            // herdr runs `observe` only at its start and for a new agent, not after an update
+            // or a link. Each action gives this binary to the observer, and starts the observer
+            // if it stopped. A linked checkout is the active version: its binary is the right
+            // one. An error stays without effect on the action.
+            if let Err(error) = observe(Observe::Start) {
+                eprintln!("herdr-worktrunk: {error}");
+            }
             (actions::open(entrypoint), None)
         }
         ["pick"] => (actions::pick(), Some("pick")),
