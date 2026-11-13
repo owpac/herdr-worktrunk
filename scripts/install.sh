@@ -6,9 +6,10 @@
 #
 # The script downloads the binary of the manifest version from the GitHub release, and checks it
 # with the SHA256SUMS file of the release. The tag of a release is its version (YYYY.M.N).
-# The download needs the release commit of this version: its subject starts with "chore: release
-# <version>". main keeps the version of its last release: a git checkout of a later commit has no
-# release binary, so the script builds with cargo. The version 0.0.0 has no release too.
+# The download needs the commit of the release binary: the release commit of this version, whose
+# subject starts with "chore: release <version>", or the commit of the tag of this version. main
+# keeps the version of its last release: a git checkout of a later commit has no release binary,
+# so the script builds with cargo. The version 0.0.0 has no release too.
 # If the release has no binary for this machine, or if the download or the check fails, the script
 # also builds the binary with cargo (Rust 1.89 or later).
 #
@@ -100,13 +101,22 @@ build_from_source() {
   say "built herdr-worktrunk $version with cargo"
 }
 
-# True if the checkout is the release commit of the version. A checkout without git, for example
-# an archive, counts as the release commit.
+# True if the checkout is the commit of the release binary: the release commit of the version, or
+# the commit of its tag. A checkout without git, for example an archive, counts as the release
+# commit.
 release_commit() {
   [ -e .git ] || return 0
   case "$(git log -1 --format=%s 2>/dev/null)" in
     "chore: release $version" | "chore: release $version "*) return 0 ;;
   esac
+  # The tag can point to a later commit of main: a merge during the run of the release workflow.
+  # herdr makes a shallow clone without the tags: ask the remote. An annotated tag gives 2 lines,
+  # and the last line is its commit.
+  head=$(git rev-parse HEAD 2>/dev/null) || head=""
+  tag=$(git ls-remote origin "refs/tags/$version" "refs/tags/$version^{}" 2>/dev/null | awk 'END { print $1 }')
+  if [ -n "$head" ] && [ "$head" = "$tag" ]; then
+    return 0
+  fi
   say "this commit is not the release commit of $version: the script builds with cargo"
   return 1
 }
