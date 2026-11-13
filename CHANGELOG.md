@@ -2,6 +2,13 @@
 
 The changes of each release of herdr-worktrunk. The workflow release-pr writes this file.
 
+## [2026.11.36](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.36) - 2026-11-13
+
+### Bug fixes
+
+- the observer runs the binary of a new version at once after an install ([#40](https://github.com/owpac/herdr-worktrunk/pull/40))
+- the observer follows the active version that herdr gives, in place of a hand-over at the build ([#42](https://github.com/owpac/herdr-worktrunk/pull/42))
+
 ## [2026.11.35](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.35) - 2026-11-13
 
 ### Bug fixes

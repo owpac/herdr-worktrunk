@@ -2,7 +2,7 @@ id = "herdr-worktrunk"
 name = "Worktrunk"
 # The version of the last release: YYYY.M.N. The pull request "chore: release YYYY.M.N" of the
 # workflow release-pr writes it.
-version = "2026.11.35"
+version = "2026.11.36"
 min_herdr_version = "0.9.0"
 description = "Worktrees that live and die with the work, from the first commit to the merged pull request"
 platforms = ["linux", "macos"]
