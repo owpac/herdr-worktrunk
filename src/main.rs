@@ -44,7 +44,7 @@ use std::process::ExitCode;
 
 use herdr::Error;
 
-const USAGE: &str = "usage: herdr-worktrunk observe [--run | --hand-over] | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>] | remove --path <worktree> [--close-agents]";
+const USAGE: &str = "usage: herdr-worktrunk observe [--run] | open picker|remover|merger|cleaner|restorer | pick | confirm | merger | restorer | restore-run | cleaner | message | list-merged [<folder>] | list-stale [<folder>] | clean [<folder>] | remove --path <worktree> [--close-agents]";
 
 /// The days without activity of `list-stale` when `stale_days` is 0.
 const DEFAULT_STALE_DAYS: u32 = 7;
@@ -86,9 +86,6 @@ enum Observe {
     Start,
     /// Be the observer (`observe --run`).
     Run,
-    /// Give the path of this binary to the running observer, without a
-    /// start (`observe --hand-over`).
-    HandOver,
 }
 
 /// The command `observe`. `observe = false` in config.toml turns it off.
@@ -101,7 +98,6 @@ fn observe(what: Observe) -> Result<(), Error> {
     match what {
         Observe::Start => observer::start(&state_dir),
         Observe::Run => observer::run(&state_dir, config.prune_merged, config.stale_days),
-        Observe::HandOver => observer::hand_over(&state_dir),
     }
 }
 
@@ -311,12 +307,11 @@ fn main() -> ExitCode {
         }
         ["observe"] => (observe(Observe::Start), None),
         ["observe", "--run"] => (observe(Observe::Run), None),
-        ["observe", "--hand-over"] => (observe(Observe::HandOver), None),
         ["open", entrypoint @ ("picker" | "remover" | "merger" | "cleaner" | "restorer")] => {
-            // herdr runs `observe` only at its start and for a new agent, not after an update
-            // or a link. Each action gives this binary to the observer, and starts the observer
-            // if it stopped. A linked checkout is the active version: its binary is the right
-            // one. An error stays without effect on the action.
+            // herdr runs `observe` only at its start and for a new agent. Each action also starts
+            // the observer if it stopped. The observer follows the active version of herdr: this
+            // write in observer.binary counts only if herdr does not answer. An error stays
+            // without effect on the action.
             if let Err(error) = observe(Observe::Start) {
                 eprintln!("herdr-worktrunk: {error}");
             }
