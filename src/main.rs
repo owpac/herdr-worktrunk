@@ -308,10 +308,10 @@ fn main() -> ExitCode {
         ["observe"] => (observe(Observe::Start), None),
         ["observe", "--run"] => (observe(Observe::Run), None),
         ["open", entrypoint @ ("picker" | "remover" | "merger" | "cleaner" | "restorer")] => {
-            // herdr runs `observe` only at its start and for a new agent, not after an update
-            // or a link. Each action gives this binary to the observer, and starts the observer
-            // if it stopped. A linked checkout is the active version: its binary is the right
-            // one. An error stays without effect on the action.
+            // herdr runs `observe` only at its start and for a new agent. Each action also starts
+            // the observer if it stopped. The observer follows the active version of herdr: this
+            // write in observer.binary counts only if herdr does not answer. An error stays
+            // without effect on the action.
             if let Err(error) = observe(Observe::Start) {
                 eprintln!("herdr-worktrunk: {error}");
             }

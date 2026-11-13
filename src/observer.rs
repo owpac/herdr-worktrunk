@@ -29,6 +29,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -1365,6 +1366,22 @@ const BINARY_IN_ROOT: &str = "bin/herdr-worktrunk";
 
 /// Return true if the binary changed since `start_time`, and did not
 /// change for `REBUILD_SETTLE_TIME` before `now`.
+/// True for a binary that the observer can run: a file with an execute
+/// bit, without a change for REBUILD_SETTLE_TIME. During an install, the
+/// new binary can be partial, or still without its execute bit: an `exec`
+/// fails, and the observer refuses the binary until its end.
+fn is_ready(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let settled = metadata
+        .modified()
+        .ok()
+        .and_then(|time| SystemTime::now().duration_since(time).ok())
+        .is_some_and(|age| age >= REBUILD_SETTLE_TIME);
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 && settled
+}
+
 fn is_settled_rebuild(
     time: Option<SystemTime>,
     start_time: Option<SystemTime>,
@@ -1395,6 +1412,9 @@ struct BinaryWatch {
     active: Option<PathBuf>,
     /// The time of the last read of the active version.
     active_read: Option<Instant>,
+    /// True if the last read of the active version failed: the log tells
+    /// only the changes.
+    active_failed: bool,
 }
 
 impl BinaryWatch {
@@ -1406,25 +1426,41 @@ impl BinaryWatch {
             refused: None,
             active: None,
             active_read: None,
+            active_failed: false,
         }
     }
 
-    /// Ask herdr for the folder of the active version, every 10 seconds.
-    /// herdr installs each version in a new folder, and runs no command of
-    /// the plugin after an install or a link: herdr is the only source
-    /// that knows the new folder at once.
-    fn read_active_version(&mut self) {
+    /// Ask herdr for the folder of the active version, every 10 seconds,
+    /// then give it to observer.binary. herdr installs each version in a new
+    /// folder, and runs no command of the plugin after an install or a link:
+    /// herdr is the only source that knows the new folder at once. Return a
+    /// message for the log when the read starts or stops to fail.
+    fn read_active_version(&mut self, state_dir: &Path) -> Option<String> {
         if self
             .active_read
             .is_some_and(|time| time.elapsed() < ACTIVE_VERSION_INTERVAL)
         {
-            return;
+            return None;
         }
         self.active_read = Some(Instant::now());
-        self.active = herdr::plugin_root()
-            .ok()
-            .flatten()
-            .map(|root| git::canonical(&root.join(BINARY_IN_ROOT)));
+        let (active, error) = match herdr::plugin_root() {
+            Ok(root) => (
+                root.map(|root| git::canonical(&root.join(BINARY_IN_ROOT))),
+                None,
+            ),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let message = match (&error, self.active_failed) {
+            (Some(error), false) => Some(format!(
+                "no active version from herdr: {error}. The observer reads observer.binary"
+            )),
+            (None, true) => Some("herdr gives the active version again".to_string()),
+            _ => None,
+        };
+        self.active_failed = error.is_some();
+        self.active = active;
+        self.share_active_version(state_dir);
+        message
     }
 
     /// Write the binary of the active version in observer.binary, if the
@@ -1432,7 +1468,7 @@ impl BinaryWatch {
     /// this file: without this write, after a downgrade, the old binary and
     /// this binary run each other in a loop.
     fn share_active_version(&self, state_dir: &Path) {
-        let Some(active) = self.active.as_ref().filter(|path| path.is_file()) else {
+        let Some(active) = self.active.as_ref().filter(|path| is_ready(path)) else {
             return;
         };
         let written = read_wanted_binary(state_dir).map(|path| git::canonical(&path));
@@ -1444,9 +1480,9 @@ impl BinaryWatch {
     /// Return the binary that the observer runs now, or None to keep its
     /// process. The binary of the active version in herdr comes first, then
     /// the binary of the last `observe` command: herdr can fail to answer.
-    /// A path to a binary that does not exist does not stop the observer.
+    /// A binary that is not ready (`is_ready`) does not stop the observer.
     fn binary_to_run(&self, state_dir: &Path) -> Option<PathBuf> {
-        let usable = |path: &PathBuf| path.is_file() && self.refused.as_ref() != Some(path);
+        let usable = |path: &PathBuf| is_ready(path) && self.refused.as_ref() != Some(path);
         let wanted = self.active.clone().filter(usable).or_else(|| {
             read_wanted_binary(state_dir)
                 .map(|path| git::canonical(&path))
@@ -1531,8 +1567,9 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
             }
         }
         if let Some(watch) = binary_watch.as_mut() {
-            watch.read_active_version();
-            watch.share_active_version(state_dir);
+            if let Some(message) = watch.read_active_version(state_dir) {
+                observer.log.write(&message);
+            }
             if let Some(binary) = watch.binary_to_run(state_dir) {
                 observer.log.write(&format!(
                     "new binary: {} -> {}",
@@ -2021,6 +2058,37 @@ mod tests {
         fs::remove_dir_all(&folder).unwrap();
     }
 
+    /// A binary that the observer can run: an execute bit, and no change
+    /// for 1 minute.
+    fn ready_binary(path: &Path) {
+        fs::write(path, "").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_binary_in_writing_or_without_an_execute_bit_waits() {
+        let folder = test_folder("not-ready");
+        let current = git::canonical(&folder).join("current");
+        let active = git::canonical(&folder).join("active");
+        ready_binary(&current);
+        // A new version during its install: just written, without an execute bit.
+        fs::write(&active, "").unwrap();
+        let mut watch = BinaryWatch::new(current.clone());
+        watch.active = Some(active.clone());
+
+        assert_eq!(watch.binary_to_run(&folder), None);
+        assert_eq!(watch.refused, None);
+        ready_binary(&active);
+        assert_eq!(watch.binary_to_run(&folder), Some(active));
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
     #[test]
     fn the_active_version_of_herdr_comes_before_the_last_observe() {
         let folder = test_folder("active");
@@ -2028,7 +2096,7 @@ mod tests {
         let active = git::canonical(&folder).join("active");
         let old = git::canonical(&folder).join("old");
         for binary in [&current, &active, &old] {
-            fs::write(binary, "").unwrap();
+            ready_binary(binary);
         }
         let mut watch = BinaryWatch::new(current.clone());
         write_wanted_binary(&folder, &old).unwrap();
@@ -2053,7 +2121,7 @@ mod tests {
         let active = git::canonical(&folder).join("active");
         let new = git::canonical(&folder).join("new");
         for binary in [&active, &new] {
-            fs::write(binary, "").unwrap();
+            ready_binary(binary);
         }
         // A downgrade: the file gives the new binary, herdr gives the old one.
         write_wanted_binary(&folder, &new).unwrap();
@@ -2077,7 +2145,7 @@ mod tests {
         let new = git::canonical(&folder).join("new");
         let newer = git::canonical(&folder).join("newer");
         for binary in [&current, &new, &newer] {
-            fs::write(binary, "").unwrap();
+            ready_binary(binary);
         }
         let mut watch = BinaryWatch::new(current.clone());
         write_wanted_binary(&folder, &new).unwrap();
