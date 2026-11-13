@@ -1427,6 +1427,20 @@ impl BinaryWatch {
             .map(|root| git::canonical(&root.join(BINARY_IN_ROOT)));
     }
 
+    /// Write the binary of the active version in observer.binary, if the
+    /// file gives another binary. A binary older than this logic reads only
+    /// this file: without this write, after a downgrade, the old binary and
+    /// this binary run each other in a loop.
+    fn share_active_version(&self, state_dir: &Path) {
+        let Some(active) = self.active.as_ref().filter(|path| path.is_file()) else {
+            return;
+        };
+        let written = read_wanted_binary(state_dir).map(|path| git::canonical(&path));
+        if written.as_ref() != Some(active) {
+            let _ = write_wanted_binary(state_dir, active);
+        }
+    }
+
     /// Return the binary that the observer runs now, or None to keep its
     /// process. The binary of the active version in herdr comes first, then
     /// the binary of the last `observe` command: herdr can fail to answer.
@@ -1518,6 +1532,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
         }
         if let Some(watch) = binary_watch.as_mut() {
             watch.read_active_version();
+            watch.share_active_version(state_dir);
             if let Some(binary) = watch.binary_to_run(state_dir) {
                 observer.log.write(&format!(
                     "new binary: {} -> {}",
@@ -2029,6 +2044,29 @@ mod tests {
         // Without an answer of herdr, the last observe gives the binary.
         watch.active = None;
         assert_eq!(watch.binary_to_run(&folder), Some(old));
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn the_active_version_goes_into_observer_binary_for_an_older_binary() {
+        let folder = test_folder("share-active");
+        let active = git::canonical(&folder).join("active");
+        let new = git::canonical(&folder).join("new");
+        for binary in [&active, &new] {
+            fs::write(binary, "").unwrap();
+        }
+        // A downgrade: the file gives the new binary, herdr gives the old one.
+        write_wanted_binary(&folder, &new).unwrap();
+        let mut watch = BinaryWatch::new(new.clone());
+        watch.active = Some(active.clone());
+
+        watch.share_active_version(&folder);
+
+        // The old binary reads only the file: it stays on itself, no loop.
+        assert_eq!(read_wanted_binary(&folder), Some(active.clone()));
+        watch.active = None;
+        watch.share_active_version(&folder);
+        assert_eq!(read_wanted_binary(&folder), Some(active));
         fs::remove_dir_all(&folder).unwrap();
     }
 
