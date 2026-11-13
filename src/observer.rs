@@ -1324,7 +1324,7 @@ fn binary_to_run(current: &Path, wanted: Option<&Path>, is_rebuilt: bool) -> Opt
 pub fn start(state_dir: &Path) -> Result<(), Error> {
     let lock = open_lock(state_dir)?;
     let executable = this_binary()?;
-    let written = hand_over(state_dir);
+    let written = write_wanted_binary(state_dir, &git::canonical(&executable));
     if lock.try_lock().is_err() {
         // An observer runs: only the file can give it this binary.
         return written;
@@ -1343,19 +1343,6 @@ pub fn start(state_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// Give the path of this binary to the running observer, and start no
-/// observer. The build of an install runs this function (`observe
-/// --hand-over`): herdr runs no other command of the plugin after an
-/// update, and a build can run without herdr. If no observer runs, the
-/// next `start` writes its own path. Without the state folder, no
-/// observer ever ran: the function writes nothing.
-pub fn hand_over(state_dir: &Path) -> Result<(), Error> {
-    if !state_dir.is_dir() {
-        return Ok(());
-    }
-    write_wanted_binary(state_dir, &git::canonical(&this_binary()?))
-}
-
 /// The path of the binary of this process.
 fn this_binary() -> Result<PathBuf, Error> {
     env::current_exe().map_err(|error| Error::Command(format!("cannot find the binary: {error}")))
@@ -1370,6 +1357,11 @@ fn modification_time(path: &Path) -> Option<SystemTime> {
 /// copy or a link can write the binary for a moment: an `exec` of a
 /// partial file stops the observer.
 const REBUILD_SETTLE_TIME: Duration = Duration::from_secs(2);
+/// The time between 2 reads of the active version in the list of the
+/// plugins of herdr.
+const ACTIVE_VERSION_INTERVAL: Duration = Duration::from_secs(10);
+/// The binary in the folder of a version of the plugin.
+const BINARY_IN_ROOT: &str = "bin/herdr-worktrunk";
 
 /// Return true if the binary changed since `start_time`, and did not
 /// change for `REBUILD_SETTLE_TIME` before `now`.
@@ -1398,6 +1390,11 @@ struct BinaryWatch {
     /// A wanted binary that `exec` refused: the observer does not try it
     /// again.
     refused: Option<PathBuf>,
+    /// The canonical path of the binary of the active version, from the
+    /// list of the plugins of herdr. None if herdr did not answer.
+    active: Option<PathBuf>,
+    /// The time of the last read of the active version.
+    active_read: Option<Instant>,
 }
 
 impl BinaryWatch {
@@ -1407,16 +1404,40 @@ impl BinaryWatch {
             current,
             time,
             refused: None,
+            active: None,
+            active_read: None,
         }
     }
 
+    /// Ask herdr for the folder of the active version, every 10 seconds.
+    /// herdr installs each version in a new folder, and runs no command of
+    /// the plugin after an install or a link: herdr is the only source
+    /// that knows the new folder at once.
+    fn read_active_version(&mut self) {
+        if self
+            .active_read
+            .is_some_and(|time| time.elapsed() < ACTIVE_VERSION_INTERVAL)
+        {
+            return;
+        }
+        self.active_read = Some(Instant::now());
+        self.active = herdr::plugin_root()
+            .ok()
+            .flatten()
+            .map(|root| git::canonical(&root.join(BINARY_IN_ROOT)));
+    }
+
     /// Return the binary that the observer runs now, or None to keep its
-    /// process. A path to a binary that does not exist does not stop the
-    /// observer.
+    /// process. The binary of the active version in herdr comes first, then
+    /// the binary of the last `observe` command: herdr can fail to answer.
+    /// A path to a binary that does not exist does not stop the observer.
     fn binary_to_run(&self, state_dir: &Path) -> Option<PathBuf> {
-        let wanted = read_wanted_binary(state_dir)
-            .map(|path| git::canonical(&path))
-            .filter(|path| path.is_file() && self.refused.as_ref() != Some(path));
+        let usable = |path: &PathBuf| path.is_file() && self.refused.as_ref() != Some(path);
+        let wanted = self.active.clone().filter(usable).or_else(|| {
+            read_wanted_binary(state_dir)
+                .map(|path| git::canonical(&path))
+                .filter(usable)
+        });
         let is_rebuilt = is_settled_rebuild(
             modification_time(&self.current),
             self.time,
@@ -1496,6 +1517,7 @@ pub fn run(state_dir: &Path, prune_merged: bool, stale_days: u32) -> Result<(), 
             }
         }
         if let Some(watch) = binary_watch.as_mut() {
+            watch.read_active_version();
             if let Some(binary) = watch.binary_to_run(state_dir) {
                 observer.log.write(&format!(
                     "new binary: {} -> {}",
@@ -1974,29 +1996,6 @@ mod tests {
     }
 
     #[test]
-    fn hand_over_writes_this_binary_and_starts_no_observer() {
-        let folder = test_folder("hand-over");
-
-        hand_over(&folder).unwrap();
-
-        let this = git::canonical(&env::current_exe().unwrap());
-        assert_eq!(read_wanted_binary(&folder), Some(this));
-        // A start opens the lock file: hand_over never opens it.
-        assert!(!lock_path(&folder).exists());
-        fs::remove_dir_all(&folder).unwrap();
-    }
-
-    #[test]
-    fn hand_over_without_a_state_folder_writes_nothing() {
-        let folder = test_folder("hand-over-missing").join("state");
-
-        hand_over(&folder).unwrap();
-
-        assert!(!folder.exists());
-        fs::remove_dir_all(folder.parent().unwrap()).unwrap();
-    }
-
-    #[test]
     fn the_wanted_binary_is_read_back() {
         let folder = test_folder("read-back");
 
@@ -2004,6 +2003,32 @@ mod tests {
 
         assert_eq!(read_wanted_binary(&folder), Some(PathBuf::from(NEW_BINARY)));
         assert!(!folder.join("observer.binary.tmp").exists());
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn the_active_version_of_herdr_comes_before_the_last_observe() {
+        let folder = test_folder("active");
+        let current = git::canonical(&folder).join("current");
+        let active = git::canonical(&folder).join("active");
+        let old = git::canonical(&folder).join("old");
+        for binary in [&current, &active, &old] {
+            fs::write(binary, "").unwrap();
+        }
+        let mut watch = BinaryWatch::new(current.clone());
+        write_wanted_binary(&folder, &old).unwrap();
+        watch.active = Some(active.clone());
+
+        assert_eq!(watch.binary_to_run(&folder), Some(active.clone()));
+
+        // The observer runs the active version: the last observe changes nothing.
+        let mut watch = BinaryWatch::new(active.clone());
+        watch.active = Some(active.clone());
+        assert_eq!(watch.binary_to_run(&folder), None);
+
+        // Without an answer of herdr, the last observe gives the binary.
+        watch.active = None;
+        assert_eq!(watch.binary_to_run(&folder), Some(old));
         fs::remove_dir_all(&folder).unwrap();
     }
 

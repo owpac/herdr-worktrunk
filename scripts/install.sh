@@ -3,7 +3,6 @@
 #
 # herdr runs this script as the [[build]] step of `herdr plugin install` (an update is a new
 # install). `herdr plugin link` does not run it: run it yourself for a local checkout.
-# After an install by herdr, the script gives the new binary to the running observer.
 #
 # The script downloads the binary of the manifest version from the GitHub release, and checks it
 # with the SHA256SUMS file of the release. The tag of a release is its version (YYYY.M.N).
@@ -122,23 +121,7 @@ release_commit() {
   return 1
 }
 
-# Give the new binary to the running observer: the observer runs it in about 2 s. herdr installs each
-# version in a new folder and runs no command of the plugin after this build: without this step, the
-# observer keeps the binary of the old version until the next start of herdr, the next new agent or
-# the next action of the plugin. Only an install by herdr does it: herdr gives HERDR_PLUGIN_ROOT, or
-# the checkout is in the install folder of herdr. A build in a development checkout keeps the
-# observer of the installed plugin.
-hand_over() {
-  case "${HERDR_PLUGIN_ROOT:+herdr}:$ROOT" in
-    herdr:* | */plugins/github-installations/*)
-      "$TARGET" observe --hand-over || say "cannot give the new binary to the observer"
-      ;;
-  esac
-}
-
 if [ "${HERDR_WORKTRUNK_BUILD:-}" != source ] && [ "$version" != 0.0.0 ] && release_commit && download; then
-  hand_over
   exit 0
 fi
-build_from_source || exit 1
-hand_over
+build_from_source

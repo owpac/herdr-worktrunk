@@ -173,6 +173,25 @@ fn focus_flag(focus: bool) -> &'static str {
     }
 }
 
+/// The folder of the active version of this plugin, from herdr: a new
+/// folder after each install, or the checkout of `herdr plugin link`.
+/// None if the plugin is not in the list, or is disabled.
+pub fn plugin_root() -> Result<Option<PathBuf>, Error> {
+    let result = run(&["plugin", "list", "--json"])?;
+    Ok(root_of(&result["plugins"], PLUGIN_ID))
+}
+
+/// The `plugin_root` of an enabled plugin in the JSON list of `herdr plugin
+/// list --json`.
+fn root_of(plugins: &Value, plugin_id: &str) -> Option<PathBuf> {
+    plugins.as_array()?.iter().find(|plugin| {
+        plugin["plugin_id"].as_str() == Some(plugin_id)
+            && plugin["enabled"].as_bool() != Some(false)
+    })?["plugin_root"]
+        .as_str()
+        .map(PathBuf::from)
+}
+
 /// Return the live state of herdr.
 pub fn snapshot() -> Result<Snapshot, Error> {
     let result = run(&["api", "snapshot"])?;
@@ -589,6 +608,23 @@ pub fn show_notification(title: &str, body: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_root_of_the_plugin_comes_from_the_list_of_herdr() {
+        let plugins = serde_json::json!([
+            {"plugin_id": "herdr-fork", "enabled": true, "plugin_root": "/fork"},
+            {"plugin_id": "herdr-worktrunk", "enabled": true, "plugin_root": "/worktrunk/2-0/checkout"},
+        ]);
+        assert_eq!(
+            root_of(&plugins, "herdr-worktrunk"),
+            Some(PathBuf::from("/worktrunk/2-0/checkout"))
+        );
+        let disabled = serde_json::json!([
+            {"plugin_id": "herdr-worktrunk", "enabled": false, "plugin_root": "/worktrunk"},
+        ]);
+        assert_eq!(root_of(&disabled, "herdr-worktrunk"), None);
+        assert_eq!(root_of(&serde_json::json!(null), "herdr-worktrunk"), None);
+    }
 
     #[test]
     fn a_shell_is_idle_only_if_it_is_the_foreground_group() {
