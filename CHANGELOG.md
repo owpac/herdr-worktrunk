@@ -2,6 +2,12 @@
 
 The changes of each release of herdr-worktrunk. The workflow release-pr writes this file.
 
+## [2026.11.35](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.35) - 2026-11-13
+
+### Bug fixes
+
+- install.sh downloads the release binary when the checkout is the commit of the tag ([#38](https://github.com/owpac/herdr-worktrunk/pull/38))
+
 ## [2026.11.34](https://github.com/owpac/herdr-worktrunk/releases/tag/2026.11.34) - 2026-11-12
 
 ### Features
