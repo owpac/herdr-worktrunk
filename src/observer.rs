@@ -1323,9 +1323,8 @@ fn binary_to_run(current: &Path, wanted: Option<&Path>, is_rebuilt: bool) -> Opt
 /// observer: if this observer runs another binary, it runs this one.
 pub fn start(state_dir: &Path) -> Result<(), Error> {
     let lock = open_lock(state_dir)?;
-    let executable = env::current_exe()
-        .map_err(|error| Error::Command(format!("cannot find the binary: {error}")))?;
-    let written = write_wanted_binary(state_dir, &git::canonical(&executable));
+    let executable = this_binary()?;
+    let written = hand_over(state_dir);
     if lock.try_lock().is_err() {
         // An observer runs: only the file can give it this binary.
         return written;
@@ -1342,6 +1341,24 @@ pub fn start(state_dir: &Path) -> Result<(), Error> {
         .map_err(|error| Error::Command(format!("cannot start the observer: {error}")))?;
     // The new observer runs this binary: it does not need the file.
     Ok(())
+}
+
+/// Give the path of this binary to the running observer, and start no
+/// observer. The build of an install runs this function (`observe
+/// --hand-over`): herdr runs no other command of the plugin after an
+/// update, and a build can run without herdr. If no observer runs, the
+/// next `start` writes its own path. Without the state folder, no
+/// observer ever ran: the function writes nothing.
+pub fn hand_over(state_dir: &Path) -> Result<(), Error> {
+    if !state_dir.is_dir() {
+        return Ok(());
+    }
+    write_wanted_binary(state_dir, &git::canonical(&this_binary()?))
+}
+
+/// The path of the binary of this process.
+fn this_binary() -> Result<PathBuf, Error> {
+    env::current_exe().map_err(|error| Error::Command(format!("cannot find the binary: {error}")))
 }
 
 /// The modification time of a file, or None if the file does not exist.
@@ -1954,6 +1971,29 @@ mod tests {
         let binary = binary_to_run(Path::new(OLD_BINARY), Some(Path::new(OLD_BINARY)), true);
 
         assert_eq!(binary, Some(PathBuf::from(OLD_BINARY)));
+    }
+
+    #[test]
+    fn hand_over_writes_this_binary_and_starts_no_observer() {
+        let folder = test_folder("hand-over");
+
+        hand_over(&folder).unwrap();
+
+        let this = git::canonical(&env::current_exe().unwrap());
+        assert_eq!(read_wanted_binary(&folder), Some(this));
+        // A start opens the lock file: hand_over never opens it.
+        assert!(!lock_path(&folder).exists());
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn hand_over_without_a_state_folder_writes_nothing() {
+        let folder = test_folder("hand-over-missing").join("state");
+
+        hand_over(&folder).unwrap();
+
+        assert!(!folder.exists());
+        fs::remove_dir_all(folder.parent().unwrap()).unwrap();
     }
 
     #[test]
